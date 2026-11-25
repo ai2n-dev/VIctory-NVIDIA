@@ -686,6 +686,69 @@ struct Lower<'a> {
     lane_paths: Vec<(usize, V)>,
     /// Heap index phis of per-lane joins with predecessors lowered later.
     pending_paths: Vec<PendingPath>,
+    /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
+    /// the one in force at the instruction being lowered (see [`round16`]).
+    round16: Vec<Option<u8>>,
+    mode16: Option<u8>,
+}
+
+/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
+/// after `inst`, from `mode` before it (`None`: not known).
+fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
+    match (inst.name(), &inst.fields) {
+        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
+        (
+            "s_setreg_imm32_b32" | "s_setreg_b32",
+            Fields::Sop {
+                src, imm: Some(h), ..
+            },
+        ) => {
+            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
+            if id != 1 || off >= 4 || off + size <= 2 {
+                return mode;
+            }
+            match src.first() {
+                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
+                    Some((x >> (2 - off) & 3) as u8)
+                }
+                _ => None,
+            }
+        }
+        _ => mode,
+    }
+}
+
+/// The 16/64-bit round mode each block starts with: nearest even at the
+/// program's start, then as the MODE writes on the way set it; `None` where
+/// paths that set it differently join (or a write is not a constant).
+fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
+    // None: not reached yet; Some(m): the mode (m None: not known).
+    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
+    entry[0] = Some(Some(0));
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    loop {
+        let mut changed = false;
+        for &b in &order {
+            let Some(mut m) = entry[b] else { continue };
+            for inst in &p.blocks[b].insts {
+                m = round16_after(inst, m);
+            }
+            for s in p.blocks[b].exit.successors() {
+                let new = match entry[s] {
+                    None => Some(m),
+                    Some(old) if old == m => continue,
+                    Some(_) => Some(None),
+                };
+                if entry[s] != new {
+                    entry[s] = new;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return entry.into_iter().map(Option::flatten).collect();
+        }
+    }
 }
 
 /// A heap index phi of a [`Source::Paths`], filled once every predecessor is
@@ -1517,6 +1580,8 @@ impl<'a> Lower<'a> {
             abort: None,
             lane_paths: Vec::new(),
             pending_paths: Vec::new(),
+            round16: round16(p),
+            mode16: Some(0),
             dead,
         }
     }
@@ -2354,8 +2419,10 @@ impl<'a> Lower<'a> {
                 }
             }
             let mut i = 0;
+            self.mode16 = self.round16[b];
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
+                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     self.section(b, i, end)?;
                     i = end;
@@ -6704,10 +6771,7 @@ impl<'a> Lower<'a> {
                         None => Ok(None),
                     }
                 };
-                let to_f16 = |l: &mut Self, f: V| {
-                    let i32t = l.s.t.i32;
-                    l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-                };
+                let to_f16 = |l: &mut Self, f: V| l.narrow16(f);
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {

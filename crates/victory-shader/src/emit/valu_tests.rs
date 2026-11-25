@@ -394,6 +394,52 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
+/// f16 results round to nearest even, the console's default MODE, on every
+/// host. DXIL's `legacyF32ToF16` leaves the rounding to the host's driver.
+#[test]
+fn v_cvt_f16_f32_rounds_to_nearest_even() {
+    // (f32 bits, f16 bits): 1 + 0.75 ulp rounds up, 1 + 0.5 ulp is a tie
+    // kept even (down), 1 + 1.5 ulp a tie rounded up to even, and a value
+    // just under half an ulp rounds down.
+    let cases = [
+        (0x3F80_1800_u32, 0x3C01_u32),
+        (0x3F80_1000, 0x3C00),
+        (0x3F80_3000, 0x3C02),
+        (0x3F80_0FFF, 0x3C00),
+        (0xBF80_1800, 0xBC01),
+    ];
+    let shader = build_valu_cs(&vop3(0x18A, 0, vgpr(1), 0, 0));
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(f, _)| [f, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        assert_eq!(
+            got & 0xFFFF,
+            cases[i].1,
+            "{backend}: v_cvt_f16_f32 {inp:x?}"
+        );
+    });
+}
+
+/// Denormal operands of `v_max_f32` / `v_min_f32` read as zeros of their
+/// sign (the console's default float mode), whatever the host's own
+/// denormal mode is, and -0 still orders below +0.
+#[test]
+fn max_and_min_read_denormal_operands_as_zeros() {
+    let cases = [
+        // max(+denormal, -0) = max(+0, -0) = +0
+        ([0x0000_0001_u32, 0x8000_0000, 0, 0], 0x110, 0x0000_0000_u32),
+        // min(-denormal, +0) = min(-0, +0) = -0
+        ([0x8000_0001, 0x0000_0000, 0, 0], 0x10F, 0x8000_0000),
+        // max(+denormal, +1 denormal more) = +0
+        ([0x0000_0001, 0x0000_0002, 0, 0], 0x110, 0x0000_0000),
+    ];
+    for (inp, op, want) in cases {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), 0));
+        run_cases(&shader, &[inp], |backend, _, inp, got| {
+            assert_eq!(got, want, "{backend}: op {op:#x} {inp:x?}");
+        });
+    }
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
