@@ -437,6 +437,11 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A range whose every block is already clean needs no per-block lookup.
+fn fully_clean(clean: &BTreeSet<usize>, first: usize, last: usize) -> bool {
+    first <= last && clean.range(first..last).count() == last - first
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -447,6 +452,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     {
         let mut g = guards();
         if g.protected.contains(&first) || g.holes.contains(&first) {
+            // All blocks are already clean: one ordered walk instead of
+            // repeated logarithmic lookups, under the same guard lock.
+            if fully_clean(&g.clean, first, last) {
+                return Some(Vec::new());
+            }
             let mut written = Vec::new();
             let mut run: Option<usize> = None;
             for block in first..=last {
@@ -1129,6 +1139,19 @@ mod tests {
         assert!(!mapped((&raw const file) as usize)); // private stack allocation
         assert!(!mapped(mapped as *const () as usize)); // executable image
         assert!(!mapped(0)); // no allocation to query
+    }
+
+    #[test]
+    fn fully_clean_requires_every_block() {
+        let mut clean: BTreeSet<usize> = (10..20).collect();
+        assert!(fully_clean(&clean, 10, 20));
+        assert!(fully_clean(&clean, 15, 15));
+        assert!(!fully_clean(&clean, 9, 20));
+        assert!(!fully_clean(&clean, 10, 21));
+        clean.remove(&15);
+        assert!(!fully_clean(&clean, 10, 20));
+        assert!(fully_clean(&clean, 16, 20));
+        assert!(!fully_clean(&clean, 20, 10));
     }
 
     #[test]
