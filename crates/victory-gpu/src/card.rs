@@ -304,33 +304,35 @@ fn byte_ranges_to_piece_runs(ranges: &[(usize, usize)], max_pieces: u32) -> Vec<
     if ranges.is_empty() || max_pieces == 0 {
         return Vec::new();
     }
-    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    let mut spans = Vec::with_capacity(ranges.len());
     for &(from, to) in ranges {
         if from >= to {
             continue;
         }
-        let first = (from / PAGE) as u32;
-        let end = (to.div_ceil(PAGE) as u32).min(max_pieces);
+        // Clip before narrowing, so large offsets cannot wrap into valid pages.
+        let first = (from / PAGE).min(max_pieces as usize) as u32;
+        let end = to.div_ceil(PAGE).min(max_pieces as usize) as u32;
         if first < end {
             spans.push((first, end));
         }
     }
-    if spans.is_empty() {
-        return Vec::new();
-    }
     spans.sort_unstable();
-    let mut out: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
-    for (a, b) in spans {
-        if let Some(last) = out.last_mut()
-            && a <= last.0 + last.1
-        {
-            let end = (last.0 + last.1).max(b);
-            last.1 = end - last.0;
+    // Compact in place instead of allocating a second vector of runs.
+    let mut used = 0;
+    for i in 0..spans.len() {
+        let (first, end) = spans[i];
+        if used > 0 && first <= spans[used - 1].1 {
+            spans[used - 1].1 = spans[used - 1].1.max(end);
         } else {
-            out.push((a, b - a));
+            spans[used] = (first, end);
+            used += 1;
         }
     }
-    out
+    spans.truncate(used);
+    for (first, end) in &mut spans {
+        *end -= *first;
+    }
+    spans
 }
 
 /// Per-submission plan built in `card_before` and consumed in `card_after` + `card_back`.
@@ -1025,6 +1027,41 @@ mod tests {
         });
         assert_eq!(accepted, 3);
         assert_eq!(used.load(Ordering::Relaxed), 192);
+    }
+
+    #[test]
+    fn piece_runs_match_bitmap_with_unsorted_and_clipped_ranges() {
+        let mut seed = 0x2934_5abcu32;
+        for count in 0..128 {
+            let mut ranges = Vec::new();
+            let mut expected = [false; 31];
+            for _ in 0..count {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let from = seed as usize % (40 * PAGE);
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let to = from + seed as usize % (4 * PAGE);
+                ranges.push((from, to));
+                if from < to {
+                    for page in expected.iter_mut().take(to.div_ceil(PAGE)).skip(from / PAGE) {
+                        *page = true;
+                    }
+                }
+            }
+            ranges.push((usize::MAX - PAGE, usize::MAX));
+            ranges.push((PAGE, PAGE));
+            let runs = byte_ranges_to_piece_runs(&ranges, expected.len() as u32);
+            let mut actual = [false; 31];
+            let mut previous_end = None;
+            for (first, count) in runs {
+                assert!(count > 0);
+                assert!(previous_end.is_none_or(|end| first > end));
+                let end = first + count;
+                assert!(end <= actual.len() as u32);
+                actual[first as usize..end as usize].fill(true);
+                previous_end = Some(end);
+            }
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
