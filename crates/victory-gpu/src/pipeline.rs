@@ -493,6 +493,15 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Host pipelines created and loaded from the library since start.
+#[cfg(windows)]
+pub(crate) fn frame_log_counts() -> (u64, u64) {
+    (
+        library::MADE.load(std::sync::atomic::Ordering::Relaxed),
+        library::LOADED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

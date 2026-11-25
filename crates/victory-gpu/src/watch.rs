@@ -672,6 +672,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    let started = std::time::Instant::now();
+    crate::framelog::add(crate::framelog::T::Remaps, 1);
     let end = at.saturating_add(len);
     {
         let mut g = guards();
@@ -731,6 +733,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::shadow::remapped(at as u64, end as u64);
     crate::resource::evict_placed_textures(at as u64, end as u64);
     crate::descriptor::host::bindless_memory_changed(at as u64, end as u64);
+    crate::framelog::add(
+        crate::framelog::T::RemapUs,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// The title committed memory `[at, at + len)` it had reserved.
@@ -771,6 +777,7 @@ pub(crate) fn try_open_guarded(at: usize) -> bool {
     if open(&mut g, at, at + 1) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        crate::framelog::add(crate::framelog::T::GuardFaults, 1);
         return true;
     }
     if writable(at) {

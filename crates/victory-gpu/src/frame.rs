@@ -168,6 +168,14 @@ pub(crate) extern "system" fn wait(
         };
         (wait, hr)
     };
+    #[cfg(windows)]
+    {
+        let us = wait.as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::PaceUs, us);
+        crate::framelog::here(crate::framelog::H::PaceUs, us);
+    }
+    #[cfg(not(windows))]
+    let _ = wait;
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.

@@ -176,6 +176,42 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Adds to [`SUBMISSION_US`] and the frame log's submission counters (`0` prepare, `1` wait).
+fn submission_us(i: usize, us: u64) {
+    SUBMISSION_US[i].fetch_add(us, Ordering::Relaxed);
+    crate::framelog::add(
+        [
+            crate::framelog::T::PrepareUs,
+            crate::framelog::T::CardWaitUs,
+        ][i],
+        us,
+    );
+    if i == 0 {
+        crate::framelog::add(crate::framelog::T::Submissions, 1);
+    }
+}
+
+/// Adds to [`PREPARING`] copy counters (`0` microseconds, `1` bytes) and the frame log.
+fn preparing(i: usize, n: u64) {
+    PREPARING[i].fetch_add(n, Ordering::Relaxed);
+    crate::framelog::add(
+        [crate::framelog::T::CopyUs, crate::framelog::T::CopyBytes][i],
+        n,
+    );
+}
+
+/// Adds to [`COPY_BACK`] (`0` microseconds, `1` bytes) and the frame log.
+fn copy_back(i: usize, n: u64) {
+    COPY_BACK[i].fetch_add(n, Ordering::Relaxed);
+    crate::framelog::add(
+        [
+            crate::framelog::T::CopyBackUs,
+            crate::framelog::T::CopyBackBytes,
+        ][i],
+        n,
+    );
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -264,6 +300,7 @@ pub(crate) fn wait_in_flight_if_ready() {
 }
 
 fn create() -> windows::core::Result<Host> {
+    crate::drvwatch::start();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -866,6 +903,8 @@ pub(crate) struct HostList {
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it (`clamp_room`).
     clamp_chunks: Mutex<ClampChunks>,
+    /// Timestamp slot pair for [`crate::cardmeter`] (`u32::MAX` when unstarted).
+    meter: std::sync::atomic::AtomicU32,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1276,6 +1315,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 last_fence: std::sync::atomic::AtomicU64::new(0),
+                meter: std::sync::atomic::AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1365,7 +1405,7 @@ impl Host {
                 } else {
                     WaitForSingleObject(self.event, INFINITE);
                 }
-                SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
+                submission_us(1, waited.elapsed().as_micros() as u64);
             }
         }
         self.reap_completed();
@@ -1576,7 +1616,7 @@ impl Host {
             if let Some(plan) = card_plan {
                 plan.clear_pending();
             }
-            SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+            submission_us(0, (prepared - started).as_micros() as u64);
             for list in runs {
                 list.deferred().early = 0;
             }
@@ -1595,8 +1635,8 @@ impl Host {
         FINISHED.fetch_max(this_submission, Ordering::AcqRel);
         bury(this_submission);
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        submission_us(0, (prepared - started).as_micros() as u64);
+        submission_us(1, gpu.as_micros() as u64);
         #[cfg(feature = "diagnostics")]
         gpu_waits(gpu, runs);
         // The host resets a device whose submission runs for about 2 s.
@@ -1626,7 +1666,7 @@ impl Host {
                 if let Some(engine_lock) = self.card_engine() {
                     let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
                     let written = engine.finish_back(self, plan, &mut submitted);
-                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                    copy_back(1, written as u64);
                 } else {
                     plan.clear_pending();
                 }
@@ -1638,7 +1678,7 @@ impl Host {
         if back.len() <= 1 {
             for (shadow, address, len) in &back {
                 let written = shadow.copy_back(*address, *len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                copy_back(1, written as u64);
             }
         } else {
             // Group by Shadow pointer so distinct shadows run in parallel
@@ -1658,14 +1698,14 @@ impl Host {
             if groups.len() <= 1 {
                 for (shadow, address, len) in &groups[0] {
                     let written = shadow.copy_back(*address, *len);
-                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                    copy_back(1, written as u64);
                 }
             } else {
                 in_parallel(&groups, 8, |chunk| {
                     for g in chunk {
                         for (shadow, address, len) in g {
                             let written = shadow.copy_back(*address, *len);
-                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                            copy_back(1, written as u64);
                         }
                     }
                 });
@@ -1689,10 +1729,10 @@ impl Host {
                     }
                     n
                 };
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                copy_back(1, written as u64);
             }
         }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        copy_back(0, copying.elapsed().as_micros() as u64);
         // Host timestamps the lists resolved, on the title's GPU clock.
         let mut clock = None;
         for list in runs {
@@ -1875,6 +1915,66 @@ impl Host {
             queue.ClearStoredMessages();
         }
         first_error
+    }
+
+    /// Logs and drains accumulated D3D12 debug layer messages during live runs.
+    pub(crate) fn drain_messages(&self) {
+        let Some(queue) = &self.messages else {
+            return;
+        };
+        static SEEN: Mutex<std::collections::BTreeMap<i32, (u64, i32)>> =
+            Mutex::new(std::collections::BTreeMap::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: each stored message is read into a buffer of its reported size, then cleared.
+        let stored = unsafe {
+            let stored = queue.GetNumStoredMessages();
+            for i in 0..stored {
+                let mut size = 0;
+                if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                    continue;
+                }
+                let mut buffer = vec![0u64; size.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(message), &mut size).is_ok() {
+                    let m = &*message;
+                    let kind = seen.entry(m.ID.0).or_insert((0, m.Severity.0));
+                    kind.0 += 1;
+                    if kind.0 <= 5 {
+                        let text =
+                            std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                        let text = String::from_utf8_lossy(text);
+                        let text = text.trim_end_matches('\0');
+                        tracing::warn!(
+                            id = m.ID.0,
+                            severity = m.Severity.0,
+                            nth = kind.0,
+                            "D3D12 debug layer: {text}"
+                        );
+                    }
+                }
+            }
+            queue.ClearStoredMessages();
+            stored
+        };
+        if stored > 0 {
+            let counts: Vec<String> = seen
+                .iter()
+                .map(|(id, (n, severity))| format!("id {id} (severity {severity}) x{n}"))
+                .collect();
+            tracing::info!(
+                "D3D12 debug layer messages so far by kind: {}",
+                counts.join(", ")
+            );
+        }
+    }
+
+    pub(crate) fn device(&self) -> &ID3D12Device {
+        &self.device
+    }
+
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: plain D3D12 timestamp frequency query on our direct queue.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0)
     }
 
     /// A host render target view of `resource`, valid until it is recorded.
@@ -2064,6 +2164,12 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        crate::cardmeter::end(
+            &self.list,
+            crate::cardmeter::Span::from_raw(
+                self.meter.swap(u32::MAX, std::sync::atomic::Ordering::Relaxed),
+            ),
+        );
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -2117,6 +2223,10 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.meter.store(
+            crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -2829,8 +2939,8 @@ impl HostList {
             }
         }
         if copy_bytes > 0 || copy_us > 0 {
-            PREPARING[0].fetch_add(copy_us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copy_bytes, Ordering::Relaxed);
+            preparing(0, copy_us);
+            preparing(1, copy_bytes);
             #[cfg(feature = "diagnostics")]
             {
                 add(C::Copies, copy_count);
@@ -2968,8 +3078,8 @@ impl Batch {
                         copied.fetch_add(n as u64, Ordering::Relaxed);
                     }
                 });
-                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-                PREPARING[1].fetch_add(copied.into_inner(), Ordering::Relaxed);
+                preparing(0, started.elapsed().as_micros() as u64);
+                preparing(1, copied.into_inner());
             }
             // shortcut: what shaders write through directly indexed slots into
             // copied memory stays in the copy (title memory used in place
@@ -3117,8 +3227,8 @@ fn update(shadow: &crate::shadow::Shadow, from: usize, len: usize) {
     let us = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
     crate::copystat::range(from, len, us, 0);
-    PREPARING[0].fetch_add(us, Ordering::Relaxed);
-    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    preparing(0, us);
+    preparing(1, copied as u64);
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -3628,6 +3738,15 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            if let Some(host) = host() {
+                host.drain_messages();
+            }
+            if crate::drvwatch::errors() > 0 {
+                tracing::warn!(
+                    errors = crate::drvwatch::errors(),
+                    "graphics driver errors reported to Windows System event log since start"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
@@ -3706,6 +3825,16 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        let showing = std::time::Instant::now();
+        let shown = self.present_now(texture, state, frame);
+        crate::framelog::add(
+            crate::framelog::T::PresentShowUs,
+            showing.elapsed().as_micros() as u64,
+        );
+        shown
+    }
+
+    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         self.wait_in_flight();
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -3791,6 +3920,21 @@ impl Host {
     /// As [`Host::present`], with the texture `over` put over `scene` (each
     /// with the host state it is in and stays in).
     pub(crate) fn present_over(
+        &self,
+        scene: Option<(&ID3D12Resource, u32)>,
+        over: (&ID3D12Resource, u32),
+        frame: u64,
+    ) -> Option<()> {
+        let showing = std::time::Instant::now();
+        let out = self.present_over_now(scene, over, frame);
+        crate::framelog::add(
+            crate::framelog::T::PresentShowUs,
+            showing.elapsed().as_micros() as u64,
+        );
+        out
+    }
+
+    fn present_over_now(
         &self,
         scene: Option<(&ID3D12Resource, u32)>,
         over: (&ID3D12Resource, u32),

@@ -631,6 +631,7 @@ impl CardEngine {
             }
             &self.before_list
         };
+        let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
 
         // Step A: Copy dirty staging ranges -> VRAM.
         for (card, ranges) in &dirty_cards {
@@ -731,6 +732,7 @@ impl CardEngine {
             drop_barriers(to_common);
         }
 
+        crate::cardmeter::end(list, timed);
         // SAFETY: close command list.
         if unsafe { list.Close() }.is_err() {
             return (None, plan);
@@ -752,6 +754,7 @@ impl CardEngine {
         unsafe {
             self.after_alloc.Reset().ok()?;
             self.after_list.Reset(&self.after_alloc, None).ok()?;
+            let timed = crate::cardmeter::begin(&self.after_list, crate::cardmeter::Kind::Check);
             // Global UAV barrier ensures all shader writes from `runs` are visible.
             self.after_list.ResourceBarrier(&[uav_barrier()]);
             self.after_list.SetComputeRootSignature(&self.root_sig);
@@ -799,6 +802,7 @@ impl CardEngine {
             self.after_list.ResourceBarrier(&back_common);
             drop_barriers(back_common);
 
+            crate::cardmeter::end(&self.after_list, timed);
             self.after_list.Close().ok()?;
             self.after_list.cast().ok()
         }

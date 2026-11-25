@@ -275,9 +275,11 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let (read, dirty) = self.refresh_now();
+        let us = started.elapsed().as_micros() as u64;
         let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        preparing[2].fetch_add(us, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+        crate::framelog::add(crate::framelog::T::RefreshUs, us);
         dirty
     }
 
@@ -376,6 +378,7 @@ impl Staging {
     /// Records `CopyTextureRegion` for every subresource from this staging
     /// buffer into `texture` (which must already be in `COPY_DEST`).
     pub(crate) fn record_copies(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
+        crate::framelog::add(crate::framelog::T::Uploads, 1);
         for (i, footprint) in self.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.

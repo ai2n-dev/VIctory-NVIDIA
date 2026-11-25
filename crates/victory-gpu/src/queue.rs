@@ -146,6 +146,18 @@ impl crate::timeline::Lists for Submission {
 
 /// Runs the lists once what they wait for is there.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    #[cfg(windows)]
+    let started = std::time::Instant::now();
+    execute_now(this, count, lists);
+    #[cfg(windows)]
+    {
+        let us = started.elapsed().as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::ExecuteUs, us);
+        crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+    }
+}
+
+fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -328,6 +340,26 @@ fn second_plane(first: *const Plane) -> Option<This> {
 /// shortcut: two planes at most, each over the whole screen, the sources
 /// expected in the common state.
 extern "system" fn present(
+    this: This,
+    planes: u32,
+    plane_parameters: *const Plane,
+    parameters: *const u8,
+) -> HRESULT {
+    #[cfg(windows)]
+    let presenting = std::time::Instant::now();
+    let hr = present_now(this, planes, plane_parameters, parameters);
+    #[cfg(windows)]
+    {
+        crate::framelog::add(
+            crate::framelog::T::PresentUs,
+            presenting.elapsed().as_micros() as u64,
+        );
+        crate::framelog::frame();
+    }
+    hr
+}
+
+fn present_now(
     this: This,
     planes: u32,
     plane_parameters: *const Plane,

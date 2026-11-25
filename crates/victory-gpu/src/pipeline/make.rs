@@ -179,6 +179,10 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    crate::framelog::add(
+        crate::framelog::T::PipelineWaitUs,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// What the workers take from: the ordinary pipelines, the screen passes.
