@@ -1181,6 +1181,7 @@ mod tests {
         host.execute_and_wait_locked(before.unwrap(), &mut submitted);
         host.execute_and_wait_locked(after, &mut submitted);
 
+        // SAFETY: command queue finished `after`, so `differs_rb` is coherent on CPU.
         let differs_1 = unsafe {
             std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec()
         };
@@ -1192,7 +1193,9 @@ mod tests {
         // 4 different bytes on the same page 2.
         let (patch_buf, patch_ptr) = host.shared_buffer(256).expect("patch buffer");
         let gpu_bytes = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        // SAFETY: `patch_ptr` points to a 256-byte persistently mapped upload buffer.
         unsafe { std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr(), patch_ptr, 4) };
+        // SAFETY: valid D3D12 device/command list calls on live test resources.
         unsafe {
             let alloc: ID3D12CommandAllocator = host
                 .device

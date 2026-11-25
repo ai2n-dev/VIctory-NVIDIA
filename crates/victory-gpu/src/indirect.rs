@@ -1136,12 +1136,13 @@ void main() {
                 )
             };
             assert_eq!(spent, 1 << 27);
-            for (i, record) in words.chunks_exact(8).enumerate() {
+            for (i, record) in words.as_chunks::<8>().0.iter().enumerate() {
                 let counts = if i < 2 { [1 << 24, 4] } else { [0, 0] };
                 assert_eq!(&record[..2], &counts);
                 assert_eq!(&record[2..], &input[2..]);
             }
             assert_eq!(
+                // SAFETY: `src_ptr` points to an open mapped upload buffer of `STRIDE` bytes.
                 unsafe { std::slice::from_raw_parts(src_ptr.cast::<u32>(), 8) },
                 &input
             );
