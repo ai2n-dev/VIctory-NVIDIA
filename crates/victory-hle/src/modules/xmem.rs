@@ -680,6 +680,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     address
 }
 
+/// Reservations below this (`16 MiB`, matching `victory_gpu::shadow`) are
+/// never coalesced whole: smaller pools alias, partially unmap, and split
+/// placeholders.
+const WHOLE_MIN: usize = 16 << 20;
 /// Reservations this long at most are shown whole.
 const WHOLE: usize = 1 << 30;
 
@@ -712,10 +716,11 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
             else {
                 return false;
             };
-            if len <= WHOLE {
+            if (WHOLE_MIN..=WHOLE).contains(&len) {
                 tracing::debug!(at = format_args!("{at:#x}"), len, section = first.section.1, views = ?physical.views.range(..at + len).next_back().map(|(v, (n, _))| (*v, *n)), "whole?");
             }
-            if len > WHOLE
+            if len < WHOLE_MIN
+                || len > WHOLE
                 || len != first.section.1
                 || physical.views.range(..at + len).next_back().is_some_and(|(v, (n, _))| v + n > at)
                 || physical.whole.iter().any(|w| Arc::ptr_eq(&w.2, &first.section))
