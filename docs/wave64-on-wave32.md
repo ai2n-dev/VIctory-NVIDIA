@@ -1,12 +1,11 @@
 # Console wave64 compute on 32-lane hosts
 
-Status: steps 1, 2, 4 and 5 are in, and the one-wave half of step 6. On
-NVIDIA, wave64 programs whose lanes read only their own half run as two
-32-lane waves. Groups of one console wave also run in the console flow:
-masks read whole, lanes of the other half, divergent branches and loops,
-scalars a divergent loop leaves, and LDS shared within the wave. Still
-open: groups of several console waves, whole-wave sections and
-`ds_(b)permute`.
+Status: steps 1, 2 and 4 to 6 are in. On NVIDIA, wave64 programs whose
+lanes read only their own half run as two 32-lane waves. The others run in
+the console flow, in groups of one console wave or of several: masks read
+whole, lanes of the other half, divergent branches and loops, scalars a
+divergent loop leaves, whole-wave reductions and prefixes, and LDS shared
+within a wave. Still open: `ds_(b)permute`.
 
 ## The problem
 
@@ -48,13 +47,14 @@ and the wave's lanes take the next 32 console threads in lane order.
 
 **What stays inside a half** needs nothing: DPP16 and DPP8 (rows of 16,
 groups of 8), `ds_swizzle` (groups of 32 or 4), and `v_permlane16` /
-`v_permlanex16` (the two rows of a 32-lane half; not lowered at all yet).
-Their lowering computes the source lane from the host lane's place in its
-row or group, so it is unchanged in the split form.
+`v_permlanex16` (the two rows of a 32-lane half). Their lowering computes
+the source lane from the host lane's place in its row or group, so it is
+unchanged in the split form.
 
 Step 4 (`split` in `Lower::new`) runs a program as two 32-lane waves when
 the host has no 64-lane waves and the program:
-- reads other lanes only through DPP and `ds_swizzle`;
+- reads other lanes only through DPP, `ds_swizzle` and `v_permlane16` /
+  `v_permlanex16`;
 - reads no mask whole and tests no bit of a mask held as a number;
 - has no whole-wave sections (their reductions would cover a half);
 - uses no LDS (the console compiler may have left out barriers between
@@ -106,7 +106,8 @@ does (step 5, `lower::CONSOLE_FLOW`):
   slot `half`, then a group barrier, both read both slots, and a second
   barrier. Every thread of the group reaches it because the group is one
   console wave whose halves take the same branches. A group of 32 threads
-  or fewer has no upper half: its word is 0 and no barrier is needed.
+  or fewer has no upper half: its word is 0 and no barrier is needed. A
+  group of several console waves meets in pairs instead (below).
 - Masks read whole (`mask_dword`) are the exchanged ballots. Lane bits of
   masks held as numbers use the console lane. `v_readlane` and
   `v_readfirstlane` read the owning half's value. `v_writelane` and
@@ -115,8 +116,8 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no `ds_(b)permute`, and no
-whole-wave sections.
+waves and no `ds_(b)permute` (any group size, and whole-wave sections; see
+below).
 
 ### LDS within one console wave
 
@@ -149,9 +150,47 @@ Where the console flow can run the program it does so now: its loops run
 while any lane of the console wave does. `valu_tests` checks both cases
 on the host's own wave sizes.
 
-Groups of several console waves still need another meeting point: a group
-barrier would wait for console waves elsewhere. The plan stays per-console-
-wave arrival counters with double-buffered slots and a bounded wait.
+### Groups of several console waves
+
+A group barrier would wait for the group's other console waves, which take
+branches of their own, so in a group of more than 64 threads only the two
+halves of a console wave meet (`Lower::pair_meet`), for every exchange and
+every LDS meeting:
+
+- Each half counts its meetings in a group-shared dword. In the entry
+  block, which every thread runs, each host wave zeroes its half's count,
+  followed by the program's one group barrier of its own.
+- At its n-th meeting a half writes its dword to its slot for meetings of
+  n's parity, fences group-shared memory, stores n as its count, polls the
+  other half's count until it is n too, fences again and reads both slots.
+  A half cannot get two meetings ahead (its next meeting waits for the
+  other's count), so two slots per half suffice.
+- The two halves reach the same meetings in the same order, since in the
+  console flow both take the console wave's branches. A lower half with no
+  upper half (the last console wave of a group with 32 or fewer threads
+  past a multiple of 64) does not wait, and its exchange gives 0 for the
+  missing half, as in a group of 32 threads.
+- The wait is a loop in the host program. Its block is split there, which
+  an instruction's lowering does not expect in its middle: the masks an
+  instruction reads whole are exchanged before it (`Lower::meet_before`),
+  and a branch's test at the end of its block. A mask read whole inside an
+  instruction anyway stops with its own reason; nothing is exchanged there.
+- The wait gives up after the loop limit (`VICTORY_SHADER_LOOP_LIMIT`)
+  polls, so a half that left the program early (a loop cut short at the
+  limit) cannot hang the host GPU.
+
+The program's own `s_barrier` stays a group barrier: every console wave
+of the group reaches it on the console too.
+
+### Whole-wave reductions and prefixes in halves
+
+A whole-wave section (`emit::wave`) leaves values that are a reduction or a
+prefix over the console wave. In halves, the host's wave operation covers
+one half. The console flow combines the halves' results through an
+exchange: a reduction takes both halves' (in the same order in both), a
+half with no thread counting as the operation's identity; a prefix sum adds
+the lower half's total in the upper half; a 64-bit float sum exchanges both
+dwords of each half's sum.
 
 ### The console flow on every host
 
@@ -202,7 +241,8 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    whose waves already meet at barriers.
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
-6. Multi-wave groups (counters), then ~~one-wave LDS sharing~~.
+6. ~~Multi-wave groups (counters), then one-wave LDS sharing.~~ Whole-wave
+   sections in halves too.
 
 ## Credit
 

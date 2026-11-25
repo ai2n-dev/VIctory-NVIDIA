@@ -1079,7 +1079,7 @@ mod tests {
     };
 
     #[test]
-    fn console_lanes_translate_only_for_hosts_with_that_wave_size() {
+    fn console_lanes_translate_for_hosts_with_and_without_that_wave_size() {
         let words = [
             0xD760_0000,
             0x0001_0B00, // v_readlane_b32 s0, v0, 5
@@ -1091,16 +1091,11 @@ mod tests {
         assert!(emit_for(&wave64, Target::ANY).is_ok());
         assert!(emit_for(&wave64, RDNA).is_ok());
         assert!(emit_for(&wave64, NVIDIA).is_ok());
-        // Two per group: the halves cannot meet at a group barrier yet.
+        // Two per group: there too, each console wave's halves meeting on
+        // their own (`lower::Lower::pair_meet`).
         let two = compute_of(&words, true, 128);
         assert!(emit_for(&two, RDNA).is_ok());
-        assert_eq!(
-            emit_for(&two, NVIDIA),
-            Err(crate::ShaderError::Unsupported {
-                offset: 0,
-                what: "console wave64 lanes on a host without 64-lane waves",
-            })
-        );
+        assert!(emit_for(&two, NVIDIA).is_ok());
         // The same code in waves of 32 runs on either.
         let wave32 = compute(&words, false);
         assert!(emit_for(&wave32, NVIDIA).is_ok());
@@ -1136,10 +1131,10 @@ mod tests {
     }
 
     /// On every hardware adapter: a wave64 program that reads other lanes
-    /// translates in groups of one console wave (natively or in the console
-    /// flow) and the adapter takes it; in groups of two it translates
-    /// exactly when the adapter runs 64-lane waves. On a machine with an AMD
-    /// and an NVIDIA GPU this checks both answers.
+    /// translates in groups of one console wave and of two (natively, or in
+    /// the console flow where the adapter has no 64-lane waves), and the
+    /// adapter takes it. On a machine with an AMD and an NVIDIA GPU this
+    /// checks both forms.
     #[test]
     #[cfg(windows)]
     fn each_adapter_gets_what_it_runs() {
@@ -1159,14 +1154,10 @@ mod tests {
                 emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
             host.compute_pipeline(&one)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
-            match emit_for(&compute_of(&words, true, 128), target) {
-                Ok(cs) => {
-                    assert!(target.runs(64), "{name}");
-                    host.compute_pipeline(&cs)
-                        .unwrap_or_else(|e| panic!("{name}: {e}"));
-                }
-                Err(_) => assert!(!target.runs(64), "{name}"),
-            }
+            let two = emit_for(&compute_of(&words, true, 128), target)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            host.compute_pipeline(&two)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 

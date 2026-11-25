@@ -1973,13 +1973,13 @@ impl Lower<'_> {
                 Ok(())
             }
             // Each lane reads a lane of its row of 16, or of the other row of
-            // its half of 32, picked by its nibble of {src2, src1}.
+            // its half of 32, picked by its nibble of {src2, src1}. That
+            // stays in the lane's half of a wave64: split in halves, the
+            // host lane is the console lane's place in its half, and the
+            // host wave holds the half.
             "v_permlane16_b32" | "v_permlanex16_b32" => {
                 let (a, s1, s2) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 self.cross_lane(false)?;
-                if self.split || self.console_cf {
-                    return Err("a lane permutation in a program split in halves");
-                }
                 let l = self.lane_index();
                 let k = |l: &mut Self, x: u32| l.s.m.i32(x);
                 let (k7, k8, k2, k15, top, zero) =

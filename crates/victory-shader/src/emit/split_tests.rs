@@ -284,10 +284,12 @@ fn exchanges_inside_a_branch_one_half_skips() {
     });
 }
 
-/// Groups of several console waves need the halves to meet without a
-/// group barrier: not yet.
+/// Groups of several console waves run in the console flow too, their
+/// halves meeting in pairs (`Lower::pair_meet`): waves of 32 where the host
+/// has no others, the console's 64 where it runs them. Refused before on
+/// hosts without 64-lane waves.
 #[test]
-fn console_flow_is_for_one_console_wave_per_group() {
+fn several_console_waves_per_group_translate_in_waves_of_32() {
     let body = [
         0xD760_0009,
         0x0001_5100, // v_readlane_b32 s9, v0, 40
@@ -297,8 +299,17 @@ fn console_flow_is_for_one_console_wave_per_group() {
         lanes_min: 32,
         lanes_max: 32,
     };
-    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
-    assert!(emit_for(&program(&body, 128), nvidia).is_err());
+    let rdna = super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    for threads in [64, 96, 128, 256, 1024] {
+        let p = program(&body, threads);
+        let cs = emit_for(&p, nvidia).unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(32), "{threads} threads");
+        let cs = emit_for(&p, rdna).unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        assert_eq!(wave_size(&cs.dxil), Some(64), "{threads} threads");
+    }
 }
 
 /// A loop lane t runs t times, with a lane read of the other half in
@@ -555,6 +566,364 @@ fn one_console_wave_with_lds_translates_without_64_lane_waves() {
         let cs = emit_for(&p, rdna).expect("translates with 64-lane waves");
         assert_eq!(wave_size(&cs.dxil), Some(64));
     }
-    // Two console waves per group still cannot meet at a barrier.
-    assert!(emit_for(&program_lds(&lanes, 128), nvidia).is_err());
+    // Two console waves per group: their halves meet in pairs.
+    let cs = emit_for(&program_lds(&lanes, 128), nvidia).expect("two console waves");
+    assert_eq!(wave_size(&cs.dxil), Some(32));
+}
+
+// ---- Groups of several console waves (`Lower::pair_meet`) ----
+
+/// Threads of console wave `w` in a group of `threads`.
+fn wave_threads(threads: u32, w: u32) -> u32 {
+    threads.saturating_sub(64 * w).min(64)
+}
+
+/// [`flow_case`] for groups of several console waves: lane t's expected
+/// value is `want(t, threads)`.
+fn waves_case(label: &str, body: &[u32], counts: &[u32], want: impl Fn(u32, u32) -> u32) {
+    for &threads in counts {
+        console_flow_case(label, body, threads, |t| want(t, threads));
+    }
+}
+
+/// v1 = the lane's place in its console wave (t & 63), v5 = its console
+/// wave in the group (t >> 6).
+const LANE_AND_WAVE: [u32; 2] = [
+    0x3602_00BF, // v_and_b32 v1, 63, v0
+    0x2C0A_0086, // v_lshrrev_b32 v5, 6, v0
+];
+
+/// Each console wave counts its own lanes below 40 - w: the halves of every
+/// console wave exchange their ballots, without the group's other waves.
+/// 96 and 80 threads: the last console wave has a lower half only.
+#[test]
+fn several_console_waves_count_their_own_masks() {
+    let mut body = LANE_AND_WAVE.to_vec();
+    body.extend([
+        0x4C0C_0AA8, // v_sub_nc_u32 v6, 40, v5
+        0x7D88_0306, // v_cmp_gt_u32 vcc, v6, v1
+        0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ]);
+    waves_case(
+        "s_bcnt1 of lanes below 40 - wave",
+        &body,
+        &[128, 256, 96, 80, 112, 1024],
+        |t, n| (40 - t / 64).min(wave_threads(n, t / 64)),
+    );
+}
+
+/// Lanes of the other half, each console wave its own: lane 40 of the wave
+/// (in the upper half), and lane 10 inside a branch only lanes below 20
+/// take (the upper half has no lane there but meets the lower one).
+#[test]
+fn several_console_waves_read_their_own_lanes() {
+    let body = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    waves_case("v_readlane 40", &body, &[128, 256, 112], |t, _| {
+        (t & !63) + 40
+    });
+    let mut body = LANE_AND_WAVE.to_vec();
+    body.extend([
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0294, // v_cmp_gt_u32 vcc, 20, v1
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0003, // s_cbranch_execz +3
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ]);
+    waves_case(
+        "if (lane < 20) v2 = readlane(10)",
+        &body,
+        &[128, 256, 96, 80],
+        |t, _| if t & 63 < 20 { (t & !63) + 10 } else { 1 },
+    );
+}
+
+/// Masks read as numbers by an instruction, which the halves exchange
+/// before it (`Lower::meet_before`): EXEC by `v_readfirstlane` (lanes at or
+/// past 20 of each console wave read lane 20, in the lower half, the upper
+/// half too; the lanes are counted with `s_bcnt1` after), and EXEC by
+/// `v_mbcnt` (odd lanes count the odd lanes below them across the halves).
+#[test]
+fn several_console_waves_read_masks_as_numbers() {
+    let mut first = LANE_AND_WAVE.to_vec();
+    first.extend([
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D86_0294, // v_cmp_le_u32 vcc, 20, v1
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0002, // s_cbranch_execz +2
+        0x7E12_0500, // v_readfirstlane_b32 s9, v0
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE8E_107E, // s_bcnt1_i32_b64 s14, exec
+        0x4A04_040E, // v_add_nc_u32 v2, s14, v2
+    ]);
+    waves_case(
+        "v_readfirstlane past lane 20, + lanes",
+        &first,
+        &[128, 256, 96, 112],
+        |t, n| {
+            let first = if t & 63 >= 20 { (t & !63) + 20 } else { 1 };
+            first + wave_threads(n, t / 64)
+        },
+    );
+    let mut count = LANE_AND_WAVE.to_vec();
+    count.extend([
+        0x7E04_02FF,
+        1000,        // v_mov_b32 v2, 1000
+        0x3608_0081, // v_and_b32 v4, 1, v0
+        0x7D84_0881, // v_cmp_eq_u32 vcc, 1, v4
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0004, // s_cbranch_execz +4
+        0xD765_0002,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v2, exec_lo, 0
+        0xD766_0002,
+        0x0002_047F, // v_mbcnt_hi_u32_b32 v2, exec_hi, v2
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ]);
+    waves_case("v_mbcnt of odd lanes", &count, &[128, 256, 96], |t, _| {
+        if t & 1 == 1 { (t & 63) / 2 } else { 1000 }
+    });
+}
+
+/// A loop whose trip count differs between the group's console waves
+/// ((t >> 1) & 63: up to 31 in waves 0 and 2, up to 63 in waves 1 and 3),
+/// with a lane read of the other half in every iteration: each console
+/// wave loops while any of its lanes does, its halves meeting in every
+/// iteration while the other waves are elsewhere.
+#[test]
+fn several_console_waves_loop_on_their_own() {
+    let body = [
+        0x2C02_0081, // v_lshrrev_b32 v1, 1, v0
+        0x3602_02BF, // v_and_b32 v1, 63, v1
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7D8A_0280, // v_cmp_ne_u32 vcc, 0, v1
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0006, // s_cbranch_execz end
+        // loop:
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+        0x7D82_0302, // v_cmp_lt_u32 vcc, v2, v1
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        // end:
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    waves_case(
+        "loop (t >> 1) & 63 times reading lane 40",
+        &body,
+        &[128, 256, 112],
+        |t, _| ((t >> 1) & 63) + (t & !63) + 40,
+    );
+}
+
+/// [`program_lds`] with `bytes` of LDS (in 512-byte steps).
+fn program_lds_bytes(body: &[u32], threads: u32, bytes: u32) -> crate::NativeProgram {
+    let mut p = program(body, threads);
+    if let StageIo::Cs(io) = &mut p.io {
+        io.rsrc2 |= bytes.div_ceil(512) << 15;
+    }
+    p
+}
+
+/// LDS shared within each console wave of a group of several: lane t
+/// writes dword t, then reads dword t ^ 32 (the other half of its console
+/// wave) without a barrier; the halves meet between the two.
+#[test]
+fn several_console_waves_share_lds_within_each() {
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    let mut body = LDS_OWN.to_vec();
+    body.extend([
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x3A08_00A0, // v_xor_b32 v4, 32, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0200_0004, // ds_read_b32 v2, v4
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ]);
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let split = !host.target().runs(64);
+        for threads in [128, 256] {
+            let p = program_lds_bytes(&body, threads, threads * 4);
+            let groups = 2;
+            let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let want: Vec<u32> = (0..groups)
+                .flat_map(|_| (0..threads).map(|t| (t ^ 32) + (t & !63) + 40))
+                .collect();
+            assert_eq!(out, want, "{name}: {threads} threads (split {split})");
+            eprintln!("{name}: LDS within each of {threads} threads' waves exact (split {split})");
+        }
+    }
+}
+
+// ---- Whole-wave sections in halves (`Lower::both_halves`) ----
+
+/// A whole-wave sum of `v0` as the console compiler expands it for wave64
+/// (llvm-mc, gfx1030, from `wave::tests`, registers moved): each half
+/// summed with DPP and `v_permlanex16`, then lanes 0 and 32 read and added
+/// in s12. `op` picks the operation: (VOP2 opcode, SOP2 opcode, the
+/// identity's inline code, the data's VGPR).
+fn wave_reduce(vop2: u32, sop2: u32, ident: u32, data: u32) -> Vec<u32> {
+    let dpp = |xmask: u32| {
+        [
+            vop2 << 25 | 1 << 17 | 1 << 9 | 0xFA,
+            0xFF01_6001 | xmask << 8,
+        ]
+    };
+    let mut words = vec![
+        0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+        0xD501_0001,
+        10 << 18 | (0x100 + data) << 9 | ident, // v_cndmask_b32_e64 v1, ident, v<data>, s[10:11]
+    ];
+    for xmask in [1, 2, 4, 8] {
+        words.extend(dpp(xmask)); // v_<op>_dpp v1, v1, v1 row_xmask:<xmask>
+    }
+    words.extend([
+        0xD778_0002,
+        0x0305_8301,                           // v_permlanex16_b32 v2, v1, -1, -1
+        vop2 << 25 | 1 << 17 | 2 << 9 | 0x101, // v_<op> v1, v1, v2
+        0xD760_000C,
+        0x0001_0101, // v_readlane_b32 s12, v1, 0
+        0xD760_000D,
+        0x0001_4101,                                        // v_readlane_b32 s13, v1, 32
+        0x8000_0000 | sop2 << 23 | 12 << 16 | 13 << 8 | 12, // s_<op> s12, s12, s13
+        0xBEFE_040A,                                        // s_mov_b64 exec, s[10:11]
+        0x7E04_020C,                                        // v_mov_b32 v2, s12
+    ]);
+    words
+}
+
+/// Console wave `w`'s threads in a group of `n`.
+fn wave_lanes(t: u32, n: u32) -> std::ops::Range<u32> {
+    let w = t / 64;
+    64 * w..64 * w + wave_threads(n, w)
+}
+
+/// Whole-wave reductions: the host's wave operation covers a half, the
+/// halves' results are combined. 96 threads: the second console wave has
+/// no upper half, which counts as the identity (for a minimum, not 0).
+#[test]
+fn whole_wave_reductions_combine_both_halves() {
+    let counts = [64, 48, 128, 96, 256];
+    // v_add_nc_u32 / s_add_u32 over t.
+    let sum = wave_reduce(0x25, 0, 0x80, 0);
+    waves_case("WaveActiveSum(t)", &sum, &counts, |t, n| {
+        wave_lanes(t, n).sum()
+    });
+    // v_min_u32 / s_min_u32 over 1000 - t (its least in the upper half).
+    let mut min = vec![
+        0x4C08_00FF,
+        1000, // v_sub_nc_u32 v4, 1000, v0
+    ];
+    min.extend(wave_reduce(0x13, 7, 0xC1, 4));
+    waves_case("WaveActiveMin(1000 - t)", &min, &counts, |t, n| {
+        wave_lanes(t, n).map(|x| 1000 - x).min().unwrap()
+    });
+}
+
+/// An inclusive prefix sum over the console wave (llvm-mc, gfx1030, as in
+/// `wave::tests`, carried to the upper half): row_shr steps in rows of 16,
+/// the even rows' totals into the odd rows (`v_permlanex16`, row-masked DPP
+/// move), then lane 31's total added to rows 2 and 3.
+const PREFIX_SUM: &[u32] = &[
+    0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+    0xD501_0001,
+    0x002A_0080, // v_cndmask_b32_e64 v1, 0, v0, s[10:11]
+    0x4A02_02FA,
+    0xFF01_1101, // v_add_nc_u32_dpp v1, v1, v1 row_shr:1
+    0x4A02_02FA,
+    0xFF01_1201, // v_add_nc_u32_dpp v1, v1, v1 row_shr:2
+    0x4A02_02FA,
+    0xFF01_1401, // v_add_nc_u32_dpp v1, v1, v1 row_shr:4
+    0x4A02_02FA,
+    0xFF01_1801, // v_add_nc_u32_dpp v1, v1, v1 row_shr:8
+    0xD778_0002,
+    0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+    0x7E06_0280, // v_mov_b32 v3, 0
+    0x7E06_02FA,
+    0xAF00_E402, // v_mov_b32_dpp v3, v2 quad_perm:[0,1,2,3] row_mask:0xa
+    0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+    0xD760_0010,
+    0x0001_3F01, // v_readlane_b32 s16, v1, 31
+    0x7E0A_0210, // v_mov_b32 v5, s16
+    0x4A02_02FA,
+    0xCF00_E405, // v_add_nc_u32_dpp v1, v5, v1 quad_perm:[0,1,2,3] row_mask:0xc
+    0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+    0x7E04_0301, // v_mov_b32 v2, v1
+];
+
+/// The prefix sum: the upper half adds the lower half's total.
+#[test]
+fn whole_wave_prefix_sums_carry_the_lower_half() {
+    waves_case(
+        "inclusive WavePrefixSum(t)",
+        PREFIX_SUM,
+        &[64, 48, 128, 96, 256],
+        |t, n| wave_lanes(t, n).filter(|&x| x <= t).sum(),
+    );
+}
+
+// ---- `v_permlane16` / `v_permlanex16` in halves ----
+
+/// Each lane reads its row's lane 15 - (its place in the row), in its own
+/// row (`v_permlane16`) and in the other row of its half
+/// (`v_permlanex16`). Within a half: split in halves on a host without
+/// 64-lane waves, no console flow. Refused before on such hosts.
+#[test]
+fn permlanes_stay_in_their_half() {
+    let select = [
+        0xBE8C_03FF,
+        0x89AB_CDEF, // s_mov_b32 s12, 0x89abcdef
+        0xBE8D_03FF,
+        0x0123_4567, // s_mov_b32 s13, 0x01234567
+    ];
+    let mut row = select.to_vec();
+    row.extend([
+        0xD777_0002,
+        0x0034_1900, // v_permlane16_b32 v2, v0, s12, s13
+    ]);
+    let mut other = select.to_vec();
+    other.extend([
+        0xD778_0002,
+        0x0034_1900, // v_permlanex16_b32 v2, v0, s12, s13
+    ]);
+    for threads in [64, 128, 32] {
+        flow_case(
+            "v_permlane16 reversing rows",
+            &row,
+            threads,
+            |t| t ^ 15,
+            true,
+        );
+        flow_case(
+            "v_permlanex16 reversing rows",
+            &other,
+            threads,
+            |t| t ^ 31,
+            true,
+        );
+    }
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let cs = emit_for(&program(&row, 64), nvidia).expect("split in halves");
+    assert_eq!(wave_size(&cs.dxil), Some(32));
 }
