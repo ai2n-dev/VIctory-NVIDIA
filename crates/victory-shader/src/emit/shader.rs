@@ -25,6 +25,7 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// UAVs in a vertex, geometry or mesh program.
     pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
+    pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -94,6 +95,8 @@ pub(crate) struct Shader {
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
     pub flags: u64,
+    /// A POPS pixel shader whose heap UAV writes must be rasterizer-ordered.
+    pub ordered: bool,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
@@ -156,6 +159,7 @@ impl Shader {
             root_uavs_shared: false,
             stride_table: None,
             flags: 0,
+            ordered: false,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
@@ -430,6 +434,13 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        // (bit 12 of word 0 is UAV; bit 13 marks it rasterizer-ordered)
+        let props = if self.ordered && !sampler && props.0 & 0x1000 != 0 {
+            self.flags |= flags::ROVS;
+            (props.0 | 0x2000, props.1)
+        } else {
+            props
+        };
         self.nonuniform_handles += u32::from(nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
@@ -457,6 +468,7 @@ impl Shader {
         for (flag, used) in [
             (flags::RESOURCE_HEAP, uses.heap),
             (flags::SAMPLER_HEAP, uses.sampler_heap),
+            (flags::ROVS, uses.rovs),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
         ] {
@@ -795,6 +807,9 @@ impl Shader {
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
         }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
+        }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
         }
@@ -934,6 +949,48 @@ mod tests {
                 v.validate(&mut dxil)
                     .unwrap_or_else(|err| panic!("{kind} shader failed validation: {err}"));
             }
+        }
+    }
+
+    #[test]
+    fn ordered_pixel_marks_heap_uavs_as_rovs() {
+        let mut validator = Validator::load(Validator::default_path().as_deref()).ok();
+        let sfi0 = |dxil: &[u8]| -> u64 {
+            let c = crate::dxbc::Container::parse(dxil).unwrap();
+            let part = c.part(crate::dxbc::FourCC::SFI0).unwrap();
+            u64::from_le_bytes(part.data[..8].try_into().unwrap())
+        };
+        // Live heap UAV handle in an ordered PS: annotated with bit 13 (ROV) and declares SFI0 0x1000.
+        let mut s = Shader::new(true);
+        s.ordered = true;
+        let b = s.entry;
+        let index = s.m.i32(0);
+        let h = s.heap_handle(b, index, false, false, (11 | 0x1000, 0));
+        assert_ne!(s.annotations[0].0 & 0x2000, 0);
+        let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+        let iu = s.m.undef(s.t.i32);
+        let i32t = s.t.i32;
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+        s.m.terminate(b, Term::Ret);
+        let mut live = s.finish();
+        assert_ne!(sfi0(&live) & 0x1000, 0);
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut live)
+                .unwrap_or_else(|err| panic!("ordered PS live ROV failed validation: {err}"));
+        }
+
+        // Dead heap UAV handle in an ordered PS: DCE strips annotateHandle, so SFI0 must not declare ROVS.
+        let mut s = Shader::new(true);
+        s.ordered = true;
+        let b = s.entry;
+        let index = s.m.i32(0);
+        let _dead = s.heap_handle(b, index, false, false, (11 | 0x1000, 0));
+        s.m.terminate(b, Term::Ret);
+        let mut dead = s.finish();
+        assert_eq!(sfi0(&dead) & 0x1000, 0);
+        if let Some(v) = validator.as_mut() {
+            v.validate(&mut dead)
+                .unwrap_or_else(|err| panic!("ordered PS dead ROV failed validation: {err}"));
         }
     }
 }

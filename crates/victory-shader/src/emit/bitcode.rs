@@ -591,6 +591,19 @@ impl Module {
                     let sampler = args.get(2).and_then(|&a| self.int_value(a)).is_some_and(|x| x != 0);
                     u.heap |= !sampler;
                     u.sampler_heap |= sampler;
+                } else if name == "dx.op.annotateHandle" {
+                    // Arguments: opcode, handle, ResourceProperties aggregate;
+                    // bit 13 of word 0 marks a rasterizer-ordered view.
+                    let kind = args.get(2).and_then(|&a| match a {
+                        V::Const(i) => match &self.consts[i as usize].1 {
+                            Const::Aggregate(fields) => {
+                                fields.first().and_then(|&f| self.int_value(V::Const(f)))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                    u.rovs |= kind.is_some_and(|k| k & 0x2000 != 0);
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
             }
@@ -1083,6 +1096,8 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// Rasterizer-ordered views (`annotateHandle` bit 13).
+    pub rovs: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).

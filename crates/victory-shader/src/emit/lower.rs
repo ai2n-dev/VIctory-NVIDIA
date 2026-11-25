@@ -2499,6 +2499,9 @@ impl<'a> Lower<'a> {
                     Fields::Sop { src, .. } if src.contains(&Operand::Const(239))
                 )
             });
+        if uses_pops {
+            self.s.ordered = true;
+        }
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
