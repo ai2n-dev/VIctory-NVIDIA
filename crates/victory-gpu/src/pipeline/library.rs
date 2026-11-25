@@ -459,11 +459,33 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
     let tmp = path.with_extension(extension);
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let written = std::fs::write(&tmp, bytes).and_then(|()| rename_over(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// Renames `from` over the file `to`. Windows answers "access denied" when
+/// another rename onto `to` or a reader that opened it is in the way at that
+/// moment, and the same call succeeds a moment later, so a few attempts are
+/// made. A `to` that is a directory fails at once: no wait changes that.
+fn rename_over(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 20;
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt < ATTEMPTS
+                    && !to.is_dir() =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(attempt.into()));
+            }
+            done => return done,
+        }
+    }
 }
 
 /// Title pipeline keys drawn or dispatched with (this run and the last).
