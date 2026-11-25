@@ -136,33 +136,71 @@ const SHADER_VISIBLE: u32 = 1;
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
-/// so `Heap::drop` cannot free the heap concurrently.
+/// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    mirror_range(handle, 1, 1);
+}
+
+/// Makes the host descriptors for what the title wrote at the `count`
+/// slots `step` bytes apart from `handle`, finding the heap once for each
+/// run of them in one heap. Keeps `SHADER_HEAPS` locked for the duration
+/// so `Heap::drop` cannot free the heap concurrently.
+#[cfg(windows)]
+fn mirror_range(handle: u64, count: u32, step: u64) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(&(_, _, at)) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))
-    else {
-        return;
-    };
-    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
-    // the `SHADER_HEAPS` lock we hold here.
-    let heap = unsafe { &*(at as *const Heap) };
-    let Some(index) = heap.index(handle) else {
-        return;
-    };
-    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
-    match heap.host.get() {
-        None => pending.push(index),
-        Some(host) => {
-            drop(pending);
-            if let Some(host) = host {
-                host.mirror(index, handle, false);
+    let mut done = 0;
+    while done < count {
+        let at = handle + u64::from(done) * step;
+        let (n, found) = mirror_run(&heaps, at, count - done, step);
+        done += n;
+        let Some(heap) = found else {
+            continue;
+        };
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock we hold here.
+        let heap = unsafe { &*(heap as *const Heap) };
+        let slots = (0..u64::from(n)).filter_map(|k| {
+            let slot = at + k * step;
+            heap.index(slot).map(|index| (index, slot))
+        });
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.extend(slots.map(|(index, _)| index)),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    for (index, slot) in slots {
+                        host.mirror(index, slot, false);
+                    }
+                }
             }
         }
     }
+}
+
+/// Finds a consecutive run with the same first matching registered heap.
+/// A later-starting heap may take precedence, so stop at every new start.
+#[cfg(any(windows, test))]
+fn mirror_run(
+    heaps: &[(u64, u64, usize)],
+    at: u64,
+    remaining: u32,
+    step: u64,
+) -> (u32, Option<usize>) {
+    debug_assert!(remaining > 0 && step > 0);
+    let mut found = None;
+    let mut next = u64::MAX;
+    for &(start, end, heap) in heaps {
+        if (start..end).contains(&at) {
+            found.get_or_insert((end, heap));
+        } else if start > at {
+            next = next.min(start);
+        }
+    }
+    let end = found.map_or(next, |(end, _)| end.min(next));
+    let n = (end - at).div_ceil(step).min(u64::from(remaining)) as u32;
+    (n, found.map(|(_, heap)| heap))
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -564,9 +602,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 
@@ -850,5 +886,43 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+}
+
+#[cfg(test)]
+mod mirror_run_tests {
+    use super::mirror_run;
+
+    #[test]
+    fn batched_heap_lookup_matches_per_slot_order() {
+        let layouts: &[&[(u64, u64, usize)]] = &[
+            &[],
+            &[(16, 48, 1), (48, 80, 2)],
+            &[(32, 64, 1), (16, 80, 2)],
+            &[(16, 80, 1), (32, 64, 2)],
+            &[(24, 36, 1), (48, 72, 2)],
+        ];
+        for heaps in layouts {
+            for start in 0..90u64 {
+                for step in [1, 3, 8, 16, 32] {
+                    let count = 32u32;
+                    let mut done = 0;
+                    while done < count {
+                        let at = start + u64::from(done) * step;
+                        let (n, heap) = mirror_run(heaps, at, count - done, step);
+                        assert!(n > 0 && n <= count - done);
+                        for k in 0..n {
+                            let slot = at + u64::from(k) * step;
+                            let expected = heaps
+                                .iter()
+                                .find(|&&(a, b, _)| (a..b).contains(&slot))
+                                .map(|&(_, _, h)| h);
+                            assert_eq!(heap, expected);
+                        }
+                        done += n;
+                    }
+                }
+            }
+        }
     }
 }
