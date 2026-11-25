@@ -846,7 +846,7 @@ pub(crate) struct HostList {
     /// released it while a submission of it was still to run.
     kept: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
     /// Draws and dispatches recorded.
-    work: Mutex<usize>,
+    work: std::sync::atomic::AtomicUsize,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Queries begun in the list and not ended yet: host heap, type, index,
@@ -1268,7 +1268,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 kept: Mutex::default(),
-                work: Mutex::default(),
+                work: Default::default(),
                 writes: Default::default(),
                 clamp_chunks: Mutex::default(),
                 pipelines: Mutex::default(),
@@ -2091,7 +2091,7 @@ impl HostList {
         }
         self.release_kept();
         *self.deferred() = Deferred::default();
-        *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        self.work.store(0, Ordering::Relaxed);
         self.writes.store(0, Ordering::Relaxed);
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
@@ -2385,7 +2385,7 @@ impl HostList {
         let mut deferred = self.deferred();
         let before = deferred.writes.len();
         deferred.waits.push((before, wait));
-        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let work = self.work.load(Ordering::Relaxed);
         deferred.wait_marks.push(work);
     }
 
@@ -2393,7 +2393,7 @@ impl HostList {
     ///
     /// Work is draws, dispatches, clears and copies: what has to run first.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
-        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let work = self.work.load(Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.writes.push((dst as usize, what, bytes));
         deferred.marks.push(work);
@@ -2412,14 +2412,14 @@ impl HostList {
             events.push((*before, 0, format!("R[{:x}]>={:x}@{mark}", w.address, w.reference)));
         }
         events.sort_by_key(|e| (e.0, e.1));
-        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let work = self.work.load(Ordering::Relaxed);
         let texts: Vec<_> = events.into_iter().map(|e| e.2).collect();
         format!("{} ({work} in all)", texts.join(" "))
     }
 
     /// Whether the list has work: draws, dispatches, clears or copies.
     pub(crate) fn worked(&self) -> bool {
-        *self.work.lock().unwrap_or_else(|e| e.into_inner()) > 0
+        self.work.load(Ordering::Relaxed) > 0
     }
 
     /// How many queries begun in the list still run.
@@ -2508,7 +2508,7 @@ impl HostList {
 
     /// Counts a draw, dispatch, clear or copy.
     pub(crate) fn count_work(&self) {
-        *self.work.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.work.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Does the list's writes that come before its first wait not met, if no
