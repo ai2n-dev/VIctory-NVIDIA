@@ -344,7 +344,7 @@ impl Shader {
         Arc::new(Shader {
             stage: source.stage,
             hash: source.hash.clone(),
-            container: Vec::new(),
+            container: source.container.clone(),
             hair: source.hair,
             resolves_light: source.resolves_light,
             translated: cell,

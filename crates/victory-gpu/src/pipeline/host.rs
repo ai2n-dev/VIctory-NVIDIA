@@ -379,13 +379,16 @@ impl HostPipeline {
         // Mesh shaders whose standalone output footprint exceeds D3D12's 32 KiB
         // limit are re-translated together with their paired pixel shader,
         // pruning outputs the pixel shader never reads.
-        let linked = mesh.and_then(|ms| {
+        let linked = match mesh.and_then(|ms| {
             let bytes = victory_shader::emit::mesh_output_bytes(&ms.translated()?.host.dxil)?;
-            if bytes <= victory_shader::emit::MESH_OUTPUT_LIMIT {
-                return None;
-            }
-            super::translate_linked(ms, find("pixel").map(Arc::as_ref))
-        });
+            (bytes > victory_shader::emit::MESH_OUTPUT_LIMIT).then_some(ms)
+        }) {
+            Some(ms) => match super::translate_linked(ms, find("pixel").map(Arc::as_ref)) {
+                Some(pair) => Some(pair),
+                None => return refuse("mesh outputs beyond 32 KiB after linking", shaders),
+            },
+            None => None,
+        };
         let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
             Some((ms, ps)) => {
                 let mut v = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];
