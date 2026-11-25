@@ -1071,6 +1071,86 @@ void main() {
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
     }
 
+    /// Three consecutive clamps share a budget but write disjoint output ranges.
+    /// The scoped and global barriers must preserve which records get the budget.
+    #[test]
+    fn warp_scoped_budget_barrier_matches_global() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const STRIDE: u32 = 32;
+        const RECORDS: u32 = 3;
+        const BYTES: u64 = (STRIDE * RECORDS) as u64;
+        let mut results = Vec::new();
+        for scoped in [false, true] {
+            let (src, src_ptr, src_gpu) = warp.shared_buffer(u64::from(STRIDE));
+            let (budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (readback, out, _) = warp.shared_buffer(BYTES);
+            let dst = warp.default_uav(BYTES);
+            let input = [u32::MAX, u32::MAX, 17, 23, 31, 37, 41, 43];
+            let constants = [0u32, STRIDE, 1, 0, 0, 0];
+            // SAFETY: live mapped buffers and an open command list. Each dispatch
+            // writes its own aligned output span; only the budget is shared.
+            unsafe {
+                std::ptr::copy_nonoverlapping(input.as_ptr(), src_ptr.cast::<u32>(), input.len());
+                budget_ptr.cast::<u32>().write_volatile(0);
+                std::ptr::write_bytes(out, 0, BYTES as usize);
+                let l = &warp.list;
+                l.ResourceBarrier(&[transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                l.SetComputeRootSignature(&warp.clamp.root);
+                l.SetPipelineState(&warp.clamp.pso);
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src_gpu);
+                l.SetComputeRootShaderResourceView(2, src_gpu);
+                l.SetComputeRootUnorderedAccessView(4, budget_gpu);
+                for i in 0..RECORDS {
+                    l.SetComputeRootUnorderedAccessView(
+                        3,
+                        dst.GetGPUVirtualAddress() + u64::from(i * STRIDE),
+                    );
+                    l.Dispatch(1, 1, 1);
+                    let barrier = if scoped {
+                        uav_barrier_on(&budget)
+                    } else {
+                        uav_barrier()
+                    };
+                    l.ResourceBarrier(&[barrier]);
+                }
+                l.ResourceBarrier(&[transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&readback, 0, &dst, 0, BYTES);
+            }
+            warp.submit_and_wait();
+            // SAFETY: fence completed; mappings remain alive.
+            let (spent, words) = unsafe {
+                (
+                    budget_ptr.cast::<u32>().read_volatile(),
+                    std::slice::from_raw_parts(out.cast::<u32>(), BYTES as usize / 4).to_vec(),
+                )
+            };
+            assert_eq!(spent, 1 << 27);
+            for (i, record) in words.chunks_exact(8).enumerate() {
+                let counts = if i < 2 { [1 << 24, 4] } else { [0, 0] };
+                assert_eq!(&record[..2], &counts);
+                assert_eq!(&record[2..], &input[2..]);
+            }
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(src_ptr.cast::<u32>(), 8) },
+                &input
+            );
+            results.push(words);
+            drop(src);
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
     /// and `HostList::reset` end-to-end on the host device.
     #[test]
