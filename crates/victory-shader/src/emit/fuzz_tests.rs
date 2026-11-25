@@ -680,8 +680,6 @@ fn hardware_adapters() -> Vec<(u32, String)> {
 
 /// A device on hardware adapter `adapter`, or on WARP.
 fn device(adapter: Option<u32>) -> Result<Host, String> {
-    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-    use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::*;
     let Some(i) = adapter else {
         return Host::new(true);
@@ -691,23 +689,8 @@ fn device(adapter: Option<u32>) -> Result<Host, String> {
         let factory: IDXGIFactory4 =
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
         let a = factory.EnumAdapters1(i).map_err(|e| e.to_string())?;
-        let mut device: Option<ID3D12Device> = None;
-        D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(|e| e.to_string())?;
-        let device = device.ok_or("no device")?;
-        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-            HighestShaderModel: D3D_SHADER_MODEL_6_6,
-        };
-        device
-            .CheckFeatureSupport(
-                D3D12_FEATURE_SHADER_MODEL,
-                (&raw mut sm).cast(),
-                size_of_val(&sm) as u32,
-            )
-            .map_err(|e| e.to_string())?;
-        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-            return Err("below SM 6.6".into());
-        }
-        Ok(Host { device })
+        let adapter = windows::core::Interface::cast(&a).map_err(|e| e.to_string())?;
+        Host::from_adapter(&adapter)
     }
 }
 
