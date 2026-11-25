@@ -313,7 +313,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            match fastest_adapter() {
+            match chosen_adapter() {
                 Ok(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
                 Err(e) => {
                     tracing::warn!(error = %e, "no adapter preference; the default is used");
@@ -457,6 +457,50 @@ impl Host {
     }
 }
 
+/// The adapter `VICTORY_ADAPTER` names (a part of its description, ignoring
+/// case), or the one Windows ranks fastest. A machine with an integrated GPU
+/// as well as a discrete one can thus be told which to run on; a name that
+/// matches nothing falls back to the fastest, with a warning.
+fn chosen_adapter() -> windows::core::Result<IDXGIAdapter1> {
+    match std::env::var("VICTORY_ADAPTER") {
+        Ok(name) if !name.trim().is_empty() => named_adapter(name.trim()).inspect_err(|e| {
+            tracing::warn!(name, error = %e, "no adapter matches VICTORY_ADAPTER; the fastest is used");
+        }),
+        _ => fastest_adapter(),
+    }
+}
+
+/// The first hardware adapter whose description holds `name`, ignoring case.
+fn named_adapter(name: &str) -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let mut i = 0;
+        loop {
+            let adapter: IDXGIAdapter1 = factory.EnumAdapters1(i)?;
+            let desc = adapter.GetDesc1()?;
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            let description = String::from_utf16_lossy(&desc.Description[..end]);
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
+                && adapter_matches(&description, name)
+            {
+                tracing::info!(adapter = description, "host adapter chosen by VICTORY_ADAPTER");
+                return Ok(adapter);
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Whether an adapter description holds `wanted`, ignoring case.
+fn adapter_matches(description: &str, wanted: &str) -> bool {
+    description.to_lowercase().contains(&wanted.to_lowercase())
+}
+
 /// The adapter Windows ranks fastest, so a machine with an integrated GPU
 /// too runs on its discrete one.
 fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
@@ -579,6 +623,15 @@ mod tests {
         unsafe { slot(1).write_volatile(0) };
         host.execute(&[&list]);
         assert_eq!(value(1), 5);
+    }
+
+    /// A name picks an adapter by a part of its description, ignoring case.
+    #[test]
+    fn adapter_names_match_a_part_ignoring_case() {
+        assert!(adapter_matches("AMD Radeon RX 9070 XT", "radeon"));
+        assert!(adapter_matches("NVIDIA GeForce RTX 4070", "RTX 4070"));
+        assert!(!adapter_matches("AMD Radeon RX 9070 XT", "nvidia"));
+        assert!(adapter_matches("Intel(R) UHD Graphics", "intel"));
     }
 
     #[test]
