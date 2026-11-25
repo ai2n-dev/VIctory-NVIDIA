@@ -99,6 +99,14 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
 /// tables (`[1]`).
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Reserve device-local bytes without transiently exceeding the shared cap.
+fn reserve_card_bytes(used: &AtomicU64, size: u64, limit: u64) -> bool {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(size).filter(|&next| next <= limit)
+    })
+    .is_ok()
+}
+
 /// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
 static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
 
@@ -192,8 +200,7 @@ impl CardState {
         {
             return None;
         }
-        if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > max_bytes {
-            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        if !reserve_card_bytes(&CARD_BYTES[0], size, max_bytes) {
             return None;
         }
         Self::new_unchecked(host, staging, size, true)
@@ -985,6 +992,40 @@ fn drop_barriers(barriers: impl IntoIterator<Item = D3D12_RESOURCE_BARRIER>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_reservations_respect_limit_and_overflow() {
+        let used = AtomicU64::new(u64::MAX - 8);
+        assert!(!reserve_card_bytes(&used, 9, u64::MAX));
+        assert_eq!(used.load(Ordering::Relaxed), u64::MAX - 8);
+        assert!(reserve_card_bytes(&used, 8, u64::MAX));
+        assert!(!reserve_card_bytes(&used, 1, u64::MAX));
+        used.fetch_sub(8, Ordering::Relaxed);
+        assert!(reserve_card_bytes(&used, 8, u64::MAX));
+    }
+
+    #[test]
+    fn concurrent_card_reservations_share_one_limit() {
+        let used = AtomicU64::new(0);
+        let gate = std::sync::Barrier::new(8);
+        let accepted = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        reserve_card_bytes(&used, 64, 192)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|&ok| ok)
+                .count()
+        });
+        assert_eq!(accepted, 3);
+        assert_eq!(used.load(Ordering::Relaxed), 192);
+    }
 
     #[test]
     fn range_helpers_merge_and_convert_pieces() {
