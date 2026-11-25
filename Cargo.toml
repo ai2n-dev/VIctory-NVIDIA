@@ -64,3 +64,11 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# Performance comparison build. Keep the normal release and diagnostics
+# profiles unchanged so incremental testing is not forced to relink with LTO.
+# cargo build --profile release-lto --locked -p victory
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
