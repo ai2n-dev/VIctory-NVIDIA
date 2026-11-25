@@ -311,7 +311,12 @@ pub(crate) fn video_memory() -> Option<[(u64, u64); 2]> {
 
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            // Its threads start now, not inside the first submission that
+            // splits a copy.
+            crate::workpool::threads();
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -320,13 +325,13 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
-/// Waits for any in-flight async host GPU submissions without creating the
-/// host device if it has not been initialised yet.
 /// Whether a submission is still to be waited for and finished.
 pub(crate) fn has_in_flight() -> bool {
     matches!(HOST.get(), Some(Some(h)) if h.has_in_flight())
 }
 
+/// Waits for any in-flight async host GPU submissions without creating the
+/// host device if it has not been initialised yet.
 pub(crate) fn wait_in_flight_if_ready() {
     if let Some(Some(h)) = HOST.get() {
         h.wait_in_flight();
