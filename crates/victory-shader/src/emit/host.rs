@@ -106,10 +106,6 @@ pub struct Host {
     pub device: ID3D12Device,
     #[cfg(test)]
     queue: Arc<Mutex<SharedQueue>>,
-    /// Held while a WARP `Host` is alive so concurrent tests never run on
-    /// `d3d10warp`'s threadpool at the same time (avoids `0xC0000005` races in
-    /// `d3d10warp!OpenAdapter10_2` / `TpCallbackMayRunLong`).
-    _warp_guard: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 #[cfg(test)]
@@ -327,25 +323,15 @@ impl Host {
         }
     }
 
-    fn host_from_cached(
-        cached: CachedDevice,
-        warp_guard: Option<std::sync::MutexGuard<'static, ()>>,
-    ) -> Self {
+    fn host_from_cached(cached: CachedDevice) -> Self {
         #[cfg(test)]
         {
             let (device, queue) = cached;
-            Self {
-                device,
-                queue,
-                _warp_guard: warp_guard,
-            }
+            Self { device, queue }
         }
         #[cfg(not(test))]
         {
-            Self {
-                device: cached,
-                _warp_guard: warp_guard,
-            }
+            Self { device: cached }
         }
     }
 
@@ -356,10 +342,10 @@ impl Host {
             // device, and without it the device has no info queue.
             enable_debug_layer();
             if warp {
-                static WARP_LOCK: Mutex<()> = Mutex::new(());
-                let guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                // Reuse one process-wide WARP device so concurrent tests never
-                // tear down `d3d10warp`'s threadpool while another thread uses it.
+                // Reuse one process-wide WARP device and serialized `SharedQueue`
+                // without holding a non-reentrant mutex across `Host`'s lifetime,
+                // so tests collecting both `Host::new(false)` and `Host::new(true)`
+                // when `VICTORY_WARP=1` never self-deadlock on the same thread.
                 static WARP_DEVICE: OnceLock<Result<CachedDevice, String>> = OnceLock::new();
                 return WARP_DEVICE
                     .get_or_init(|| {
@@ -372,7 +358,7 @@ impl Host {
                         Self::finish_device(dev.ok_or("no device")?)
                     })
                     .clone()
-                    .map(|cached| Self::host_from_cached(cached, Some(guard)));
+                    .map(Self::host_from_cached);
             }
             // Serialize and reuse hardware D3D12 devices and queues per adapter
             // LUID so parallel test threads do not hammer `OpenAdapter12` or
@@ -405,7 +391,7 @@ impl Host {
                 })
                 .clone()?;
             drop(guard);
-            Ok(Self::host_from_cached(cached, None))
+            Ok(Self::host_from_cached(cached))
         }
     }
 
