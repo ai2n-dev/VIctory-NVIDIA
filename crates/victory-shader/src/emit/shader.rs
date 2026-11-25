@@ -23,6 +23,8 @@ pub(crate) mod flags {
     pub const DOUBLE_EXT: u64 = 1 << 6;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -445,6 +447,10 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        let compute = self.threads.is_some() && self.mesh.is_none() && !self.rectangles;
+        if !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -769,6 +775,9 @@ impl Shader {
         if self.flags & flags::DOUBLE_EXT != 0 {
             features |= 0x20;
         }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -877,5 +886,43 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+    use crate::emit::validator::Validator;
+
+    #[test]
+    fn uavs_outside_pixel_and_compute_programs_are_declared() {
+        let mut validator = Validator::load(Validator::default_path().as_deref()).ok();
+        for (kind, pixel, threads, heap) in [
+            ("vs", false, None, false),
+            ("ps", true, None, false),
+            ("cs", false, Some([64, 1, 1]), false),
+            ("vs_heap", false, None, true),
+        ] {
+            let mut s = Shader::new(pixel);
+            s.threads = threads;
+            let b = s.entry;
+            let h = if heap {
+                let index = s.m.i32(0);
+                s.heap_handle(b, index, false, false, (11 | 0x1000, 0))
+            } else {
+                s.root_uav_handle(1, true)
+            };
+            let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+            let iu = s.m.undef(s.t.i32);
+            let i32t = s.t.i32;
+            s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, or, zero, iu, iu, one]);
+            s.m.terminate(b, Term::Ret);
+            let mut dxil = s.finish();
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil)
+                    .unwrap_or_else(|err| panic!("{kind} shader failed validation: {err}"));
+            }
+        }
     }
 }
