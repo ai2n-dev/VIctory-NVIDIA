@@ -450,7 +450,7 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = guarded(|| execute(&job.request));
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -794,6 +794,16 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Runs a request, failing it if it panics (malformed title data reaching a
+/// decoder). A worker that unwound would leave the request running for good,
+/// its staging bytes held and whoever waits for it blocked.
+fn guarded(run: impl FnOnce() -> Result<(), HRESULT>) -> Result<(), HRESULT> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|_| {
+        tracing::error!("dstorage: a request panicked and was failed");
+        Err(INVALID_DATA)
+    })
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -1028,6 +1038,13 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn a_panicking_request_fails_instead_of_ending_its_worker() {
+        assert_eq!(guarded(|| Ok(())), Ok(()));
+        assert_eq!(guarded(|| Err(E_NOTIMPL)), Err(E_NOTIMPL));
+        assert_eq!(guarded(|| panic!("a malformed stream")), Err(INVALID_DATA));
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
