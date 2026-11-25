@@ -7,6 +7,7 @@
 //!
 //! On by default; `VICTORY_DRIVER_WATCH=0` disables the subscription.
 
+use std::ffi::OsStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use windows_sys::Win32::System::EventLog::{
@@ -24,9 +25,18 @@ pub(crate) fn errors() -> u64 {
     ERRORS.load(Relaxed)
 }
 
+fn should_watch(value: Option<&OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+fn record_seen(errors: &AtomicU64, tripped: &AtomicBool) -> (u64, bool) {
+    let n = errors.fetch_add(1, Relaxed) + 1;
+    let first = !tripped.swap(true, Relaxed);
+    (n, first)
+}
+
 fn seen() {
-    let n = ERRORS.fetch_add(1, Relaxed) + 1;
-    let first = !TRIPPED.swap(true, Relaxed);
+    let (n, first) = record_seen(&ERRORS, &TRIPPED);
     tracing::error!(
         n,
         first,
@@ -49,7 +59,7 @@ unsafe extern "system" fn on_event(
 pub(crate) fn start() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        if std::env::var_os("VICTORY_DRIVER_WATCH").is_some_and(|v| v == "0") {
+        if !should_watch(std::env::var_os("VICTORY_DRIVER_WATCH").as_deref()) {
             return;
         }
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
@@ -90,12 +100,33 @@ mod tests {
 
     #[test]
     fn the_first_error_trips_the_switch_and_every_one_is_counted() {
-        assert!(!TRIPPED.load(Relaxed));
-        assert_eq!(errors(), 0);
-        seen();
+        let count = AtomicU64::new(0);
+        let flag = AtomicBool::new(false);
+        assert_eq!(record_seen(&count, &flag), (1, true));
+        assert_eq!(record_seen(&count, &flag), (2, false));
+
+        // Verify global `seen()` / `on_event` integration too.
+        let before = errors();
+        // Non-deliver action is ignored.
+        // SAFETY: pure callback exercising action filtering.
+        let r0 = unsafe { on_event(0, std::ptr::null(), 0) };
+        assert_eq!(r0, 0);
+        assert_eq!(errors(), before);
+        // Deliver action increments global counter and sets `TRIPPED`.
+        // SAFETY: pure callback with `EvtSubscribeActionDeliver`.
+        let r1 = unsafe { on_event(EvtSubscribeActionDeliver, std::ptr::null(), 0) };
+        assert_eq!(r1, 0);
+        assert_eq!(errors(), before + 1);
         assert!(TRIPPED.load(Relaxed));
         seen();
-        assert_eq!(errors(), 2);
+        assert_eq!(errors(), before + 2);
+    }
+
+    #[test]
+    fn watch_switch_honors_env_override() {
+        assert!(should_watch(None));
+        assert!(should_watch(Some(OsStr::new("1"))));
+        assert!(!should_watch(Some(OsStr::new("0"))));
     }
 
     #[test]

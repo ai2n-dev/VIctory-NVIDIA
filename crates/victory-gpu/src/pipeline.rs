@@ -836,6 +836,17 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    #[cfg(windows)]
+    #[test]
+    fn frame_log_counts_read_library_counters() {
+        let before = frame_log_counts();
+        library::MADE.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        library::LOADED.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        let after = frame_log_counts();
+        assert_eq!(after.0, before.0 + 2);
+        assert_eq!(after.1, before.1 + 3);
+    }
+
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
             .shaders

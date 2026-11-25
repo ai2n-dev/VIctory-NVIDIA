@@ -64,6 +64,11 @@ pub fn add(t: T, n: u64) {
     TOTAL[t as usize].fetch_add(n, Relaxed);
 }
 
+#[cfg(test)]
+pub(crate) fn total(t: T) -> u64 {
+    TOTAL[t as usize].load(Relaxed)
+}
+
 /// Thread-local counters accumulated on the presenting thread between presents.
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -152,17 +157,27 @@ fn cpu_sets() -> Vec<(u32, u8, u8)> {
     sets
 }
 
+fn parse_on(value: Option<&std::ffi::OsStr>, diagnostics: bool) -> bool {
+    match value {
+        Some(v) => v != "0",
+        None => diagnostics,
+    }
+}
+
 /// Whether per-frame breakdown logging is active.
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var_os("VICTORY_FRAME_LOG") {
-        Some(v) => v != "0",
-        None => cfg!(feature = "diagnostics"),
+    *ON.get_or_init(|| {
+        parse_on(
+            std::env::var_os("VICTORY_FRAME_LOG").as_deref(),
+            cfg!(feature = "diagnostics"),
+        )
     })
 }
 
 fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
-    (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) / 10
+    // Disjoint 32-bit halves: `+` matches `|` and avoids equivalent `|` -> `^` mutants.
+    ((u64::from(t.dwHighDateTime) << 32) + u64::from(t.dwLowDateTime)) / 10
 }
 
 fn thread_times() -> (u64, u64) {
@@ -534,6 +549,13 @@ mod tests {
 
     #[test]
     fn more_long_frames_than_are_listed_are_counted() {
+        let exact: Vec<Frame> = (0..LONG_MOST).map(|i| frame(i as u64, 500.0)).collect();
+        let exact_out = lines(&exact, 100_000.0, 5.0);
+        assert_eq!(
+            exact_out.iter().filter(|l| l.starts_with("long frame ")).count(),
+            LONG_MOST
+        );
+        assert!(!exact_out.iter().any(|l| l.starts_with("long frames:")));
         let mut frames: Vec<Frame> = (0..12).map(|i| frame(i, 500.0)).collect();
         frames.push(frame(12, 100.0));
         let out = lines(&frames, 100_000.0, 5.0);
@@ -551,9 +573,101 @@ mod tests {
     fn totals_and_a_threads_own_counts_add_up() {
         let before = TOTAL[T::DiskReads as usize].load(Relaxed);
         add(T::DiskReads, 3);
-        assert_eq!(TOTAL[T::DiskReads as usize].load(Relaxed) - before, 3);
+        assert_eq!(total(T::DiskReads) - before, 3);
         here(H::PaceUs, 5);
         here(H::PaceUs, 6);
         assert_eq!(HERE.with(|c| c.get())[H::PaceUs as usize], 11);
+    }
+
+    #[test]
+    fn frame_log_helpers_cover_switches_filetime_median_and_means() {
+        use std::ffi::OsStr;
+        assert!(!parse_on(None, false));
+        assert!(parse_on(None, true));
+        assert!(!parse_on(Some(OsStr::new("0")), true));
+        assert!(parse_on(Some(OsStr::new("1")), false));
+
+        assert_eq!(median(std::iter::empty()), 0.0);
+        assert_eq!(median([30.0, 10.0, 20.0].into_iter()), 20.0);
+        assert_eq!(median([10.0, 40.0, 20.0, 30.0].into_iter()), 30.0);
+        assert_eq!(long_over(0.0), 40_000.0);
+        assert_eq!(long_over(100_000.0), 150_000.0);
+        // Boundary: equal to `long_over(100_000.0) == 150_000.0` is not marked long (`>` strict).
+        let boundary = lines(&[frame(0, 150.0)], 100_000.0, 1.0);
+        assert!(boundary[0].contains("0 long"), "{}", boundary[0]);
+        assert!(boundary.iter().all(|l| !l.starts_with("long frame")));
+
+        let ft = windows_sys::Win32::Foundation::FILETIME {
+            dwLowDateTime: 1_000_000,
+            dwHighDateTime: 1,
+        };
+        assert_eq!(micros(ft), ((1u64 << 32) + 1_000_000) / 10);
+
+        let mut a = frame(1, 100.0);
+        a.s = [
+            20_000.0, 2_000.0, 50_000.0, 5_000.0, 12.0, 100.0, 20.0, 2.0, 4.0, 4096.0,
+        ];
+        a.h = [3_000.0, 4_000.0];
+        a.t[T::PresentShowUs as usize] = 2_000.0;
+        a.t[T::Submissions as usize] = 4.0;
+        a.t[T::PrepareUs as usize] = 6_000.0;
+        a.t[T::CardWaitUs as usize] = 8_000.0;
+        a.t[T::CopyUs as usize] = 1_000.0;
+        a.t[T::CopyBytes as usize] = 2_000_000.0;
+        a.t[T::CopyBackUs as usize] = 500.0;
+        a.t[T::CopyBackBytes as usize] = 100_000.0;
+        a.t[T::CardSyncUs as usize] = 4_000.0;
+        a.t[T::CardSyncLists as usize] = 2.0;
+        a.t[T::CardCheckUs as usize] = 2_000.0;
+        a.t[T::CardCheckLists as usize] = 1.0;
+        a.t[T::CardListsUs as usize] = 12_000.0;
+        a.t[T::CardLists as usize] = 6.0;
+        a.t[T::ExecuteUs as usize] = 9_000.0;
+        a.t[T::RefreshUs as usize] = 3_000.0;
+        a.t[T::Remaps as usize] = 2.0;
+        a.t[T::RemapUs as usize] = 1_000.0;
+        a.t[T::PipelineWaitUs as usize] = 5_000.0;
+        a.t[T::DiskReads as usize] = 10.0;
+        a.t[T::DiskBytes as usize] = 4_000_000.0;
+        a.t[T::DiskUs as usize] = 2_000.0;
+        a.t[T::GuardFaults as usize] = 6.0;
+        a.t[T::PaceUs as usize] = 8_000.0;
+        a.t[T::RenderLooks as usize] = 1.0;
+        let mut b = a.clone();
+        b.number = 2;
+        b.us = 200_000.0;
+        b.t[T::PresentUs as usize] = 20_000.0;
+        b.t[T::Uploads as usize] = 200.0;
+        b.t[T::CardSyncUs as usize] = 6_000.0;
+        b.t[T::CardSyncLists as usize] = 4.0;
+        let avg = mean(&[&a, &b]);
+        assert_eq!(avg.us, 150_000.0);
+        assert_eq!(avg.s[S_THREAD_USER], 20_000.0);
+        assert_eq!(avg.h[H::ExecuteUs as usize], 3_000.0);
+        assert_eq!(avg.t[T::CardSyncLists as usize], 3.0);
+        let summary = text(&avg);
+        for needle in [
+            "150 ms |",
+            "ran 22 ms (user 20, kernel 2)",
+            "present 15.0 ms (show 2.0)",
+            "execute 3.0 ms, paced 4.0 ms",
+            "submissions: 4, preparing 6.0 ms, card wait 8.0 ms",
+            "copies 1.0 ms 2.0 MB",
+            "copy-back 0.5 ms 0.10 MB",
+            "sync 5.0 ms in 3, check 2.0 ms in 1, lists 12.0 ms in 6",
+            "execute all 9.0 ms",
+            "refresh 3.0 ms, 150 uploads",
+            "remaps: 2 (1.0 ms)",
+            "pipelines: 2 made, 4 loaded, 5.0 ms waited",
+            "disk: 10 reads 4.0 MB 2.0 worker ms",
+            "faults: 12 page, 6 guard",
+            "process: 50 user 5 kernel ms",
+            "pacing all 8.0 ms",
+            "100 draws, 20 dispatches",
+            "4096 MB free",
+            "slow core render 0/1",
+        ] {
+            assert!(summary.contains(needle), "missing {needle:?} in {summary}");
+        }
     }
 }
