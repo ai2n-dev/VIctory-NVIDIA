@@ -530,6 +530,8 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -559,7 +561,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    handles: HashMap<HandleKey, V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1564,10 +1566,7 @@ impl<'a> Lower<'a> {
             no_barrier,
             pruned: keep.is_some(),
             half_outputs: half_outputs(&x.native.io, &x.outputs),
-            half_inputs: {
-                let hi = half_inputs(&x.native.io, &x.inputs);
-                hi
-            },
+            half_inputs: half_inputs(&x.native.io, &x.inputs),
             half_input_spills: half_input_spills(&half_inputs(&x.native.io, &x.inputs), &x.inputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -5141,7 +5140,7 @@ impl<'a> Lower<'a> {
             return self.code_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
-            if self.scalar.get(&site).is_none()
+            if !self.scalar.contains_key(&site)
                 && self.x.res.addresses
                 && let Some(count) = name.strip_prefix("s_load_dword").and_then(smem_dwords)
                 && let Some(Operand::Scalar { code, .. }) = *data
@@ -5172,7 +5171,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            if self.scalar.get(&site).is_none()
+            if !self.scalar.contains_key(&site)
                 && crate::resource::traces_rays(self.x.p)
                 && let Some(count) = name.strip_prefix("s_load_dword").and_then(smem_dwords)
                 && let Some(Operand::Scalar { code, .. }) = *data

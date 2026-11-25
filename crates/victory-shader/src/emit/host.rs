@@ -175,8 +175,11 @@ unsafe fn enable_debug_layer() {
     if debug_requested() {
         let mut layer: Option<ID3D12Debug> = None;
         // SAFETY: plain D3D12 COM factory call before first device creation.
-        if unsafe { D3D12GetDebugInterface(&mut layer) }.is_ok() {
-            layer.iter().for_each(|l| unsafe { l.EnableDebugLayer() });
+        if unsafe { D3D12GetDebugInterface(&mut layer) }.is_ok()
+            && let Some(l) = layer
+        {
+            // SAFETY: `D3D12GetDebugInterface` returned a valid `ID3D12Debug`.
+            unsafe { l.EnableDebugLayer() };
         }
     }
 }

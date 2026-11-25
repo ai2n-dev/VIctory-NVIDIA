@@ -404,12 +404,11 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
         emit(&prep.c, &prep.native, &prep.p, &prep.st, &prep.io, &res, target)
     };
     let compute = prep.native.stage == HwStage::Cs && rays();
-    let plain = match with(prep.traces && compute) {
+    match with(prep.traces && compute) {
         Err(ShaderError::Unsupported { .. }) if compute && !prep.traces => with(true),
         Err(ShaderError::Unsupported { .. }) if compute => with(false),
-        done => return done,
-    };
-    plain
+        done => done,
+    }
 }
 
 /// Re-translates a mesh shader together with its paired pixel shader (or
@@ -686,7 +685,9 @@ fn emit_program_pruned(
 /// Interpolation modes of the input (for pixel) or output (for vertex/mesh)
 /// signature elements carried in a container's `PSV0` part: `(row, col, kind,
 /// interp)`.
-fn psv_interp(part: &[u8], pixel: bool) -> Option<Vec<(Option<u32>, u8, u8, u8)>> {
+type PsvInterpRow = (Option<u32>, u8, u8, u8);
+
+fn psv_interp(part: &[u8], pixel: bool) -> Option<Vec<PsvInterpRow>> {
     use crate::dxbc::u32_at;
     let info_sz = u32_at(part, 0).ok()? as usize;
     if info_sz < 32 {
