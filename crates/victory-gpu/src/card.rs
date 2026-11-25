@@ -308,6 +308,40 @@ fn merge_byte_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.truncate(out + 1);
 }
 
+/// Optional extra pages to hash between upload rehash runs. Never apply this
+/// to the post-submission compare: that must retain exact declared coverage.
+fn rehash_gap() -> u32 {
+    static GAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_REHASH_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(16)
+    })
+}
+
+/// Input runs are sorted, disjoint and bounded by the card size. Bridging
+/// small gaps trades extra hash work for fewer dispatches. Rehash only.
+fn join_rehash_runs(runs: &mut Vec<(u32, u32)>, gap: u32) {
+    if gap == 0 || runs.len() < 2 {
+        return;
+    }
+    let mut out = 0;
+    for i in 1..runs.len() {
+        let (first, count) = runs[i];
+        let (base, span) = runs[out];
+        let end = base + span;
+        if first.saturating_sub(end) <= gap {
+            runs[out].1 = end.max(first + count) - base;
+        } else {
+            out += 1;
+            runs[out] = (first, count);
+        }
+    }
+    runs.truncate(out + 1);
+}
+
 /// Converts byte ranges `[from, to)` into sorted, merged 64 KiB piece runs `(first_piece, count)`.
 fn byte_ranges_to_piece_runs(ranges: &[(usize, usize)], max_pieces: u32) -> Vec<(u32, u32)> {
     if ranges.is_empty() || max_pieces == 0 {
@@ -655,7 +689,8 @@ impl CardEngine {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
             {
-                let runs = byte_ranges_to_piece_runs(ranges, card.total_pieces());
+                let mut runs = byte_ranges_to_piece_runs(ranges, card.total_pieces());
+                join_rehash_runs(&mut runs, rehash_gap());
                 if !runs.is_empty() {
                     rehash_uploads.push((card.clone(), hashes, runs));
                 }
@@ -1122,6 +1157,23 @@ mod tests {
             }
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn rehash_gap_coalesces_only_small_gaps() {
+        let original = vec![(0, 2), (4, 3), (8, 1), (20, 2)];
+        let mut baseline = original.clone();
+        join_rehash_runs(&mut baseline, 0);
+        assert_eq!(baseline, original);
+
+        let mut one = original.clone();
+        join_rehash_runs(&mut one, 1);
+        assert_eq!(one, vec![(0, 2), (4, 5), (20, 2)]);
+
+        let mut two = original;
+        join_rehash_runs(&mut two, 2);
+        assert_eq!(two, vec![(0, 9), (20, 2)]);
+        join_rehash_runs(&mut Vec::new(), 4);
     }
 
     #[test]
