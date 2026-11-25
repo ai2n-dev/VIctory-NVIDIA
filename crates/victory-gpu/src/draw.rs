@@ -101,9 +101,11 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Tables made afresh in this list, by a hash of the table and what it
+    /// holds ([`table_hash`]).
+    fresh_tables: std::collections::HashMap<u64, Fresh, std::hash::BuildHasherDefault<Plain>>,
+    /// The record words of [`Fresh`] tables, one after the other.
+    fresh_records: Vec<[u32; 3]>,
     /// Of them, large ones by table: the records it was made from and the
     /// first dynamic slot. A shader that reads less of one takes the same.
     large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,
@@ -265,6 +267,51 @@ impl Slots {
             })
         })
     }
+}
+
+/// A table made afresh: what it was made from (the `n` records at `at` in
+/// [`State::fresh_records`]) and its first dynamic slot.
+struct Fresh {
+    table: u64,
+    n: u32,
+    at: usize,
+    first: u32,
+}
+
+/// A hash that is mixed already, used as it is.
+#[derive(Default)]
+struct Plain(u64);
+
+impl std::hash::Hasher for Plain {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0 << 8 | u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+/// A quick hash of `table` and its `n` records. It only finds the table
+/// made before: the records are compared too, so a collision costs a copy,
+/// not wrong descriptors.
+fn table_hash(table: u64, n: u32) -> u64 {
+    let mix = |h: u64, x: u64| (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let h = (0..n).fold(table, |h, k| {
+        let [a, b, c] = record(table, k);
+        mix(mix(h, u64::from(a) | u64::from(b) << 32), u64::from(c))
+    });
+    h ^ h >> 32
+}
+
+/// The words of entry `k` of `table`.
+fn record(table: u64, k: u32) -> [u32; 3] {
+    // SAFETY: a descriptor slot in title memory.
+    unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
 }
 
 /// The longest `table` of `heap` was asked for, now for `n` entries.
@@ -436,6 +483,7 @@ impl State {
         self.host_heaps = [0; 2];
         // Making one refreshes what it names, which is each list's own work.
         self.fresh_tables.clear();
+        self.fresh_records.clear();
         self.large_tables.clear();
         if self.topology != 0 {
             self.set_topology(list, self.topology);
@@ -1279,17 +1327,16 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            let key = table_hash(table, n);
+            let same = self.fresh_tables.get(&key).filter(|f| {
+                f.table == table
+                    && f.n == n
+                    && self.fresh_records[f.at..f.at + n as usize]
+                        .iter()
+                        .enumerate()
+                        .all(|(k, r)| *r == record(table, k as u32))
+            });
+            if let Some(&Fresh { first, .. }) = same {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
@@ -1314,7 +1361,9 @@ impl State {
                 }
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let at = self.fresh_records.len();
+            self.fresh_records.extend((0..n).map(|k| record(table, k)));
+            self.fresh_tables.insert(key, Fresh { table, n, at, first });
             if n >= LARGE {
                 self.large_tables.entry(table).or_default().push((records, first));
             }
