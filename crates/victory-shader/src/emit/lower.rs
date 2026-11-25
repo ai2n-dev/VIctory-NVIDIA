@@ -195,20 +195,61 @@ enum Stop {
 
 const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
+/// Semantic key `(UPPERCASE_NAME, index)` -> 4-bit absolute channel mask of
+/// arbitrary (`kind == 0`) inputs read by the paired pixel shader.
+pub(crate) type KeptOutputs = HashMap<(String, u32), u8>;
+
+/// Keeps only arbitrary (`kind == 0`) signature elements whose semantic has at
+/// least one channel read in `keep`, trimming unread leading and trailing
+/// channels. System values (`kind != 0`) stay untouched.
+fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    elements.retain_mut(|e| {
+        if e.kind != 0 {
+            return true;
+        }
+        if e.row.is_none() {
+            return false;
+        }
+        let key = (e.name.to_ascii_uppercase(), e.index);
+        let used = keep.get(&key).copied().unwrap_or(0);
+        let rel = (used >> e.col) & ((1u8 << e.cols) - 1);
+        if rel == 0 {
+            return false;
+        }
+        let first = rel.trailing_zeros() as u8;
+        let last = 7 - rel.leading_zeros() as u8;
+        e.col += first;
+        e.cols = last - first + 1;
+        true
+    });
+}
+
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false) {
+    lower_pruned(parts, None)
+}
+
+pub(crate) fn lower_pruned(
+    parts: &Parts,
+    keep: Option<&KeptOutputs>,
+) -> Result<Lowered, ShaderError> {
+    match lower_program(parts, false, keep) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
+        }) if parts.native.stage == HwStage::Cs => lower_program(parts, true, keep),
         result => result,
     }
 }
 
-fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
+fn lower_program(
+    parts: &Parts,
+    numeric_selects: bool,
+    keep: Option<&KeptOutputs>,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects).run() {
+        match Lower::new(parts, &bad, numeric_selects, keep).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -576,6 +617,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Whether arbitrary outputs were pruned against a paired pixel shader.
+    pruned: bool,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1135,7 +1178,12 @@ impl SubDword {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, numeric_selects: bool) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        numeric_selects: bool,
+        keep: Option<&KeptOutputs>,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1146,6 +1194,13 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let Some(keep) = keep {
+            if x.native.stage == HwStage::Ps {
+                prune_signature(&mut s.inputs, keep);
+            } else if x.native.stage == HwStage::Ms {
+                prune_signature(&mut s.outputs, keep);
+            }
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let dead = crate::sgpr_spill::dead(p);
         let writes_uavs = insts().any(|i| {
@@ -1304,11 +1359,29 @@ impl<'a> Lower<'a> {
         let mut no_barrier = HashSet::new();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            if let Some(keep) = keep {
+                prune_signature(&mut s.prims, keep);
+            }
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            let mut max_vertices = ms.max_vertices;
+            let mut max_primitives = ms.max_primitives;
+            // Each lane writes only its own vertex/primitive (`mesh_thread()`),
+            // so when the declared counts exceed DXIL's 32 KiB output budget we
+            // can safely tighten them down to the group's thread count.
+            if super::container::mesh_output_bytes(
+                &s.outputs,
+                &s.prims,
+                max_vertices,
+                max_primitives,
+            ) > super::container::MESH_OUTPUT_LIMIT
+            {
+                max_vertices = max_vertices.min(ms.threads);
+                max_primitives = max_primitives.min(ms.threads);
+            }
             s.mesh = Some(super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
+                max_vertices,
+                max_primitives,
                 topology: ms.topology,
             });
             // Barriers order the lanes' LDS accesses; the console's
@@ -1399,6 +1472,7 @@ impl<'a> Lower<'a> {
             meeting: false,
             flat: None,
             no_barrier,
+            pruned: keep.is_some(),
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             half_inputs: {
                 let hi = half_inputs(&x.native.io, &x.inputs);
@@ -4155,9 +4229,12 @@ impl<'a> Lower<'a> {
         if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
         }
-        // The console allows larger outputs than the host; the signatures
-        // link to the title's pixel shader, so none are dropped.
-        if mesh_output_bytes(&self.s.outputs, &self.s.prims, mesh) > MAX_MESH_OUTPUT_BYTES {
+        // Standalone mesh shaders over 32 KiB still emit so the pipeline can
+        // measure them and re-translate linked with their pixel shader; refuse
+        // only when the pruned signature still exceeds the host's 32 KiB limit.
+        if self.pruned
+            && mesh_output_bytes(&self.s.outputs, &self.s.prims, mesh) > MAX_MESH_OUTPUT_BYTES
+        {
             return Err("mesh outputs beyond the host's 32 KiB");
         }
         let e = self.s.entry;
@@ -6616,7 +6693,7 @@ impl<'a> Lower<'a> {
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, attribute.row, b, h)
+                        packed_half(&l.x.inputs, attribute.row, b, h)
                             .or_else(|| l.half_input_spills.get(&(attribute.row, h)).copied())
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
@@ -8339,7 +8416,7 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, row, b, h)
+                        packed_half(&self.x.outputs, row, b, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -8526,7 +8603,7 @@ impl<'a> Lower<'a> {
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
         let free: std::collections::BTreeSet<u32> = self
-            .s
+            .x
             .outputs
             .iter()
             .filter(|o| o.kind == 0)
@@ -9589,7 +9666,7 @@ impl<'a> Lower<'a> {
 /// pull model).
 /// The host's limit on a mesh shader's vertex plus primitive outputs
 /// (DXC's `kMaxMSOutputTotalBytes`).
-const MAX_MESH_OUTPUT_BYTES: u32 = 32768;
+const MAX_MESH_OUTPUT_BYTES: u32 = super::container::MESH_OUTPUT_LIMIT;
 
 /// A mesh shader's output size as the validator counts it: every element's
 /// components times the maximum vertex or primitive count, each rounded up
@@ -9599,10 +9676,7 @@ fn mesh_output_bytes(
     prims: &[SigElement],
     mesh: super::shader::Mesh,
 ) -> u32 {
-    let scalars = |els: &[SigElement], n: u32| -> u32 {
-        els.iter().map(|e| u32::from(e.cols)).sum::<u32>() * n.next_multiple_of(32)
-    };
-    4 * (scalars(outputs, mesh.max_vertices) + scalars(prims, mesh.max_primitives))
+    super::container::mesh_output_bytes(outputs, prims, mesh.max_vertices, mesh.max_primitives)
 }
 
 /// The coordinates `calculateLOD` takes for a texture of DXIL resource
@@ -10910,7 +10984,7 @@ mod tests {
             per_lane_only: false,
         };
         let bad = HashMap::new();
-        let mut l = super::Lower::new(&parts, &bad, false);
+        let mut l = super::Lower::new(&parts, &bad, false, None);
         assert!(l.lower_ir().is_ok());
         assert_eq!(l.mask_data, super::MaskData::Host);
         assert_eq!(l.s.wave_size, None);

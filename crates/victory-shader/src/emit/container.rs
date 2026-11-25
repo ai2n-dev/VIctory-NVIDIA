@@ -3,6 +3,30 @@
 //! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
 //! the container hash that D3D12 checks.
 
+/// D3D12 / DXIL maximum combined byte size of a mesh shader's vertex and
+/// primitive outputs per thread group (`kMaxMSOutputTotalBytes`).
+pub const MESH_OUTPUT_LIMIT: u32 = 32 * 1024;
+
+/// Combined byte size of a mesh shader's vertex and primitive outputs as DXIL
+/// validates it: 4 bytes per declared component of every allocated element,
+/// times the vertex and primitive maxima each rounded up to a multiple of 32.
+pub(crate) fn mesh_output_bytes(
+    outputs: &[SigElement],
+    prims: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> u32 {
+    let stride = |els: &[SigElement]| -> u32 {
+        els.iter()
+            .filter(|e| e.row.is_some())
+            .map(|e| u32::from(e.cols) * 4)
+            .sum()
+    };
+    stride(outputs)
+        .saturating_mul(max_vertices.next_multiple_of(32))
+        .saturating_add(stride(prims).saturating_mul(max_primitives.next_multiple_of(32)))
+}
+
 /// One signature element: one row (D3D12 links stages by semantic).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SigElement {
@@ -526,5 +550,34 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn mesh_output_bytes_matches_dxil_budget() {
+        let el = |row: u32, cols: u8| SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        // 16 float4 rows = 64 components; at 128 vertices that is exactly 32 KiB.
+        let v16: Vec<SigElement> = (0..16).map(|r| el(r, 4)).collect();
+        assert_eq!(mesh_output_bytes(&v16, &[], 128, 128), MESH_OUTPUT_LIMIT);
+        // One more scalar pushes past 32 KiB.
+        let mut v17 = v16.clone();
+        v17.push(el(16, 1));
+        assert_eq!(mesh_output_bytes(&v17, &[], 128, 128), 33_280);
+        // Maxima round up to multiples of 32, and primitive outputs add on top.
+        let prim = [el(0, 2)];
+        assert_eq!(
+            mesh_output_bytes(&v16[..1], &prim, 33, 1),
+            4 * 4 * 64 + 2 * 4 * 32
+        );
     }
 }

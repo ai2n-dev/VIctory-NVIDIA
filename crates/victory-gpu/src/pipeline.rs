@@ -327,6 +327,116 @@ fn stores(name: &str) -> bool {
     name.contains("store") || name.contains("atomic")
 }
 
+#[cfg(windows)]
+struct LinkedPair {
+    mesh: Arc<Shader>,
+    pixel: Option<Arc<Shader>>,
+}
+
+#[cfg(windows)]
+type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+
+#[cfg(windows)]
+impl Shader {
+    fn from_translated(source: &Shader, translated: Translated) -> Arc<Shader> {
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(translated));
+        Arc::new(Shader {
+            stage: source.stage,
+            hash: source.hash.clone(),
+            container: Vec::new(),
+            hair: source.hair,
+            resolves_light: source.resolves_light,
+            translated: cell,
+        })
+    }
+}
+
+/// Re-translates a mesh shader together with its paired pixel shader (if any)
+/// so arbitrary mesh outputs unread by the pixel shader are pruned under
+/// D3D12's 32 KiB mesh output limit (`victory_shader::emit::MESH_OUTPUT_LIMIT`).
+#[cfg(windows)]
+pub(crate) fn translate_linked(
+    ms: &Shader,
+    ps: Option<&Shader>,
+) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
+    let key: LinkedKey = (
+        *blake3::hash(&ms.container).as_bytes(),
+        ps.map(|p| *blake3::hash(&p.container).as_bytes()),
+    );
+    if let Some(hit) = LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key))
+    {
+        return hit
+            .as_ref()
+            .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    }
+    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    let result = match victory_shader::emit::translate_linked(
+        &ms.container,
+        ps.map(|p| p.container.as_slice()),
+        target,
+    ) {
+        Ok((ms_host, ps_host)) => {
+            let ms_bytes = victory_shader::emit::mesh_output_bytes(&ms_host.dxil);
+            let ms_orig = ms.translated()?;
+            let mesh = Shader::from_translated(
+                ms,
+                Translated {
+                    host: ms_host,
+                    used: ms_orig.used.clone(),
+                    resource_heap: ms_orig.resource_heap,
+                    writes_memory: ms_orig.writes_memory,
+                },
+            );
+            let pixel = match (ps, ps_host) {
+                (Some(p), Some(host)) => {
+                    let ps_orig = p.translated()?;
+                    Some(Shader::from_translated(
+                        p,
+                        Translated {
+                            host,
+                            used: ps_orig.used.clone(),
+                            resource_heap: ps_orig.resource_heap,
+                            writes_memory: ps_orig.writes_memory,
+                        },
+                    ))
+                }
+                _ => None,
+            };
+            tracing::info!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                bytes = ms_bytes,
+                "mesh and pixel linked under 32 KiB output budget"
+            );
+            Some(LinkedPair { mesh, pixel })
+        }
+        Err(e) => {
+            tracing::warn!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                error = %e,
+                "linked mesh/pixel translation failed; using standalone translation"
+            );
+            None
+        }
+    };
+    let out = result
+        .as_ref()
+        .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, result);
+    out
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
