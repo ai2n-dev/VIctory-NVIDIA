@@ -1705,12 +1705,14 @@ static PLACED_LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// The placed textures alive now (resource objects).
 #[cfg(windows)]
 pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
-    let mut live: std::collections::HashSet<usize> = PLACED_TEXTURES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .map(|&(r, _)| r)
-        .collect();
+    // Both locks, as in `hold_placed`: eviction changes them together.
+    let mut live = {
+        let _map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        PLACED_LIVE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    };
     let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     live.extend(targets.values().flatten());
     live
