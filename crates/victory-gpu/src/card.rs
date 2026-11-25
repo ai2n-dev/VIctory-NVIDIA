@@ -99,6 +99,15 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
 /// tables (`[1]`).
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Readback wait attempts, wait time (us), bytes requested, and copy commands.
+#[cfg(feature = "diagnostics")]
+static FETCH_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_fetch_stats() -> [u64; 4] {
+    std::array::from_fn(|i| FETCH_STATS[i].swap(0, Ordering::Relaxed))
+}
+
 /// Reserve device-local bytes without transiently exceeding the shared cap.
 fn reserve_card_bytes(used: &AtomicU64, size: u64, limit: u64) -> bool {
     used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -920,7 +929,19 @@ impl CardEngine {
                 if unsafe { self.fetch_list.Close() }.is_ok()
                     && let Ok(cmd) = self.fetch_list.cast::<ID3D12CommandList>()
                 {
+                    #[cfg(feature = "diagnostics")]
+                    let fetch_started = std::time::Instant::now();
                     host.execute_and_wait_locked(cmd, submitted);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        FETCH_STATS[0].fetch_add(1, Ordering::Relaxed);
+                        FETCH_STATS[1].fetch_add(
+                            fetch_started.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
+                        FETCH_STATS[2].fetch_add(total_bytes, Ordering::Relaxed);
+                        FETCH_STATS[3].fetch_add(dirty_runs.len() as u64, Ordering::Relaxed);
+                    }
 
                     // Group dirty runs by entry so distinct shadows merge in parallel.
                     let mut per_entry: Vec<(usize, Vec<(u32, u32, usize)>)> = Vec::new();

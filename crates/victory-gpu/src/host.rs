@@ -3673,6 +3673,19 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
+            {
+                let [waits, wait_us, bytes, copies] = crate::card::take_fetch_stats();
+                if waits != 0 {
+                    tracing::info!(
+                        waits,
+                        wait_ms = wait_us as f64 / 1000.0,
+                        requested_mb = bytes as f64 / 1e6,
+                        copies,
+                        "card readback since last report (includes queue execution)"
+                    );
+                }
+            }
+            #[cfg(feature = "diagnostics")]
             log_gpu_waits();
             #[cfg(feature = "diagnostics")]
             log_gpu_times();
