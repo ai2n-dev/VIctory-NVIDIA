@@ -1672,13 +1672,13 @@ impl Host {
             // across CPU cores without lock contention on `before`/`pending`.
             let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
                 Vec::new();
+            let mut indices = std::collections::HashMap::<_, usize>::new();
             for item in back {
-                if let Some(g) = groups
-                    .iter_mut()
-                    .find(|g| std::sync::Arc::ptr_eq(&g[0].0, &item.0))
-                {
-                    g.push(item);
+                let key = std::sync::Arc::as_ptr(&item.0);
+                if let Some(&index) = indices.get(&key) {
+                    groups[index].push(item);
                 } else {
+                    indices.insert(key, groups.len());
                     groups.push(vec![item]);
                 }
             }
