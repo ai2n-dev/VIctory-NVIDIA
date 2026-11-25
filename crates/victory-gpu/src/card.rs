@@ -387,6 +387,7 @@ pub(crate) struct CardEngine {
     fetch_list: ID3D12GraphicsCommandList,
     differs_gpu: ID3D12Resource,
     differs_rb: (ID3D12Resource, usize, u64),
+    direct_flags: bool,
     dummy_uav: ID3D12Resource,
     fetch_rb: Option<(ID3D12Resource, usize, u64)>,
     dirty_queue: Vec<Weak<CardState>>,
@@ -398,6 +399,11 @@ unsafe impl Send for CardEngine {}
 
 impl CardEngine {
     pub(crate) fn new(host: &Host) -> windows::core::Result<Self> {
+        let direct = std::env::var_os("VICTORY_CARD_DIRECT_FLAGS").is_some_and(|v| v == "1");
+        Self::new_with_direct_flags(host, direct)
+    }
+
+    fn new_with_direct_flags(host: &Host, direct: bool) -> windows::core::Result<Self> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: valid HLSL source and entry point.
         unsafe {
@@ -459,17 +465,13 @@ impl CardEngine {
         let (fetch_alloc, fetch_list) = make_pair()?;
 
         let init_diff_bytes = 256 << 10; // 65,536 pieces (4 GiB of ranges)
-        let differs_gpu = host
-            .uav_buffer(init_diff_bytes)
-            .ok_or_else(windows::core::Error::empty)?;
-        let (rb_res, rb_ptr) = host
-            .readback_buffer(init_diff_bytes)
-            .ok_or_else(windows::core::Error::empty)?;
+        let (differs_gpu, rb_res, rb_ptr, direct_flags) =
+            Self::allocate_flags(host, init_diff_bytes, direct)
+                .ok_or_else(windows::core::Error::empty)?;
         let dummy_uav = host
             .uav_buffer(256)
             .ok_or_else(windows::core::Error::empty)?;
-        crate::host::name(&differs_gpu, || "card differs gpu".into());
-        crate::host::name(&rb_res, || "card differs readback".into());
+        tracing::debug!(direct_flags, "card compare flag buffer");
         crate::host::name(&dummy_uav, || "card dummy uav".into());
 
         Ok(Self {
@@ -482,11 +484,30 @@ impl CardEngine {
             fetch_alloc,
             fetch_list,
             differs_gpu,
-            differs_rb: (rb_res, rb_ptr as usize, init_diff_bytes),
+            differs_rb: (rb_res, rb_ptr, init_diff_bytes),
+            direct_flags,
             dummy_uav,
             fetch_rb: None,
             dirty_queue: Vec::new(),
         })
+    }
+
+    /// Prefer a CPU-mapped L0 UAV for the small dirty-flag array when opted in.
+    /// If it is unavailable, retain the default device-local UAV + readback.
+    fn allocate_flags(
+        host: &Host,
+        size: u64,
+        direct: bool,
+    ) -> Option<(ID3D12Resource, ID3D12Resource, usize, bool)> {
+        if direct && let Some((resource, ptr)) = host.shared_buffer(size) {
+            crate::host::name(&resource, || "card direct L0 flags".into());
+            return Some((resource.clone(), resource, ptr as usize, true));
+        }
+        let gpu = host.uav_buffer(size)?;
+        let (rb, ptr) = host.readback_buffer(size)?;
+        crate::host::name(&gpu, || "card differs gpu".into());
+        crate::host::name(&rb, || "card differs readback".into());
+        Some((gpu, rb, ptr as usize, false))
     }
 
     fn ensure_differs_capacity(&mut self, host: &Host, needed_bytes: u64) -> bool {
@@ -494,14 +515,14 @@ impl CardEngine {
             return true;
         }
         let size = needed_bytes.next_multiple_of(256 << 10);
-        let Some(gpu) = host.uav_buffer(size) else {
-            return false;
-        };
-        let Some((rb, ptr)) = host.readback_buffer(size) else {
+        let Some((gpu, rb, ptr, direct_flags)) =
+            Self::allocate_flags(host, size, self.direct_flags)
+        else {
             return false;
         };
         let old_gpu = std::mem::replace(&mut self.differs_gpu, gpu);
-        let old_rb = std::mem::replace(&mut self.differs_rb, (rb, ptr as usize, size));
+        let old_rb = std::mem::replace(&mut self.differs_rb, (rb, ptr, size));
+        self.direct_flags = direct_flags;
         crate::host::retire((old_gpu, old_rb.0));
         true
     }
@@ -767,7 +788,8 @@ impl CardEngine {
     }
 
     /// Records the post-submission GPU hash compare (`compare = 2`) and copies
-    /// the tiny `differs` array to `differs_rb` (runs in the same GPU wait!).
+    /// the tiny `differs` array to `differs_rb`, or writes it directly into
+    /// a mapped L0 UAV. Both paths retain the original submission fence.
     pub(crate) fn record_after(&mut self, host: &Host, plan: &CardPlan) -> Option<ID3D12CommandList> {
         if plan.total_pieces == 0 {
             return None;
@@ -803,29 +825,41 @@ impl CardEngine {
                 }
             }
 
-            let to_copy = [transition_barrier(
-                &self.differs_gpu,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )];
-            self.after_list.ResourceBarrier(&to_copy);
-            drop_barriers(to_copy);
+            if self.direct_flags {
+                // The CPU reads the mapped L0 flags only after the existing
+                // submission fence. No GPU-to-readback copy is needed.
+                let common = [transition_barrier(
+                    &self.differs_gpu,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )];
+                self.after_list.ResourceBarrier(&common);
+                drop_barriers(common);
+            } else {
+                let to_copy = [transition_barrier(
+                    &self.differs_gpu,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )];
+                self.after_list.ResourceBarrier(&to_copy);
+                drop_barriers(to_copy);
 
-            self.after_list.CopyBufferRegion(
-                &self.differs_rb.0,
-                0,
-                &self.differs_gpu,
-                0,
-                needed_bytes,
-            );
+                self.after_list.CopyBufferRegion(
+                    &self.differs_rb.0,
+                    0,
+                    &self.differs_gpu,
+                    0,
+                    needed_bytes,
+                );
 
-            let back_common = [transition_barrier(
-                &self.differs_gpu,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )];
-            self.after_list.ResourceBarrier(&back_common);
-            drop_barriers(back_common);
+                let back_common = [transition_barrier(
+                    &self.differs_gpu,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )];
+                self.after_list.ResourceBarrier(&back_common);
+                drop_barriers(back_common);
+            }
 
             self.after_list.Close().ok()?;
             self.after_list.cast().ok()
@@ -1105,10 +1139,20 @@ mod tests {
 
     #[test]
     fn warp_card_roundtrip_upload_wave64_hash_and_concurrent_merge() {
+        for direct in [false, true] {
+            card_roundtrip(direct);
+        }
+    }
+
+    fn card_roundtrip(direct: bool) {
         let Some(host) = Host::new_warp() else {
             return;
         };
-        let mut engine = CardEngine::new(&host).expect("CardEngine should build on WARP");
+        let mut engine = CardEngine::new_with_direct_flags(&host, direct)
+            .expect("CardEngine should build on WARP");
+        assert_eq!(engine.direct_flags, direct);
+        assert!(engine.ensure_differs_capacity(&host, (256 << 10) + 4));
+        assert_eq!(engine.direct_flags, direct);
         let pages = 4usize;
         let size = (pages * PAGE) as u64;
         let mut title = vec![0u8; size as usize];
