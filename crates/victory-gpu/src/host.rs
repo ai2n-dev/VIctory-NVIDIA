@@ -910,13 +910,15 @@ pub(crate) fn warn_depth_bounds() {
 
 /// A list's buffers for hoisted clamped indirect arguments with their
 /// states, how many are in use since the reset, the bytes taken of the last
-/// of those, and whether the list has the barrier that precedes the clamps.
+/// of those, whether the list has the barrier that precedes the clamps, and
+/// whether it has the clamps' root signature, pipeline and budget bound.
 #[derive(Default)]
 struct ClampChunks {
     all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
     used: usize,
     at: u64,
     barrier: bool,
+    bound: bool,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -2128,6 +2130,7 @@ impl HostList {
             chunks.used = 0;
             chunks.at = 0;
             chunks.barrier = false;
+            chunks.bound = false;
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2520,6 +2523,14 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
         Some((buffer, 0))
+    }
+
+    /// Whether the list's clamps still have to bind their root signature,
+    /// pipeline and budget: the first after the reset does, and the rest
+    /// find them bound (nothing else records compute state in the list).
+    pub(crate) fn clamp_unbound(&self) -> bool {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        !std::mem::replace(&mut chunks.bound, true)
     }
 
     /// The clamped arguments written so far become readable as indirect
