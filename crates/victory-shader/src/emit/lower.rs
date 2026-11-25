@@ -1187,6 +1187,23 @@ impl<'a> Lower<'a> {
                     || implicit_derivatives(i.name())
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             };
+            // A mask operation's SCC (some lane of the wave has its bit) read
+            // as a number, such as `WaveActiveAnyTrue` selecting a value
+            // (`s_and_b64` of the mask and EXEC, then `s_cselect`): it is
+            // the console wave's, not the host wave's. A branch on it is the
+            // structure's (`LaneExit::Branch`). Where neither the host's
+            // waves nor the console flow can run such a program, it keeps
+            // the host wave's answer, as before ([`Parts::per_lane_only`]).
+            let sccs = mask_sccs(x.st, p);
+            let console_wave = if x.native.wave64 { 64 } else { 32 };
+            let scc_ok = !x.per_lane_only
+                && (x.target.runs(console_wave)
+                    || !insts().any(|i| i.name().contains("permute")));
+            let reads_scc = |i: &Inst| {
+                scc_ok
+                    && !matches!(i.fields, Fields::Sopp { .. })
+                    && i.read(Reg::Scc).is_some_and(|v| sccs.contains_key(&v))
+            };
             let whole = |i: &Inst| {
                 let n = i.name();
                 n.contains("permute")
@@ -1195,6 +1212,7 @@ impl<'a> Lower<'a> {
                     || n == "image_sample"
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || reads_mask_as_data(x.st, i)
+                    || reads_scc(i)
                     || numeric_selects && numeric_select(x.st, i)
             };
             let reads_whole = live().any(whole);

@@ -645,11 +645,36 @@ fn several_console_waves_read_their_own_lanes() {
     );
 }
 
+/// A mask operation's SCC read as a number (`WaveActiveAnyTrue` choosing a
+/// value): only lane 36, in the upper half, sets the mask. It is the console
+/// wave's: before, such a program took no wave size and each host wave of 32
+/// answered for itself (7 in the lower half).
+#[test]
+fn any_lane_of_the_console_wave_chooses_a_value() {
+    let scc = [
+        0x7D84_00FF,
+        36,          // v_cmp_eq_u32 vcc, 36, v0
+        0x878C_7E6A, // s_and_b64 s[12:13], vcc, exec
+        0x8509_8785, // s_cselect_b32 s9, 5, 7
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    console_flow_case("SCC of (t == 36) & exec", &scc, 64, |_| 5);
+    // Where the host runs 64-lane waves, the program asks for them.
+    let rdna = super::Target {
+        lanes_min: 32,
+        lanes_max: 64,
+    };
+    let cs = emit_for(&program(&scc, 64), rdna).expect("translates");
+    assert_eq!(wave_size(&cs.dxil), Some(64));
+}
+
 /// Masks read as numbers by an instruction, which the halves exchange
 /// before it (`Lower::meet_before`): EXEC by `v_readfirstlane` (lanes at or
 /// past 20 of each console wave read lane 20, in the lower half, the upper
-/// half too; the lanes are counted with `s_bcnt1` after), and EXEC by
-/// `v_mbcnt` (odd lanes count the odd lanes below them across the halves).
+/// half too; the lanes are counted with `s_bcnt1` after), EXEC by
+/// `v_mbcnt` (odd lanes count the odd lanes below them across the halves),
+/// and a mask operation's SCC (only thread 100, in console wave 1's upper
+/// half, sets it).
 #[test]
 fn several_console_waves_read_masks_as_numbers() {
     let mut first = LANE_AND_WAVE.to_vec();
@@ -689,6 +714,16 @@ fn several_console_waves_read_masks_as_numbers() {
     ]);
     waves_case("v_mbcnt of odd lanes", &count, &[128, 256, 96], |t, _| {
         if t & 1 == 1 { (t & 63) / 2 } else { 1000 }
+    });
+    let scc = [
+        0x7D84_00FF,
+        100,         // v_cmp_eq_u32 vcc, 100, v0
+        0x878C_7E6A, // s_and_b64 s[12:13], vcc, exec
+        0x8509_8785, // s_cselect_b32 s9, 5, 7
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    waves_case("SCC of vcc & exec", &scc, &[128, 256], |t, _| {
+        if t / 64 == 1 { 5 } else { 7 }
     });
 }
 

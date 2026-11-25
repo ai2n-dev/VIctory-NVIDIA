@@ -17,8 +17,9 @@ layout declares the console's (`WaveSize(64)`, see `emit::lower`, where
 
 - **console lanes**: it reads other lanes (`v_readlane`, `v_writelane`,
   DPP, `ds_swizzle`, `ds_(b)permute`, `v_permlane*`), counts with
-  `v_mbcnt`, reads a lane mask as a number, or tests its own bit of a mask
-  held as a number;
+  `v_mbcnt`, reads a lane mask as a number (or whether some lane has its
+  bit, a mask operation's SCC, as `WaveActiveAnyTrue` choosing a value
+  does), or tests its own bit of a mask held as a number;
 - **one wave sharing LDS**: the group is a single console wave and uses
   LDS, where the console compiler leaves out barriers because one wave runs
   in order.
