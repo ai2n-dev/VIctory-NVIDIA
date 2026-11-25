@@ -717,6 +717,17 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             bump_region_epochs(at, end);
         }
     }
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = j
+            .written
+            .range(at / PAGE..end.div_ceil(PAGE))
+            .map(|(&p, _)| p)
+            .collect();
+        for page in pages {
+            j.written.remove(&page);
+        }
+    }
     crate::shadow::remapped(at as u64, end as u64);
     crate::resource::evict_placed_textures(at as u64, end as u64);
     crate::descriptor::host::bindless_memory_changed(at as u64, end as u64);
@@ -1015,6 +1026,7 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        title_memory_remapped(p, 4 * PAGE);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
