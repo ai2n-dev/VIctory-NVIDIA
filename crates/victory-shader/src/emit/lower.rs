@@ -2029,16 +2029,25 @@ impl<'a> Lower<'a> {
         // the console wave, each half with its own result. The console flow
         // runs the loop while any lane of the console wave does, as the
         // console does; where it cannot, the per-lane form stays.
-        if self.console_flow_ok
-            && !self.x.console_cf
-            && !self.x.per_lane_only
-            && self
-                .loop_exits
-                .values()
-                .flatten()
-                .any(|(_, after)| !after.is_empty())
+        if self
+            .loop_exits
+            .values()
+            .flatten()
+            .any(|(_, after)| !after.is_empty())
         {
-            return Err(unsupported(0, CONSOLE_FLOW));
+            if self.console_flow_ok && !self.x.console_cf && !self.x.per_lane_only {
+                return Err(unsupported(0, CONSOLE_FLOW));
+            }
+            // On hosts that support both 32- and 64-lane waves (such as AMD
+            // RDNA), omitting WaveSize lets the driver run in 32-lane waves,
+            // so `leave_loops` would cover only half a console wave.
+            if self.x.native.wave64
+                && matches!(self.x.native.io, StageIo::Cs(_))
+                && self.x.target.runs(64)
+                && self.s.wave_size.is_none()
+            {
+                self.s.wave_size = Some(64);
+            }
         }
         self.cur = self.s.entry;
         self.find_sections();
