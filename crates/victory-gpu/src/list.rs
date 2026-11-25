@@ -2070,15 +2070,17 @@ mod tests {
         let (mut allocator, mut list) = (null, null);
         assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
         assert_eq!(new_list(0, allocator, &LIST_IIDS[0], &mut list), S_OK);
-        let memory = [0u64; 2];
-        let at = |i: usize| (&raw const memory[i]) as u64;
+        let memory = std::cell::UnsafeCell::new([0u64; 2]);
+        let base = memory.get();
+        // SAFETY: `i` is 0 or 1 inside the `[u64; 2]` allocation.
+        let at = |i: usize| unsafe { base.cast::<u64>().add(i) } as u64;
         let value = |i: usize| {
             // SAFETY: inside the array.
             unsafe { (at(i) as *const u64).read_volatile() }
         };
         for _ in 0..2 {
-            // SAFETY: inside the array.
-            unsafe { (at(0) as *mut [u64; 2]).write_volatile([0; 2]) };
+            // SAFETY: `base` has mutable provenance over the whole `[u64; 2]`.
+            unsafe { base.write_volatile([0; 2]) };
             state::stencil_ref(list, 3);
             // No work yet: not cut.
             wait_value(list, at(0), 7, 0);
