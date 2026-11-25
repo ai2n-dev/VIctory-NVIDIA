@@ -3400,7 +3400,7 @@ unsafe extern "C" {
 #[cfg(target_arch = "x86_64")]
 fn ensure_safe_copy_veh() {
     use windows_sys::Win32::Foundation::{
-        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -3411,6 +3411,7 @@ fn ensure_safe_copy_veh() {
         let r = unsafe { &*(*info).ExceptionRecord };
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && r.ExceptionCode != EXCEPTION_IN_PAGE_ERROR as NTSTATUS
+            && r.ExceptionCode != EXCEPTION_GUARD_PAGE as NTSTATUS
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -4587,6 +4588,35 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(page0.iter().all(|&b| b == 0x3C));
 
         // SAFETY: our reservation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn safe_copy_handles_guard_pages() {
+        use super::read_into;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // SAFETY: fresh committed page freed below.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(base, 0);
+        // SAFETY: page is committed RW.
+        unsafe { std::ptr::write_bytes(base as *mut u8, 42, 4096) };
+        let mut prev = 0u32;
+        // SAFETY: protecting our own committed page with PAGE_GUARD.
+        let guarded = unsafe { VirtualProtect(base as *mut _, 4096, PAGE_READWRITE | PAGE_GUARD, &mut prev) };
+        assert_ne!(guarded, 0);
+        let mut dst = [0u8; 4];
+        assert!(!read_into(base as *const u8, &mut dst));
+        // SAFETY: freeing our own allocation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }
