@@ -110,6 +110,26 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+/// Record kernel pages in the coarser journal without a temporary vector.
+fn record_pages(
+    written: &mut BTreeMap<usize, u64>,
+    found: &[usize],
+    guarded: impl IntoIterator<Item = usize>,
+    now: u64,
+) {
+    let mut previous = None;
+    for &address in found {
+        let page = address / PAGE;
+        if previous != Some(page) {
+            written.insert(page, now);
+            previous = Some(page);
+        }
+    }
+    for page in guarded {
+        written.insert(page, now);
+    }
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -154,10 +174,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
+    record_pages(&mut j.written, &j.found[..count], guarded, now);
     Some((
         now,
         j.written
@@ -845,6 +862,28 @@ fn writable(at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn record_pages_matches_old_journal_with_duplicates_and_unsorted_addresses() {
+        use super::{PAGE, record_pages};
+        let mut seed = 0x1234_5678u32;
+        for count in 0..256usize {
+            let mut found = Vec::new();
+            for i in 0..count {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let page = (seed as usize >> 16) % 31;
+                found.push(page * PAGE + (i % 16) * 4096);
+            }
+            let guarded = [2usize, 2, 8, 29];
+            let mut expected = std::collections::BTreeMap::from([(99, 1), (8, 2)]);
+            let mut actual = expected.clone();
+            for page in found.iter().map(|a| a / PAGE).chain(guarded) {
+                expected.insert(page, 3);
+            }
+            record_pages(&mut actual, &found, guarded, 3);
+            assert_eq!(actual, expected);
+        }
+    }
+
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
