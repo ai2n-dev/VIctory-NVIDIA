@@ -1991,19 +1991,27 @@ impl Shadow {
         if tiles.is_empty() {
             return;
         }
+        // Keep the tile map locked while borrowing its CPU mappings. A sweep
+        // cannot remove or recycle these tiles until all scoped workers join.
+        let mapped = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+        tiles.retain(|&(tile, base)| mapped.get(&tile).is_some_and(|t| t.data == base));
+        if tiles.is_empty() {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         SPARSE_WRITES[1].fetch_add((tiles.len() * PAGE) as u64, Ordering::Relaxed);
         let views: Vec<&[u8]> = tiles
             .iter()
             .map(|&(_, base)| {
-                // SAFETY: each mapped tile was just marked used by each_tile.
-                // The pending submission and before lock keep its snapshot
-                // phase live; no GPU writes run during this phase.
+                // SAFETY: the map lock keeps the validated mappings alive,
+                // and the submission's snapshot phase precedes GPU writes.
                 unsafe { std::slice::from_raw_parts(base as *const u8, PAGE) }
             })
             .collect();
         let mut buffers = pooled_tiles(tiles.len());
         snapshot_tiles(&views, &mut buffers, parallel_snapshots());
+        drop(views);
+        drop(mapped);
         for ((tile, _), buffer) in tiles.into_iter().zip(buffers) {
             before.insert(tile, buffer);
         }
