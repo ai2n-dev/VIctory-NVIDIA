@@ -463,7 +463,12 @@ fn scalar_bit_operations() {
         (Sop1, "s_flbit_i32_i64", 1, false), (Sop1, "s_brev_b64", 2, false),
         (Sop1, "s_sext_i32_i8", 1, false), (Sop1, "s_sext_i32_i16", 1, false),
         (Sop1, "s_bitset0_b64", 2, false), (Sop1, "s_bitset1_b64", 2, false),
-        (Sop1, "s_bitreplicate_b64_b32", 2, false), (Sop2, "s_absdiff_i32", 1, true),
+        (Sop1, "s_bitreplicate_b64_b32", 2, false),
+        (Sop1, "s_wqm_b32", 1, true),
+        (Sop1, "s_wqm_b64", 2, true),
+        (Sop1, "s_quadmask_b32", 1, true),
+        (Sop1, "s_quadmask_b64", 2, true),
+        (Sop2, "s_absdiff_i32", 1, true),
         (Sop2, "s_pack_ll_b32_b16", 1, false), (Sop2, "s_pack_lh_b32_b16", 1, false),
         (Sop2, "s_pack_hh_b32_b16", 1, false), (Sopc, "s_bitcmp0_b32", 0, true),
         (Sopc, "s_bitcmp1_b32", 0, true), (Sopc, "s_bitcmp0_b64", 0, true),
@@ -485,6 +490,30 @@ fn scalar_bit_operations() {
                 "s_bitset0_b64" => words64(old64 & !(1 << (a & 63)), false),
                 "s_bitset1_b64" => words64(old64 | (1 << (a & 63)), false),
                 "s_bitreplicate_b64_b32" => words64((0..32).map(|i| (u64::from(a >> i & 1) * 3) << (2 * i)).sum(), false),
+                "s_wqm_b32" => {
+                    let r = (0..8u32)
+                        .filter(|q| (a >> (4 * q)) & 0xF != 0)
+                        .fold(0u32, |acc, q| acc | (0xF << (4 * q)));
+                    [r, u32::from(r != 0), 0]
+                }
+                "s_wqm_b64" => {
+                    let r = (0..16u32)
+                        .filter(|q| (x >> (4 * q)) & 0xF != 0)
+                        .fold(0u64, |acc, q| acc | (0xF << (4 * q)));
+                    words64(r, r != 0)
+                }
+                "s_quadmask_b32" => {
+                    let r = (0..8u32)
+                        .filter(|q| (a >> (4 * q)) & 0xF != 0)
+                        .fold(0u32, |acc, q| acc | (1 << q));
+                    [r, u32::from(r != 0), 0]
+                }
+                "s_quadmask_b64" => {
+                    let r = (0..16u32)
+                        .filter(|q| (x >> (4 * q)) & 0xF != 0)
+                        .fold(0u64, |acc, q| acc | (1 << q));
+                    words64(r, r != 0)
+                }
                 "s_absdiff_i32" => {
                     let r = (a as i32).wrapping_sub(b as i32).wrapping_abs() as u32;
                     [r, u32::from(r != 0), 0]

@@ -789,32 +789,62 @@ impl Lower<'_> {
                     self.set(scc, Val::Bit(nz));
                     Ok(())
                 }
-                "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
-                | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
+                "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
                     let mut r = Vec::new();
                     for h in 0..2u8 {
                         let a = half(self, 0, h)?;
-                        let x = if name == "s_not_b64" {
-                            self.s.m.bin(c, Bin::Xor, a, ones)
-                        } else {
-                            let mut b = half(self, 1, h)?;
-                            if name.contains("n2") {
-                                b = self.s.m.bin(c, Bin::Xor, b, ones);
-                            }
-                            let op = match &name[2..5] {
-                                "and" | "nan" => Bin::And,
-                                "or_" | "orn" | "nor" => Bin::Or,
-                                _ => Bin::Xor,
-                            };
-                            let x = self.s.m.bin(c, op, a, b);
-                            if matches!(name, "s_nand_b64" | "s_nor_b64" | "s_xnor_b64") {
-                                self.s.m.bin(c, Bin::Xor, x, ones)
-                            } else {
-                                x
-                            }
+                        r.push(self.s.m.bin(c, Bin::Xor, a, ones));
+                    }
+                    self.set(lo, Val::I32(r[0]));
+                    self.set(hi, Val::I32(r[1]));
+                    let s = nonzero(self, r[0], r[1]);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_wqm_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (rl, rh) = (self.wqm32(a), self.wqm32(b));
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    let s = nonzero(self, rl, rh);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_quadmask_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (ql, qh) = (self.quadmask32(a), self.quadmask32(b));
+                    let k8 = self.s.m.i32(8);
+                    let qh = self.s.m.bin(c, Bin::Shl, qh, k8);
+                    let r = self.s.m.bin(c, Bin::Or, ql, qh);
+                    let zero = self.s.m.i32(0);
+                    self.set(lo, Val::I32(r));
+                    self.set(hi, Val::I32(zero));
+                    let s = nonzero(self, r, zero);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
+                | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" => {
+                    let ones = self.s.m.i32(u32::MAX);
+                    let mut r = Vec::new();
+                    for h in 0..2u8 {
+                        let a = half(self, 0, h)?;
+                        let mut b = half(self, 1, h)?;
+                        if name.contains("n2") {
+                            b = self.s.m.bin(c, Bin::Xor, b, ones);
+                        }
+                        let op = match &name[2..5] {
+                            "and" | "nan" => Bin::And,
+                            "or_" | "orn" | "nor" => Bin::Or,
+                            _ => Bin::Xor,
                         };
-                        r.push(x);
+                        let x = self.s.m.bin(c, op, a, b);
+                        r.push(if matches!(name, "s_nand_b64" | "s_nor_b64" | "s_xnor_b64") {
+                            self.s.m.bin(c, Bin::Xor, x, ones)
+                        } else {
+                            x
+                        });
                     }
                     self.set(lo, Val::I32(r[0]));
                     self.set(hi, Val::I32(r[1]));
@@ -923,6 +953,14 @@ impl Lower<'_> {
                 let a = src32(self, 0)?;
                 let ones = self.s.m.i32(u32::MAX);
                 (self.s.m.bin(c, Bin::Xor, a, ones), None)
+            }
+            "s_wqm_b32" => {
+                let a = src32(self, 0)?;
+                (self.wqm32(a), None)
+            }
+            "s_quadmask_b32" => {
+                let a = src32(self, 0)?;
+                (self.quadmask32(a), None)
             }
             "s_add_u32" | "s_add_i32" | "s_addk_i32" => {
                 let a = src32(self, 0)?;
@@ -2628,6 +2666,8 @@ impl Lower<'_> {
             "v_cvt_i16_f16",
             "v_cvt_norm_i16_f16",
             "v_cvt_norm_u16_f16",
+            "v_cvt_pknorm_i16_f16",
+            "v_cvt_pknorm_u16_f16",
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
@@ -2769,8 +2809,23 @@ impl Lower<'_> {
             if v.clamp || v.omod != 0 {
                 return Err("modifiers on a 16-bit integer operation");
             }
-            let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
+            let h = self.half_src(inst, 0)?;
+            let r = self.cvt_norm16_half(h, v.abs & 1 != 0, v.neg & 1 != 0, name == "v_cvt_norm_i16_f16");
             return self.write_half(inst, r, guard);
+        }
+        if matches!(name, "v_cvt_pknorm_i16_f16" | "v_cvt_pknorm_u16_f16") {
+            if v.clamp || v.omod != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            let signed = name == "v_cvt_pknorm_i16_f16";
+            let h0 = self.half_src(inst, 0)?;
+            let h1 = self.half_src(inst, 1)?;
+            let lo = self.cvt_norm16_half(h0, v.abs & 1 != 0, v.neg & 1 != 0, signed);
+            let hi = self.cvt_norm16_half(h1, v.abs & 2 != 0, v.neg & 2 != 0, signed);
+            let k16 = self.s.m.i32(16);
+            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+            let packed = self.s.m.bin(c, Bin::Or, lo, hi);
+            return self.write_i(inst, packed, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
         let saturates = matches!(name, "v_mad_i16" | "v_mad_u16");
@@ -2852,24 +2907,65 @@ impl Lower<'_> {
         self.write_half(inst, r, guard)
     }
 
-    /// `v_cvt_norm_i16_f16` / `v_cvt_norm_u16_f16`: the f16 source (with its
-    /// abs/neg modifiers) clamped to [-1, 1] or [0, 1], times 32767 or 65535,
-    /// rounded to nearest even once from the exact product; NaN gives 0.
+    /// Smears each 4-bit quad of `x` to `0xF` if any bit in that quad is 1
+    /// (`s_wqm_b32` / half of `s_wqm_b64`).
+    fn wqm32(&mut self, x: V) -> V {
+        let c = self.cur;
+        let k1 = self.s.m.i32(1);
+        let k2 = self.s.m.i32(2);
+        let m5 = self.s.m.i32(0x5555_5555);
+        let ma = self.s.m.i32(0xAAAA_AAAA);
+        let m3 = self.s.m.i32(0x3333_3333);
+        let mc = self.s.m.i32(0xCCCC_CCCC);
+        let p_lo = self.s.m.bin(c, Bin::And, x, m5);
+        let p_hi = self.s.m.bin(c, Bin::And, x, ma);
+        let p_lo = self.s.m.bin(c, Bin::Shl, p_lo, k1);
+        let p_hi = self.s.m.bin(c, Bin::LShr, p_hi, k1);
+        let p = self.s.m.bin(c, Bin::Or, x, p_lo);
+        let p = self.s.m.bin(c, Bin::Or, p, p_hi);
+        let q_lo = self.s.m.bin(c, Bin::And, p, m3);
+        let q_hi = self.s.m.bin(c, Bin::And, p, mc);
+        let q_lo = self.s.m.bin(c, Bin::Shl, q_lo, k2);
+        let q_hi = self.s.m.bin(c, Bin::LShr, q_hi, k2);
+        let q = self.s.m.bin(c, Bin::Or, p, q_lo);
+        self.s.m.bin(c, Bin::Or, q, q_hi)
+    }
+
+    /// Packs the 8 quad-occupancy bits of `x` into bits `0..8` (`s_quadmask_*`).
+    fn quadmask32(&mut self, x: V) -> V {
+        let c = self.cur;
+        let q = self.wqm32(x);
+        let m1 = self.s.m.i32(0x1111_1111);
+        let m2 = self.s.m.i32(0x0303_0303);
+        let m4 = self.s.m.i32(0x000F_000F);
+        let m8 = self.s.m.i32(0xFF);
+        let (k3, k6, k12) = (self.s.m.i32(3), self.s.m.i32(6), self.s.m.i32(12));
+        let t = self.s.m.bin(c, Bin::And, q, m1);
+        let s1 = self.s.m.bin(c, Bin::LShr, t, k3);
+        let t = self.s.m.bin(c, Bin::Or, t, s1);
+        let t = self.s.m.bin(c, Bin::And, t, m2);
+        let s2 = self.s.m.bin(c, Bin::LShr, t, k6);
+        let t = self.s.m.bin(c, Bin::Or, t, s2);
+        let t = self.s.m.bin(c, Bin::And, t, m4);
+        let s3 = self.s.m.bin(c, Bin::LShr, t, k12);
+        let t = self.s.m.bin(c, Bin::Or, t, s3);
+        self.s.m.bin(c, Bin::And, t, m8)
+    }
+
+    /// `v_cvt_norm_*_f16` / `v_cvt_pknorm_*_f16`: converts one f16 source `h`
+    /// (with its abs/neg modifiers) clamped to [-1, 1] or [0, 1], times 32767
+    /// or 65535, rounded to nearest even once from the exact product; NaN gives 0.
     /// Worked on the f16's bits in integers, because in f32 the product
     /// (up to 26 significant bits) would round before the rounding to an
     /// integer.
-    fn cvt_norm16(&mut self, inst: &Inst, signed: bool) -> Result<V, Why> {
-        let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
-        };
+    fn cvt_norm16_half(&mut self, mut h: V, abs: bool, neg_mod: bool, signed: bool) -> V {
         let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let mut h = self.half_src(inst, 0)?;
-        if v.abs & 1 != 0 {
+        if abs {
             let m = k(self, 0x7FFF);
             h = self.s.m.bin(c, Bin::And, h, m);
         }
-        if v.neg & 1 != 0 {
+        if neg_mod {
             let m = k(self, 0x8000);
             h = self.s.m.bin(c, Bin::Xor, h, m);
         }
@@ -2921,7 +3017,7 @@ impl Lower<'_> {
             self.s.m.select(c, neg, k0, r)
         };
         let m16 = k(self, 0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, r, m16))
+        self.s.m.bin(c, Bin::And, r, m16)
     }
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low

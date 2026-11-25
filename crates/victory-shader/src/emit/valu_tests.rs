@@ -755,6 +755,35 @@ fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
             );
         });
     }
+    // `v_cvt_pknorm_i16_f16` (0x312) and `v_cvt_pknorm_u16_f16` (0x313)
+    // convert two f16 sources into low and high 16-bit normalized lanes.
+    let pairs: &[(u16, u16)] = &[
+        (0x0000, 0x3C00), // 0.0, 1.0
+        (0xBC00, 0x3800), // -1.0, 0.5
+        (0xB800, 0x7E00), // -0.5, NaN
+        (0x3A9B, 0xBA9B), // non-trivial fractions
+        (0x7C00, 0xFC00), // +inf, -inf
+    ];
+    for (op, signed, what) in [
+        (0x312u16, true, "v_cvt_pknorm_i16_f16"),
+        (0x313, false, "v_cvt_pknorm_u16_f16"),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), 0));
+        let inputs: Vec<[u32; 4]> = pairs
+            .iter()
+            .map(|&(a, b)| [u32::from(a), u32::from(b), 0, 0])
+            .collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let lo = cvt_norm16_reference(pairs[i].0, signed);
+            let hi = cvt_norm16_reference(pairs[i].1, signed);
+            let want = u32::from(lo) | (u32::from(hi) << 16);
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#06x}, {:#06x}) = {got:#010x}, want {want:#010x}",
+                pairs[i].0, pairs[i].1,
+            );
+        });
+    }
 }
 
 #[test]
