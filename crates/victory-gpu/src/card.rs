@@ -655,7 +655,7 @@ impl CardEngine {
         let mut entries: Vec<CardWriteEntry> = Vec::new();
         let mut entry_indices = std::collections::HashMap::<_, usize>::new();
         let mut need_full_hash: Vec<(Arc<CardState>, ID3D12Resource)> = Vec::new();
-        let mut hashing_cards = std::collections::HashSet::new();
+        let mut full_hash_cards = std::collections::HashSet::new();
         let mut total_pieces = 0u32;
 
         for (shadow, address, len) in writes {
@@ -668,7 +668,7 @@ impl CardEngine {
                 continue;
             };
             if let Some((hashes, full_init)) = card.ensure_hashes(host) {
-                if full_init && hashing_cards.insert(Arc::as_ptr(&card)) {
+                if full_init && full_hash_cards.insert(Arc::as_ptr(&card)) {
                     need_full_hash.push((card.clone(), hashes.clone()));
                 }
                 entry_indices.insert(key, entries.len());
@@ -699,9 +699,10 @@ impl CardEngine {
         // Also check which dirty-uploaded shadows already have hashes (so we
         // re-hash their newly uploaded pieces after CopyBufferRegion).
         let mut rehash_uploads: Vec<RehashUpload> = Vec::new();
+        let mut partial_hash_cards = std::collections::HashSet::new();
         for (card, ranges) in &dirty_cards {
             // Skip partial rehash if this card is already getting a full hash below.
-            if hashing_cards.contains(&Arc::as_ptr(card)) {
+            if full_hash_cards.contains(&Arc::as_ptr(card)) {
                 continue;
             }
             if card.hashes_ready.load(Ordering::Acquire)
@@ -714,7 +715,7 @@ impl CardEngine {
                 let mut runs = byte_ranges_to_piece_runs(ranges, card.total_pieces());
                 join_rehash_runs(&mut runs, rehash_gap());
                 if !runs.is_empty() {
-                    hashing_cards.insert(Arc::as_ptr(card));
+                    partial_hash_cards.insert(Arc::as_ptr(card));
                     rehash_uploads.push((card.clone(), hashes, runs));
                 }
             }
@@ -760,7 +761,8 @@ impl CardEngine {
         let mut to_srv = Vec::new();
         let mut to_common = Vec::new();
         for (card, _) in &dirty_cards {
-            let will_hash = hashing_cards.contains(&Arc::as_ptr(card));
+            let key = Arc::as_ptr(card);
+            let will_hash = full_hash_cards.contains(&key) || partial_hash_cards.contains(&key);
             let after = if will_hash {
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
             } else {
