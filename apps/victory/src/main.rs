@@ -79,6 +79,12 @@ enum Command {
         /// (translated for this host's wave sizes unless --host-lanes says).
         #[arg(long)]
         pipelines: bool,
+        /// With `--pipelines`: make pipelines for these stages only (vs, ps,
+        /// cs, ms; every stage is still emitted and validated). With
+        /// `VICTORY_D3D12_DEBUG=1` creation is slow, and `--only cs` covers
+        /// the compute programs in a fraction of the time.
+        #[arg(long, value_enum, value_delimiter = ',', requires = "pipelines")]
+        only: Vec<translate::Only>,
         /// Translate for a host whose waves are MIN-MAX lanes (32-32 for
         /// NVIDIA, 32-64 for AMD RDNA): shaders that need another wave size
         /// are listed as failures. Default: any wave size.
@@ -156,10 +162,11 @@ fn main() -> Result<()> {
             paths,
             validate,
             pipelines,
+            only,
             list,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+        } => translate::run(paths, validate, pipelines, &only, list, jobs, host_lanes),
         Command::Run {
             exe,
             unimplemented,

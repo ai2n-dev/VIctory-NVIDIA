@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use clap::ValueEnum;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -140,11 +141,34 @@ impl Tally {
     }
 }
 
+/// A stage `translate --pipelines --only` makes pipelines for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Only {
+    Vs,
+    Ps,
+    Cs,
+    Ms,
+}
+
+/// Whether a pipeline is made for `stage` under `--only` (every stage if none).
+fn wanted(only: &[Only], stage: HwStage) -> bool {
+    only.is_empty()
+        || only.iter().any(|o| {
+            matches!(
+                (o, stage),
+                (Only::Vs, HwStage::Vs)
+                    | (Only::Ps, HwStage::Ps)
+                    | (Only::Cs, HwStage::Cs)
+                    | (Only::Ms, HwStage::Ms)
+            )
+        })
+}
+
 /// Emitted shaders by label, shared between threads.
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
-struct Checks {
+struct Checks<'a> {
     /// The wave sizes to translate for.
     target: emit::Target,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
@@ -152,12 +176,15 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// `--only`: the stages pipelines are made for (all if empty).
+    only: &'a [Only],
 }
 
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
     pipelines: bool,
+    only: &[Only],
     list: bool,
     jobs: Option<usize>,
     host_lanes: Option<(u32, u32)>,
@@ -228,6 +255,7 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            only,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -344,7 +372,7 @@ fn translate(
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -501,7 +529,7 @@ fn translate(
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
     label: impl Fn() -> String,
 ) {
     if let Some(keep) = &checks.keep {
@@ -520,7 +548,10 @@ fn check(
             &shader.dxil,
         );
     }
-    if let Some((h, stub_ps)) = &checks.host {
+    let piped = checks.host.is_some() && wanted(checks.only, shader.stage);
+    if let Some((h, stub_ps)) = &checks.host
+        && piped
+    {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
@@ -538,6 +569,9 @@ fn check(
         }
     }
     let Some(v) = checks.validator.as_mut() else {
+        if t.list && !piped {
+            t.lines.push(format!("{}  emitted", label()));
+        }
         return;
     };
     match v.validate(&mut shader.dxil) {
@@ -756,4 +790,27 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Only, wanted};
+    use victory_shader::HwStage;
+
+    #[test]
+    fn no_filter_makes_every_stage() {
+        for stage in [HwStage::Vs, HwStage::Ps, HwStage::Cs, HwStage::Ms, HwStage::Gs] {
+            assert!(wanted(&[], stage), "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn a_filter_makes_the_listed_stages_only() {
+        let only = [Only::Cs, Only::Ms];
+        assert!(wanted(&only, HwStage::Cs));
+        assert!(wanted(&only, HwStage::Ms));
+        for stage in [HwStage::Vs, HwStage::Ps, HwStage::Gs] {
+            assert!(!wanted(&only, stage), "{stage:?}");
+        }
+    }
 }
