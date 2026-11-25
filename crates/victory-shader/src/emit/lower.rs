@@ -4293,6 +4293,7 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
+        self.s.flags |= flags::WAVE_OPS;
         self.s.op(
             self.cur,
             "waveGetLaneIndex",

@@ -2376,6 +2376,28 @@ mod tests {
             }
         }
     }
+
+    /// A mesh shader computing its lane index via `v_mbcnt_lo_u32_b32 v1, -1, 0`
+    /// lowers `lane_index` from `mesh_thread()` without emitting any wave op, so
+    /// its DXIL feature flags (`SFI0`) must not declare `WAVE_OPS` (`0x80000`).
+    #[test]
+    fn mesh_mbcnt_all_ones_does_not_declare_wave_ops() {
+        let (bytes, native) = wide_mesh_parts(64, 64, 64);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let ms = emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap();
+        let dxil = Container::parse(&ms.dxil).unwrap();
+        let sfi0 = dxil.part(FourCC::SFI0).expect("SFI0 part").data;
+        let flags = u64::from_le_bytes(sfi0[..8].try_into().unwrap());
+        assert_eq!(
+            flags & 0x80000,
+            0,
+            "mesh shader without wave ops should not declare WAVE_OPS (SFI0={flags:#x})"
+        );
+    }
 }
 
 #[cfg(test)]

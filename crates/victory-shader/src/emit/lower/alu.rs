@@ -3544,7 +3544,6 @@ impl Lower<'_> {
                     };
                     if name == "v_mbcnt_lo_u32_b32" && !self.x.native.wave64 {
                         if matches!(v.src.first(), Some(&Operand::Const(193))) {
-                            self.s.flags |= flags::WAVE_OPS;
                             let lane = self.lane_index();
                             return Ok(self.s.m.bin(c, Bin::Add, lane, b));
                         }
@@ -3555,7 +3554,6 @@ impl Lower<'_> {
                             .transpose()?
                             .flatten()
                         {
-                            self.s.flags |= flags::WAVE_OPS;
                             let lane = self.lane_index();
                             let m_lo = self.below_mask(c, lane);
                             let (k32, z) = (k(self, 32), k(self, 0));
@@ -3581,7 +3579,6 @@ impl Lower<'_> {
                     if !host {
                         return Err("v_mbcnt of a mask that is no ballot (console lane layout)");
                     }
-                    self.s.flags |= flags::WAVE_OPS;
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
