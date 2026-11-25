@@ -208,7 +208,18 @@ pub(crate) fn dispatched() -> u64 {
 fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
     let reach = if kind == 0 { 1 << 16 } else { 1 << 20 };
     let shadow = crate::shadow::find_reaching(address, reach)?;
-    let len = shadow.left(address).min(reach);
+    let mut len = shadow.left(address).min(reach);
+    // In a sparse copy only the tiles asked for are there, and a shader that
+    // reads a root view past them faults (the structure builders' views have
+    // no length: Radeon GPU Detective, run rt10, a read at an address of no
+    // resource). To the end of the title's buffer then, within reason.
+    // shortcut: 64 MiB at most; a longer buffer is cut there.
+    if kind != 0
+        && shadow.is_sparse()
+        && let Some(end) = crate::shadow::buffer_end(address)
+    {
+        len = len.max((end - address).min(64 << 20)).min(shadow.left(address));
+    }
     let gpu = shadow.gpu(address);
     if kind != 0 || gpu % 256 == 0 {
         shadow.refresh(list, address, len);

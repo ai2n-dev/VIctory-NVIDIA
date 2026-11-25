@@ -1789,7 +1789,13 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
     crate::host::name(&buffer, || format!("copies of title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::info!(start = format_args!("{start:#x}"), len, alias = of.is_some(), "sparse copies of title memory");
+    tracing::info!(
+        start = format_args!("{start:#x}"),
+        len,
+        alias = of.is_some(),
+        gpu = format_args!("{gpu:#x}"),
+        "sparse copies of title memory"
+    );
     Some(Shadow {
         buffer,
         data: std::ptr::null_mut(),
@@ -2352,6 +2358,16 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// the host does not bound): in memory outside buffers, one with at least
 /// `reach` bytes after `address`. A window ending sooner than the data read
 /// through the view is a GPU page fault.
+/// Where the innermost title buffer holding `address` ends, if one does.
+pub(crate) fn buffer_end(address: u64) -> Option<u64> {
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .map(|(_, e)| e.end)
+        .find(|&e| e > address)
+}
+
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
     // To the end of the innermost buffer holding it: a window ending sooner
     // faults.
