@@ -554,19 +554,24 @@ impl CardEngine {
         // 2. Group declared `Step::GpuWrite` ranges by `Card` shadow and ensure
         //    each written card shadow has its hash table allocated.
         let mut entries: Vec<CardWriteEntry> = Vec::new();
+        let mut entry_indices = std::collections::HashMap::<_, usize>::new();
         let mut need_full_hash: Vec<(Arc<CardState>, ID3D12Resource)> = Vec::new();
         let mut total_pieces = 0u32;
 
         for (shadow, address, len) in writes {
+            let key = Arc::as_ptr(shadow);
+            if let Some(&index) = entry_indices.get(&key) {
+                entries[index].declared.push((*address, *len));
+                continue;
+            }
             let Some(card) = shadow.card_state() else {
                 continue;
             };
-            if let Some(entry) = entries.iter_mut().find(|e| Arc::ptr_eq(&e.shadow, shadow)) {
-                entry.declared.push((*address, *len));
-            } else if let Some((hashes, full_init)) = card.ensure_hashes(host) {
+            if let Some((hashes, full_init)) = card.ensure_hashes(host) {
                 if full_init {
                     need_full_hash.push((card.clone(), hashes.clone()));
                 }
+                entry_indices.insert(key, entries.len());
                 entries.push(CardWriteEntry {
                     shadow: shadow.clone(),
                     card: card.clone(),
@@ -907,7 +912,9 @@ impl CardEngine {
                     let mut per_entry: Vec<(usize, Vec<(u32, u32, usize)>)> = Vec::new();
                     for run in &dirty_runs {
                         let ptr = fetch_ptr + run.rb_offset as usize;
-                        if let Some(g) = per_entry.iter_mut().find(|(i, _)| *i == run.entry_idx) {
+                        // Runs were emitted in entry order above, so only
+                        // the last group can belong to the current entry.
+                        if let Some(g) = per_entry.last_mut().filter(|(i, _)| *i == run.entry_idx) {
                             g.1.push((run.first_piece, run.count, ptr));
                         } else {
                             per_entry.push((run.entry_idx, vec![(run.first_piece, run.count, ptr)]));
