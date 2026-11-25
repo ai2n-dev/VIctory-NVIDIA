@@ -348,18 +348,26 @@ impl Host {
                 )
                 .is_ok()
                 && options.DepthBoundsTestSupported.as_bool();
-            let mut options16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            let report = probe_device(&device);
             let gpu_upload = !cfg!(test)
                 && std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "1")
-                && device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS16,
-                        (&raw mut options16).cast(),
-                        size_of_val(&options16) as u32,
-                    )
-                    .is_ok()
-                && options16.GPUUploadHeapSupported.as_bool();
-            tracing::info!(gpu_upload, "D3D12 GPU upload heap (Resizable BAR)");
+                && report.rebar_supported;
+            tracing::info!(
+                adapter = %report.name,
+                vendor = format_args!("{:#06x}", report.vendor),
+                device = format_args!("{:#06x}", report.device),
+                vram_mb = report.vram_mb,
+                luid = format_args!("{:08x}:{:08x}", report.luid_high, report.luid_low),
+                wave_min = report.wave_min,
+                wave_max = report.wave_max,
+                binding_tier = report.binding_tier,
+                mesh_tier = report.mesh_tier,
+                shader_model = format_args!("{:#x}", report.shader_model),
+                rebar_supported = report.rebar_supported,
+                gpu_upload,
+                depth_bounds_supported,
+                "host D3D12 adapter confirmed"
+            );
             let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                 ..Default::default()
@@ -457,14 +465,136 @@ impl Host {
     }
 }
 
+/// Hardware details and D3D12 capabilities queried directly from a created
+/// `ID3D12Device` via its LUID, confirming which physical adapter runs.
+#[derive(Debug, Clone)]
+pub(crate) struct AdapterReport {
+    pub(crate) name: String,
+    pub(crate) vendor: u32,
+    pub(crate) device: u32,
+    pub(crate) vram_mb: usize,
+    pub(crate) luid_high: i32,
+    pub(crate) luid_low: u32,
+    pub(crate) wave_min: u32,
+    pub(crate) wave_max: u32,
+    pub(crate) binding_tier: i32,
+    pub(crate) mesh_tier: i32,
+    pub(crate) shader_model: i32,
+    pub(crate) rebar_supported: bool,
+}
+
+fn probe_device(device: &ID3D12Device) -> AdapterReport {
+    // SAFETY: plain D3D12 / DXGI queries on a valid live device.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let (mut name, mut vendor, mut dev_id, mut vram_mb) = (String::new(), 0, 0, 0);
+        if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            && let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid)
+            && let Ok(desc) = adapter.GetDesc1()
+        {
+            let end = desc
+                .Description
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(desc.Description.len());
+            name = String::from_utf16_lossy(&desc.Description[..end]);
+            vendor = desc.VendorId;
+            dev_id = desc.DeviceId;
+            vram_mb = desc.DedicatedVideoMemory >> 20;
+        }
+        let mut opts0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let binding_tier = if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut opts0).cast(),
+                size_of_val(&opts0) as u32,
+            )
+            .is_ok()
+        {
+            opts0.ResourceBindingTier.0
+        } else {
+            0
+        };
+        let mut opts1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let (wave_min, wave_max) = if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opts1).cast(),
+                size_of_val(&opts1) as u32,
+            )
+            .is_ok()
+            && opts1.WaveOps.as_bool()
+        {
+            (opts1.WaveLaneCountMin, opts1.WaveLaneCountMax)
+        } else {
+            (0, 0)
+        };
+        let mut opts7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        let mesh_tier = if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut opts7).cast(),
+                size_of_val(&opts7) as u32,
+            )
+            .is_ok()
+        {
+            opts7.MeshShaderTier.0
+        } else {
+            0
+        };
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_8,
+        };
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .is_err()
+        {
+            sm.HighestShaderModel = D3D_SHADER_MODEL_6_6;
+            let _ = device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            );
+        }
+        let mut opts16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let rebar_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                (&raw mut opts16).cast(),
+                size_of_val(&opts16) as u32,
+            )
+            .is_ok()
+            && opts16.GPUUploadHeapSupported.as_bool();
+        AdapterReport {
+            name,
+            vendor,
+            device: dev_id,
+            vram_mb,
+            luid_high: luid.HighPart,
+            luid_low: luid.LowPart,
+            wave_min,
+            wave_max,
+            binding_tier,
+            mesh_tier,
+            shader_model: sm.HighestShaderModel.0,
+            rebar_supported,
+        }
+    }
+}
+
 /// The adapter `VICTORY_ADAPTER` names (a part of its description, ignoring
 /// case), or the one Windows ranks fastest. A machine with an integrated GPU
 /// as well as a discrete one can thus be told which to run on; a name that
 /// matches nothing falls back to the fastest, with a warning.
 fn chosen_adapter() -> windows::core::Result<IDXGIAdapter1> {
     match std::env::var("VICTORY_ADAPTER") {
-        Ok(name) if !name.trim().is_empty() => named_adapter(name.trim()).inspect_err(|e| {
+        Ok(name) if !name.trim().is_empty() => named_adapter(name.trim()).or_else(|e| {
             tracing::warn!(name, error = %e, "no adapter matches VICTORY_ADAPTER; the fastest is used");
+            fastest_adapter()
         }),
         _ => fastest_adapter(),
     }
@@ -488,7 +618,13 @@ fn named_adapter(name: &str) -> windows::core::Result<IDXGIAdapter1> {
             if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0
                 && adapter_matches(&description, name)
             {
-                tracing::info!(adapter = description, "host adapter chosen by VICTORY_ADAPTER");
+                tracing::info!(
+                    adapter = description,
+                    vendor = format_args!("{:#06x}", desc.VendorId),
+                    device = format_args!("{:#06x}", desc.DeviceId),
+                    vram_mb = desc.DedicatedVideoMemory >> 20,
+                    "host adapter chosen by VICTORY_ADAPTER"
+                );
                 return Ok(adapter);
             }
             i += 1;
@@ -513,6 +649,8 @@ fn fastest_adapter() -> windows::core::Result<IDXGIAdapter1> {
         let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         tracing::info!(
             name = String::from_utf16_lossy(&desc.Description[..end]),
+            vendor = format_args!("{:#06x}", desc.VendorId),
+            device = format_args!("{:#06x}", desc.DeviceId),
             vram_mb = desc.DedicatedVideoMemory >> 20,
             "host adapter"
         );
@@ -632,6 +770,31 @@ mod tests {
         assert!(adapter_matches("NVIDIA GeForce RTX 4070", "RTX 4070"));
         assert!(!adapter_matches("AMD Radeon RX 9070 XT", "nvidia"));
         assert!(adapter_matches("Intel(R) UHD Graphics", "intel"));
+    }
+
+    /// Confirms the physical adapter backing the live `ID3D12Device` via its
+    /// LUID and reports wave range, binding tier, mesh tier, and shader model.
+    #[test]
+    fn physical_adapter_details_match_dxgi_luid() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let report = probe_device(&host.device);
+        eprintln!("physical adapter report: {report:?}");
+        assert!(!report.name.is_empty());
+        assert_ne!(report.vendor, 0);
+        assert!(report.wave_min > 0 && report.wave_max >= report.wave_min);
+        assert!(report.shader_model >= D3D_SHADER_MODEL_6_6.0);
+        if let Ok(wanted) = std::env::var("VICTORY_ADAPTER") {
+            let w = wanted.trim();
+            if !w.is_empty() && named_adapter(w).is_ok() {
+                assert!(
+                    adapter_matches(&report.name, w),
+                    "expected adapter matching {w:?}, got {:?}",
+                    report.name
+                );
+            }
+        }
     }
 
     #[test]
