@@ -812,23 +812,7 @@ impl HostHeap {
         if FAILED[1].load(Ordering::Relaxed) >= WALKS {
             return None;
         }
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = free_dynamic_run(&taken[..spare], *next as usize, n);
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
@@ -2822,6 +2806,26 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Search candidate starts from the cursor, then before it. A run may
+/// cross the cursor but may never cross the physical end of the heap.
+fn free_dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let end = taken.len();
+    if n == 0 || n > end || cursor >= end {
+        return None;
+    }
+    let second_end = cursor.saturating_add(n - 1).min(end);
+    for span in [cursor..end, 0..second_end] {
+        let mut run = 0;
+        for at in span {
+            run = if taken[at] { 0 } else { run + 1 };
+            if run == n {
+                return Some(at + 1 - n);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3014,6 +3018,26 @@ void main() {
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
+    #[test]
+    fn free_dynamic_run_matches_linear_oracle() {
+        for len in 1..=9 {
+            for mask in 0..(1usize << len) {
+                let taken: Vec<bool> = (0..len).map(|i| mask & (1 << i) != 0).collect();
+                for cursor in 0..len {
+                    for n in 1..=len {
+                        let expected = (cursor..len).chain(0..cursor).find(|&start| {
+                            start + n <= len && taken[start..start + n].iter().all(|&v| !v)
+                        });
+                        assert_eq!(free_dynamic_run(&taken, cursor, n), expected);
+                    }
+                }
+            }
+        }
+        assert_eq!(free_dynamic_run(&[], 0, 1), None);
+        assert_eq!(free_dynamic_run(&[false], 0, 0), None);
+        assert_eq!(free_dynamic_run(&[false], 0, 2), None);
+    }
+
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
