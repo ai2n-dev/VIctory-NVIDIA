@@ -227,6 +227,15 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
     }
     let gpu = shadow.gpu(address);
     if kind != 0 || gpu % 256 == 0 {
+        // The list holds the copy it gives the address of: the title may
+        // release the buffer before it submits the list, and a retired copy
+        // only outlives the submissions started by then and a few frames
+        // (menus present a hundred a second). The structure builders' lists
+        // read and wrote freed copies (page fault in a copy loop of root
+        // views, Radeon GPU Detective, run rt2, 2026-11-25).
+        if kind != 0 && list.first_use(shadow.buffer.as_raw() as usize) {
+            list.keep(&shadow.buffer);
+        }
         shadow.refresh(list, address, len);
         if kind == 2 {
             shadow.gpu_writes(list, address, len);
