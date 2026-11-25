@@ -1086,12 +1086,16 @@ impl Host {
             list.SetGraphicsRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        if !data.is_empty() {
+                            list.SetGraphicsRoot32BitConstants(
+                                *param,
+                                data.len() as u32,
+                                data.as_ptr().cast(),
+                                0,
+                            );
+                        }
+                    }
                     Root::Table { sampler, index } => {
                         let (heap, size) = if *sampler {
                             (&sampler_heap, sampler_size)
@@ -1660,12 +1664,16 @@ impl Host {
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
                 match arg {
-                    Root::Constants(data) => list.SetComputeRoot32BitConstants(
-                        *param,
-                        data.len() as u32,
-                        data.as_ptr().cast(),
-                        0,
-                    ),
+                    Root::Constants(data) => {
+                        if !data.is_empty() {
+                            list.SetComputeRoot32BitConstants(
+                                *param,
+                                data.len() as u32,
+                                data.as_ptr().cast(),
+                                0,
+                            );
+                        }
+                    }
                     Root::Table { sampler, index } => {
                         let (h, size) = if *sampler {
                             (&samplers, sampler_size)
