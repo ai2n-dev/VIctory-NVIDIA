@@ -13,11 +13,10 @@
 //! run in the console flow (`lower::CONSOLE_FLOW`) on every host. Run on
 //! every hardware adapter; each wrong lane is listed.
 
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-use windows::Win32::Graphics::Direct3D12::{D3D12CreateDevice, ID3D12Device};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory1,
+    CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory1,
 };
+use windows::core::Interface;
 
 use super::host::{Dispatch, Host, Root, View};
 use crate::native::{ComputeIo, RootParam, RootType, StageIo};
@@ -105,11 +104,10 @@ fn devices() -> Vec<(String, Host)> {
             }
             let n = d.Description.iter().position(|&c| c == 0).unwrap_or(128);
             let name = String::from_utf16_lossy(&d.Description[..n]);
-            let mut device: Option<ID3D12Device> = None;
-            if D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
-                && let Some(device) = device
+            if let Ok(adapter) = a.cast::<IDXGIAdapter>()
+                && let Ok(host) = Host::from_adapter(&adapter)
             {
-                out.push((name, Host::from_device(device)));
+                out.push((name, host));
             }
         }
     }

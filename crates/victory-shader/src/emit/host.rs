@@ -1,24 +1,124 @@
 //! Host D3D12 checks for emitted shaders: pipeline creation and, for
 //! tests, drawing a full-screen triangle and reading the target back.
 
+use std::collections::HashMap;
 use std::ffi::CString;
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 
+#[cfg(test)]
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+#[cfg(test)]
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, PCSTR};
 
 use super::HostShader;
 use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
+#[cfg(test)]
+struct SharedQueue {
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    event: usize,
+    value: u64,
+}
+
+#[cfg(test)]
+impl SharedQueue {
+    fn new(device: &ID3D12Device) -> Result<Self, String> {
+        // SAFETY: plain D3D12/Win32 creation on a live device.
+        unsafe {
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+            let event = CreateEventW(None, false, false, None).map_err(err)?;
+            Ok(Self {
+                queue,
+                fence,
+                event: event.0 as usize,
+                value: 0,
+            })
+        }
+    }
+
+    unsafe fn execute_and_wait(
+        &mut self,
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+    ) -> Result<(), String> {
+        // SAFETY: caller guarantees `self.queue`, `self.fence`, and `list`
+        // belong to `device` and `self.event` is a live auto-reset event.
+        unsafe {
+            self.queue
+                .ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+            self.value += 1;
+            let target = self.value;
+            self.queue.Signal(&self.fence, target).map_err(err)?;
+            if self.fence.GetCompletedValue() >= target {
+                return check_device_removed(device);
+            }
+            let event = HANDLE(self.event as *mut _);
+            if let Err(e) = self.fence.SetEventOnCompletion(target, event) {
+                check_device_removed(device)?;
+                return Err(err(e));
+            }
+            // Wait via OS event instead of polling `GetDeviceRemovedReason`
+            // (`NtGdiDdDDIGetDeviceState`) in a spin loop.
+            loop {
+                match WaitForSingleObject(event, 1_000) {
+                    WAIT_OBJECT_0 => break,
+                    WAIT_TIMEOUT => check_device_removed(device)?,
+                    _ => return Err("fence wait failed".to_string()),
+                }
+            }
+            check_device_removed(device)
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SharedQueue {
+    fn drop(&mut self) {
+        // SAFETY: valid event handle created in `SharedQueue::new`.
+        unsafe {
+            let _ = CloseHandle(HANDLE(self.event as *mut _));
+        }
+    }
+}
+
+#[cfg(test)]
+type CachedDevice = (ID3D12Device, Arc<Mutex<SharedQueue>>);
+#[cfg(not(test))]
+type CachedDevice = ID3D12Device;
+type DeviceMap = Mutex<HashMap<(u32, i32), Result<CachedDevice, String>>>;
+
 pub struct Host {
     pub device: ID3D12Device,
+    #[cfg(test)]
+    queue: Arc<Mutex<SharedQueue>>,
     /// Held while a WARP `Host` is alive so concurrent tests never run on
     /// `d3d10warp`'s threadpool at the same time (avoids `0xC0000005` races in
     /// `d3d10warp!OpenAdapter10_2` / `TpCallbackMayRunLong`).
     _warp_guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+fn check_device_removed(device: &ID3D12Device) -> Result<(), String> {
+    // SAFETY: valid live ID3D12Device COM interface.
+    if let Err(e) = unsafe { device.GetDeviceRemovedReason() } {
+        return Err(format!("device removed: {}", err(e)));
+    }
+    Ok(())
 }
 
 /// What the stage declares that a pipeline must match.
@@ -148,10 +248,49 @@ impl Host {
         Self::create(false, Some(adapter.cast().map_err(err)?))
     }
 
-    pub(crate) fn from_device(device: ID3D12Device) -> Self {
-        Self {
-            device,
-            _warp_guard: None,
+    #[cfg(test)]
+    pub(crate) fn from_adapter(adapter: &IDXGIAdapter) -> Result<Self, String> {
+        Self::create(false, Some(adapter.clone()))
+    }
+
+    #[cfg(test)]
+    fn execute_and_wait(&self, list: &ID3D12GraphicsCommandList) -> Result<(), String> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `self.queue` and `list` were created from `self.device`.
+        unsafe { queue.execute_and_wait(&self.device, list) }
+    }
+
+    fn finish_device(dev: ID3D12Device) -> Result<CachedDevice, String> {
+        check_sm66(&dev)?;
+        #[cfg(test)]
+        {
+            Ok((dev.clone(), Arc::new(Mutex::new(SharedQueue::new(&dev)?))))
+        }
+        #[cfg(not(test))]
+        {
+            Ok(dev)
+        }
+    }
+
+    fn host_from_cached(
+        cached: CachedDevice,
+        warp_guard: Option<std::sync::MutexGuard<'static, ()>>,
+    ) -> Self {
+        #[cfg(test)]
+        {
+            let (device, queue) = cached;
+            Self {
+                device,
+                queue,
+                _warp_guard: warp_guard,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            Self {
+                device: cached,
+                _warp_guard: warp_guard,
+            }
         }
     }
 
@@ -159,12 +298,11 @@ impl Host {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             if warp {
-                static WARP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                static WARP_LOCK: Mutex<()> = Mutex::new(());
                 let guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
                 // Reuse one process-wide WARP device so concurrent tests never
                 // tear down `d3d10warp`'s threadpool while another thread uses it.
-                static WARP_DEVICE: std::sync::OnceLock<Result<ID3D12Device, String>> =
-                    std::sync::OnceLock::new();
+                static WARP_DEVICE: OnceLock<Result<CachedDevice, String>> = OnceLock::new();
                 return WARP_DEVICE
                     .get_or_init(|| {
                         let factory: IDXGIFactory4 =
@@ -173,27 +311,43 @@ impl Host {
                         let mut dev: Option<ID3D12Device> = None;
                         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev)
                             .map_err(err)?;
-                        let dev = dev.ok_or("no device")?;
-                        check_sm66(&dev)?;
-                        Ok(dev)
+                        Self::finish_device(dev.ok_or("no device")?)
                     })
                     .clone()
-                    .map(|device| Host {
-                        device,
-                        _warp_guard: Some(guard),
-                    });
+                    .map(|cached| Self::host_from_cached(cached, Some(guard)));
             }
-            let device = if let Some(adapter) = &adapter {
-                let mut dev: Option<ID3D12Device> = None;
-                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(err)?;
-                dev.ok_or("no device")?
-            } else {
-                let mut dev: Option<ID3D12Device> = None;
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(err)?;
-                dev.ok_or("no device")?
+            // Serialize and reuse hardware D3D12 devices and queues per adapter
+            // LUID so parallel test threads do not hammer `OpenAdapter12` or
+            // run concurrent `CreateCommandQueue`/`ExecuteCommandLists` calls
+            // that deadlock `nvwgf2umx.dll`.
+            let adapter = match adapter {
+                Some(a) => Some(a),
+                None => CreateDXGIFactory1::<IDXGIFactory1>()
+                    .and_then(|f| f.EnumAdapters1(0))
+                    .and_then(|a| a.cast::<IDXGIAdapter>())
+                    .ok(),
             };
-            check_sm66(&device)?;
-            Ok(Host::from_device(device))
+            let key = adapter
+                .as_ref()
+                .and_then(|a| a.GetDesc().ok())
+                .map_or((0, 0), |d| (d.AdapterLuid.LowPart, d.AdapterLuid.HighPart));
+            static HW_DEVICES: OnceLock<DeviceMap> = OnceLock::new();
+            let cache = HW_DEVICES.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cached = guard
+                .entry(key)
+                .or_insert_with(|| {
+                    let mut dev: Option<ID3D12Device> = None;
+                    if let Some(a) = &adapter {
+                        D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(err)?;
+                    } else {
+                        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(err)?;
+                    }
+                    Self::finish_device(dev.ok_or("no device")?)
+                })
+                .clone()?;
+            drop(guard);
+            Ok(Self::host_from_cached(cached, None))
         }
     }
 
@@ -749,12 +903,6 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // are kept alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -1023,21 +1171,7 @@ impl Host {
             };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
             list.Close().map_err(err)?;
-            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
-                }
-                std::thread::yield_now();
-            }
-            if let Err(e) = dev.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
-            }
+            self.execute_and_wait(&list)?;
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let mut out = Vec::with_capacity((w * h) as usize);
@@ -1141,12 +1275,6 @@ impl Host {
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
         unsafe {
-            let queue: ID3D12CommandQueue = dev
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    ..Default::default()
-                })
-                .map_err(err)?;
             let alloc: ID3D12CommandAllocator = dev
                 .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
                 .map_err(err)?;
@@ -1582,15 +1710,7 @@ impl Host {
                 }
             }
             list.Close().map_err(err)?;
-            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
-            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-            queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if let Err(e) = dev.GetDeviceRemovedReason() {
-                    return Err(format!("device removed: {}", err(e)));
-                }
-                std::thread::yield_now();
-            }
+            self.execute_and_wait(&list)?;
             let mut out = Vec::new();
             for (_, size, n, rb) in &uavs {
                 let mut p = std::ptr::null_mut();

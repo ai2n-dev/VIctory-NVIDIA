@@ -719,8 +719,7 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
             if (WHOLE_MIN..=WHOLE).contains(&len) {
                 tracing::debug!(at = format_args!("{at:#x}"), len, section = first.section.1, views = ?physical.views.range(..at + len).next_back().map(|(v, (n, _))| (*v, *n)), "whole?");
             }
-            if len < WHOLE_MIN
-                || len > WHOLE
+            if !(WHOLE_MIN..=WHOLE).contains(&len)
                 || len != first.section.1
                 || physical.views.range(..at + len).next_back().is_some_and(|(v, (n, _))| v + n > at)
                 || physical.whole.iter().any(|w| Arc::ptr_eq(&w.2, &first.section))
