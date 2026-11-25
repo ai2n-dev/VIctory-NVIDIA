@@ -381,6 +381,7 @@ impl Module {
     }
 
     /// The value of an integer constant; `None` for anything else.
+    #[cfg(test)]
     pub fn int_value(&self, v: V) -> Option<i64> {
         match v {
             V::Const(i) => match self.consts[i as usize].1 {
@@ -394,7 +395,23 @@ impl Module {
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
-            self.consts[o as usize] = self.consts[n as usize].clone();
+            if o == n {
+                return;
+            }
+            let previous = self.consts[o as usize].clone();
+            let replacement = self.consts[n as usize].clone();
+            if self.const_ids.get(&previous) == Some(&o) {
+                self.const_ids.remove(&previous);
+                // Another constant may still hold the previous value after
+                // an earlier replacement. Keep its canonical ID if present.
+                if let Some(i) = self.consts.iter().enumerate().find_map(|(i, c)| {
+                    (i != o as usize && *c == previous).then_some(i as u32)
+                }) {
+                    self.const_ids.insert(previous, i);
+                }
+            }
+            self.consts[o as usize] = replacement.clone();
+            self.const_ids.entry(replacement).or_insert(n);
         }
     }
 
@@ -1274,6 +1291,27 @@ mod tests {
         }
         assert_eq!((f32t, i32t), (m.float(), m.int(32)));
         assert_eq!(m.consts.len(), 4096);
+    }
+
+    #[test]
+    fn replacing_constants_preserves_interning_keys() {
+        let mut m = Module::default();
+        let old = m.i32(10);
+        let new = m.i32(20);
+        m.replace_const(old, new);
+        assert_eq!(m.int_value(old), Some(20));
+        assert_eq!(m.i32(20), new);
+        let ten = m.i32(10);
+        assert_ne!(ten, old);
+        assert_eq!(m.int_value(ten), Some(10));
+
+        // Replacing the canonical 20 leaves the other 20 valid.
+        let thirty = m.i32(30);
+        m.replace_const(new, thirty);
+        assert_eq!(m.i32(20), old);
+        assert_eq!(m.int_value(new), Some(30));
+        m.replace_const(old, old);
+        assert_eq!(m.i32(20), old);
     }
 
     #[test]
