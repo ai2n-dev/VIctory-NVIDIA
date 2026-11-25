@@ -107,6 +107,9 @@ pub(crate) struct State {
     /// Of them, large ones by table: the records it was made from and the
     /// first dynamic slot. A shader that reads less of one takes the same.
     large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,
+    /// What [`State::tables`] made for the stage being bound: root slot, byte
+    /// offset of its fresh table. Kept to reuse its storage across draws.
+    made: Vec<(u8, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -236,6 +239,35 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
 /// Tables from this many entries on are made once for every length shaders
 /// read them to.
 const LARGE: u32 = 64;
+
+/// Root slots (bytes) as a set that lives on the stack: a draw collects them
+/// without the heap, and they come out in order.
+#[derive(Default)]
+struct Slots([u64; 4]);
+
+impl Slots {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot / 64)] |= 1 << (slot % 64);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        (self.0[usize::from(slot / 64)] >> (slot % 64)) & 1 != 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u8> {
+        let words = self.0;
+        (0..4u8).flat_map(move |w| {
+            let mut bits = words[usize::from(w)];
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as u8;
+                    bits &= bits - 1;
+                    w * 64 + bit
+                })
+            })
+        })
+    }
+}
 
 /// The longest `table` of `heap` was asked for, now for `n` entries.
 fn longest(heap: &crate::descriptor::Heap, table: u64, n: u32) -> u32 {
@@ -775,13 +807,16 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            let Some(made) = self.tables(list, &t.used, compute) else {
+            if !self.tables(list, &t.used, compute) {
                 return no("a table not made");
-            };
+            }
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // A root signature holds at most 64 dwords, constants included.
+                let mut stack = [0u32; 64];
+                let values = &mut stack[..dwords as usize];
                 for u in &t.host.user_data {
-                    let fresh = made
+                    let fresh = self
+                        .made
                         .iter()
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     if u.root == RootType::MEMORY {
@@ -1139,27 +1174,28 @@ impl State {
     /// filled at submission (the host wants constant buffers 256-byte
     /// aligned, the console only 16). Identical descriptors share slots
     /// within a list. Returns the fresh tables' new byte offsets by root
-    /// parameter, or `None` when the draw must be dropped (a constant table
-    /// found no dynamic slots).
-    fn tables(
-        &mut self,
-        list: &HostList,
-        used: &[UsedResource],
-        compute: bool,
-    ) -> Option<Vec<(u8, u32)>> {
+    /// parameter in `self.made`, or `false` when the draw must be dropped (a
+    /// constant table found no dynamic slots).
+    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> bool {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
+        // Taken out so `self` stays free to borrow; a draw dropped below
+        // leaves it empty, and it grows again.
+        let mut made = std::mem::take(&mut self.made);
+        made.clear();
+        let mut fresh = Slots::default();
+        for u in used
             .iter()
             .filter(tables)
             .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
-            .map(|u| u.slot)
-            .collect();
+        {
+            fresh.insert(u.slot);
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
         // are made afresh too: the title's slots there have no host slot of
         // their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh.contains(u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -1173,18 +1209,15 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.insert(u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        for slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -1275,7 +1308,7 @@ impl State {
                 // tables fall back to the title's slots.
                 if entries.iter().any(|u| u.kind == ResourceType::Cbv) {
                     once!(n, "a constant table did not fit in command-list slots; draw dropped");
-                    return None;
+                    return false;
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
                 for u in entries {
@@ -1322,7 +1355,8 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        Some(made)
+        self.made = made;
+        true
     }
 
     /// The first draws, at debug level: what they bind and read
