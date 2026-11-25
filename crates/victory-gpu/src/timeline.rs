@@ -7,10 +7,18 @@
 //! that meets the wait. One title thread submits to all queues, waits before
 //! what they wait for, so a submission never blocks.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    /// Nesting depth of `Timeline::step` on the current thread. Work that
+    /// submits or pumps re-entrantly must not wait on a queue this thread
+    /// already holds `busy`.
+    static STEPPING: Cell<u32> = const { Cell::new(0) };
+}
 
 use crate::fence::Held;
 
@@ -44,6 +52,34 @@ pub(crate) enum Op {
 #[derive(Default)]
 pub(crate) struct Timeline {
     state: Mutex<State>,
+    /// Notified whenever `busy` clears so submitters waiting for another
+    /// thread's in-progress step wake immediately.
+    done: Condvar,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Idle,
+    Moved,
+    Busy,
+}
+
+struct BusyGuard<'a>(&'a Timeline);
+
+impl<'a> BusyGuard<'a> {
+    fn enter(timeline: &'a Timeline) -> Self {
+        STEPPING.with(|n| n.set(n.get() + 1));
+        Self(timeline)
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        STEPPING.with(|n| n.set(n.get().saturating_sub(1)));
+        let mut s = self.0.lock();
+        s.busy = false;
+        self.0.done.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -98,24 +134,33 @@ impl Timeline {
         s.ops.is_empty() && !s.busy
     }
 
-    /// Runs what can run on this queue; whether anything did. `force`: the
-    /// first op runs whether or not its wait is met.
-    fn step(&self, mut force: bool) -> bool {
+    /// Waits until no other thread is mid-step on this queue.
+    fn wait_not_busy(&self) {
+        let mut s = self.lock();
+        while s.busy {
+            s = self.done.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Runs what can run on this queue; whether anything did or another thread
+    /// is currently running it. `force`: the first op runs whether or not its
+    /// wait is met.
+    fn step(&self, mut force: bool) -> Step {
         let mut moved = false;
         loop {
             let mut s = self.lock();
             if s.busy {
-                return moved;
+                return if moved { Step::Moved } else { Step::Busy };
             }
             let work: Box<dyn FnOnce()> = match s.ops.front_mut() {
                 None => {
                     s.hold(false);
-                    return moved;
+                    return if moved { Step::Moved } else { Step::Idle };
                 }
                 Some(Op::Wait(fence, value)) => {
                     if !fence.reached(*value) && !force {
                         s.hold(true);
-                        return moved;
+                        return if moved { Step::Moved } else { Step::Idle };
                     }
                     let op = s.ops.pop_front();
                     Box::new(move || drop(op))
@@ -130,7 +175,7 @@ impl Timeline {
                             continue;
                         }
                         s.hold(true);
-                        return moved;
+                        return if moved { Step::Moved } else { Step::Idle };
                     }
                     let work = lists.take(n);
                     if n == len {
@@ -149,14 +194,15 @@ impl Timeline {
                         crate::host::wait_in_flight_if_ready();
                         work();
                     }),
-                    _ => return moved,
+                    _ => return if moved { Step::Moved } else { Step::Idle },
                 },
             };
             s.hold(false);
             s.busy = true;
+            let _busy = BusyGuard::enter(self);
             drop(s);
             work();
-            self.lock().busy = false;
+            drop(_busy);
             progress();
             (moved, force) = (true, false);
         }
@@ -190,9 +236,16 @@ fn queues() -> MutexGuard<'static, Vec<Arc<Timeline>>> {
     QUEUES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Runs what can run on every queue, until none moves: what one ran may be
-/// what another waits for.
+/// Runs what can run on every queue, until none moves and (when called outside
+/// `Timeline::step`) no other thread is mid-step on any queue: what one ran
+/// may be what another waits for, and a submission does not return while its
+/// ready work is still running elsewhere.
 pub(crate) fn pump() {
+    pump_inner(true);
+}
+
+fn pump_inner(wait: bool) {
+    let wait = wait && STEPPING.with(|n| n.get() == 0);
     loop {
         // Queues the title released go once they have run everything.
         let all = {
@@ -201,13 +254,23 @@ pub(crate) fn pump() {
             queues.clone()
         };
         let mut moved = false;
+        let mut busy: Option<Arc<Timeline>> = None;
         for queue in &all {
-            moved |= queue.step(false);
+            match queue.step(false) {
+                Step::Moved => moved = true,
+                Step::Busy if busy.is_none() => busy = Some(queue.clone()),
+                Step::Busy | Step::Idle => {}
+            }
         }
-        if !moved {
-            return;
+        if moved {
+            crate::fence::wake();
+            continue;
         }
-        crate::fence::wake();
+        if wait && let Some(queue) = busy {
+            queue.wait_not_busy();
+            continue;
+        }
+        return;
     }
 }
 
@@ -234,7 +297,7 @@ fn watch() {
                     continue;
                 }
                 std::thread::sleep(Duration::from_micros(500));
-                pump();
+                pump_inner(false);
                 force();
             }
         });
@@ -377,5 +440,55 @@ mod tests {
         queue.submit(op(&at, &log, &[(6, 0)]));
         until(|| log.lock().unwrap().len() == 2);
         assert_eq!(at.load(Ordering::Acquire), 5);
+    }
+
+    /// Submitting to a queue that another thread is currently stepping does not
+    /// return before both the in-progress op and the newly submitted op finish.
+    #[test]
+    fn submit_waits_for_busy_queue_on_another_thread() {
+        let queue = Timeline::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_done = Arc::new(AtomicBool::new(false));
+
+        let q = queue.clone();
+        let s = started.clone();
+        let f = first_done.clone();
+        let worker = std::thread::spawn(move || {
+            q.submit(Op::Work(Box::new(move || {
+                s.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_millis(30));
+                f.store(true, Ordering::Release);
+            })));
+        });
+        until(|| started.load(Ordering::Acquire));
+
+        let d = second_done.clone();
+        queue.submit(Op::Work(Box::new(move || {
+            d.store(true, Ordering::Release);
+        })));
+        assert!(first_done.load(Ordering::Acquire));
+        assert!(second_done.load(Ordering::Acquire));
+        worker.join().unwrap();
+    }
+
+    /// Submitting re-entrantly from inside a queue's work does not deadlock
+    /// waiting for the outer queue's `busy` flag.
+    #[test]
+    fn reentrant_submit_inside_work_does_not_deadlock() {
+        let (first, second) = (Timeline::new(), Timeline::new());
+        let nested = Arc::new(AtomicBool::new(false));
+        let followup = Arc::new(AtomicBool::new(false));
+
+        let f = first.clone();
+        let s = second.clone();
+        let n = nested.clone();
+        let u = followup.clone();
+        first.submit(Op::Work(Box::new(move || {
+            s.submit(Op::Work(Box::new(move || n.store(true, Ordering::Release))));
+            f.submit(Op::Work(Box::new(move || u.store(true, Ordering::Release))));
+        })));
+        assert!(nested.load(Ordering::Acquire));
+        assert!(followup.load(Ordering::Acquire));
     }
 }
