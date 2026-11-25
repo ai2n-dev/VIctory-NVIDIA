@@ -1946,7 +1946,9 @@ impl Shadow {
             before.entry(tile).or_insert_with(|| {
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
-                let whole = data as usize & !(PAGE - 1);
+                // The mapped base need not be PAGE-aligned: subtract the
+                // offset within the title tile rather than rounding the pointer.
+                let whole = data as usize - at % PAGE;
                 let mut buf = pooled_tile();
                 // SAFETY: the tile's mapping.
                 buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
@@ -2396,6 +2398,18 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_tile_base_uses_offset_not_host_alignment() {
+        let page = super::PAGE;
+        for base in [page * 4, page * 4 + 4096, page * 4 + 32768] {
+            for offset in [0, 1, 4095, 4096, page - 1] {
+                let address = page * 8 + offset;
+                let data = base + offset;
+                assert_eq!(data - address % page, base);
+            }
+        }
+    }
+
     use super::*;
     use std::ops::Range;
 
