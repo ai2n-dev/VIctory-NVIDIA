@@ -156,9 +156,8 @@ pub(crate) fn broadcast(extra: usize, work: &(dyn Fn() + Sync)) {
     // SAFETY: only the lifetime bound of the pointee changes. `CloseOnExit`
     // below waits for every thread that took the pointer before `work` is
     // released.
-    let body: *const Body = unsafe {
-        std::mem::transmute::<*const (dyn Fn() + Sync + '_), *const Body>(work)
-    };
+    let body: *const Body =
+        unsafe { std::mem::transmute::<*const (dyn Fn() + Sync + '_), *const Body>(work) };
     let job = Arc::new(Job {
         body,
         state: Mutex::new(State {
