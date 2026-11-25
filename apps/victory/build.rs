@@ -2,10 +2,11 @@
 
 fn main() {
     // Threads created without a stack size take the executable's default.
-    // Host graphics drivers compiling the title's large shaders on such
-    // threads (vkd3d-proton's and the drivers' own, under Wine too) overflow
-    // the linker's default of 1 MiB: reserve 16 MiB instead.
+    // Reserve 4 MiB rather than MSVC's 1 MiB so host drivers compiling large
+    // shaders do not overflow, without burning ~555 MiB of `< 4 GiB` virtual
+    // address space across 37+ threads like 16 MiB did (blocks 32-bit title
+    // reservations on Windows + NVIDIA).
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-        println!("cargo:rustc-link-arg-bins=/STACK:16777216");
+        println!("cargo:rustc-link-arg-bins=/STACK:4194304");
     }
 }
