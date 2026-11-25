@@ -11,11 +11,17 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
-/// Most threads, the caller included, that work on one call. Copying between
-/// memory pools stops scaling well before the core count of a large desktop
-/// part, and extra threads only fight over memory bandwidth and the shared
-/// caches.
-const MAX_THREADS: usize = 8;
+/// Most threads, the caller included, the pool has by default: one per
+/// physical core up to this. Copies of what is in the processor's caches
+/// keep scaling to all the cores of a 16-core part (30 GB/s on one thread,
+/// 100 GB/s on 16 on a Ryzen 9 9955HX3D, `workpool::bench`), those of main
+/// memory stop near 15 GB/s from about 8 threads, and a call costs 1.4 us
+/// with 2 threads and 9.5 us with 16, which is small next to a job worth
+/// splitting.
+const MAX_THREADS: usize = 16;
+
+/// Most threads a request through [`THREADS_VARIABLE`] may ask for.
+const MAX_REQUESTED_THREADS: usize = 64;
 
 /// Overrides the number of threads (the caller included) for tuning on a
 /// given CPU.
@@ -123,10 +129,66 @@ fn configured_threads() -> usize {
     let requested = std::env::var(THREADS_VARIABLE)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok());
-    let available = std::thread::available_parallelism().map_or(4, |n| n.get());
-    requested.unwrap_or(available).clamp(1, MAX_THREADS)
+    match requested {
+        Some(requested) => requested.clamp(1, MAX_REQUESTED_THREADS),
+        None => {
+            let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+            // Without the processor's topology, half the logical processors
+            // are taken to be cores (the usual two threads to a core).
+            let cores = physical_cores().unwrap_or(logical.div_ceil(2));
+            cores.clamp(1, MAX_THREADS)
+        }
+    }
 }
 
+/// The number of physical cores of the machine, if Windows tells.
+fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut bytes = 0u32;
+    // SAFETY: a size query: no buffer is given, the length comes back.
+    unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            std::ptr::null_mut(),
+            &raw mut bytes,
+        )
+    };
+    if bytes == 0 {
+        return None;
+    }
+    // Eight bytes to a word keeps the buffer aligned for the records.
+    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8)];
+    // SAFETY: the buffer has room for `bytes` bytes.
+    let filled = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buffer
+                .as_mut_ptr()
+                .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &raw mut bytes,
+        )
+    };
+    if filled == 0 {
+        return None;
+    }
+    // SAFETY: the buffer holds at least `bytes` initialised bytes.
+    let records =
+        unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), bytes as usize) };
+    // Each record starts with its kind and its size, both 32 bits.
+    let (mut cores, mut offset) = (0, 0);
+    while let Some(size) = records.get(offset + 4..offset + 8) {
+        let size = u32::from_ne_bytes([size[0], size[1], size[2], size[3]]) as usize;
+        if size == 0 {
+            break;
+        }
+        cores += 1;
+        offset += size;
+    }
+    (cores > 0).then_some(cores)
+}
 /// A helper: joins one job after another for as long as the process lives.
 fn serve() {
     loop {
@@ -186,6 +248,9 @@ pub(crate) fn broadcast(extra: usize, work: &(dyn Fn() + Sync)) {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+#[cfg(test)]
+mod bench;
 
 #[cfg(test)]
 mod tests {
