@@ -719,6 +719,33 @@ mod tests {
 
     use super::*;
 
+    /// Constants and texture footprints share scratch chunks without overlap.
+    #[test]
+    fn scratch_uploads_keep_footprint_alignment_and_disjoint_ranges() {
+        use windows::core::Interface;
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let (gpu, constant) = list.scratch(1).unwrap();
+        let (first, offset, bytes) = list.upload(257).unwrap();
+        assert_eq!(offset % 512, 0);
+        // SAFETY: a live upload buffer.
+        assert_eq!(unsafe { first.GetGPUVirtualAddress() } + offset, gpu + 512);
+        assert_eq!(bytes as usize - constant as usize, 512);
+
+        let (second, next, next_bytes) = list.upload(1).unwrap();
+        assert_eq!(first.as_raw(), second.as_raw());
+        assert_eq!(next, offset + 512);
+        assert_eq!(next_bytes as usize - bytes as usize, 512);
+
+        let (large, large_offset, _) = list.upload(SCRATCH_CHUNK + 1).unwrap();
+        assert_ne!(large.as_raw(), first.as_raw());
+        assert_eq!(large_offset, 0);
+
+        let (new_chunk, new_offset, _) = list.upload(SCRATCH_CHUNK).unwrap();
+        assert_ne!(new_chunk.as_raw(), first.as_raw());
+        assert_eq!(new_offset, 0);
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.

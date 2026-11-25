@@ -1948,7 +1948,7 @@ impl Shadow {
                 SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
                 // The mapped base need not be PAGE-aligned: subtract the
                 // offset within the title tile rather than rounding the pointer.
-                let whole = data as usize - at % PAGE;
+                let whole = sparse_tile_base(data as usize, at);
                 let mut buf = pooled_tile();
                 // SAFETY: the tile's mapping.
                 buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
@@ -2008,6 +2008,11 @@ impl Shadow {
         }
         written
     }
+}
+
+/// Recover the mapped tile base from the address of a byte in that tile.
+fn sparse_tile_base(data: usize, address: usize) -> usize {
+    data - address % PAGE
 }
 
 /// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
@@ -2405,7 +2410,7 @@ mod tests {
             for offset in [0, 1, 4095, 4096, page - 1] {
                 let address = page * 8 + offset;
                 let data = base + offset;
-                assert_eq!(data - address % page, base);
+                assert_eq!(super::sparse_tile_base(data, address), base);
             }
         }
     }
