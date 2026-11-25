@@ -231,9 +231,7 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
         }
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 /// Tables from this many entries on are made once for every length shaders
