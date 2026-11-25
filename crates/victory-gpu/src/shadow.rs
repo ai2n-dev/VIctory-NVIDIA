@@ -154,8 +154,8 @@ fn pooled_tiles(count: usize) -> Vec<Vec<u8>> {
     buffers
 }
 
-/// Copy read-only tile views into independent owned snapshots. Scoped workers
-/// cannot outlive the borrowed views or buffers, even if a worker panics.
+/// Copy read-only tile views into independent owned snapshots. The shared
+/// work pool joins all participating workers before returning or unwinding.
 fn snapshot_tiles(views: &[&[u8]], buffers: &mut [Vec<u8>], parallel: bool) {
     assert_eq!(views.len(), buffers.len());
     let copy = |src: &[&[u8]], dst: &mut [Vec<u8>]| {
@@ -164,18 +164,24 @@ fn snapshot_tiles(views: &[&[u8]], buffers: &mut [Vec<u8>], parallel: bool) {
             buffer.extend_from_slice(view);
         }
     };
-    // Below 8 MiB, thread startup can cost more than the copies.
+    // Keep the existing 8 MiB threshold until hardware benchmarks justify
+    // changing it. Do not start helpers for small or disabled snapshots.
     if !parallel || views.len() < 128 {
         copy(views, buffers);
         return;
     }
-    let chunk = views.len().div_ceil(6);
-    std::thread::scope(|scope| {
-        let mut chunks = views.chunks(chunk).zip(buffers.chunks_mut(chunk));
-        if let Some((src, dst)) = chunks.next() {
-            for (src, dst) in chunks {
-                scope.spawn(move || copy(src, dst));
-            }
+    let threads = crate::workpool::threads();
+    let chunk = views.len().div_ceil(threads);
+    let chunks = Mutex::new(views.chunks(chunk).zip(buffers.chunks_mut(chunk)));
+    crate::workpool::broadcast(threads - 1, &|| {
+        loop {
+            // Take ownership of one disjoint mutable slice. The mutex is
+            // released before any copy; no raw pointers or new worker threads.
+            let next = {
+                let mut chunks = chunks.lock().unwrap_or_else(|e| e.into_inner());
+                chunks.next()
+            };
+            let Some((src, dst)) = next else { break };
             copy(src, dst);
         }
     });
@@ -2079,7 +2085,7 @@ impl Shadow {
             return;
         }
         // Keep the tile map locked while borrowing its CPU mappings. A sweep
-        // cannot remove or recycle these tiles until all scoped workers join.
+        // cannot remove or recycle these tiles until the pool call returns.
         let mapped = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
         tiles.retain(|&(tile, base)| mapped.get(&tile).is_some_and(|t| t.data == base));
         if tiles.is_empty() {
