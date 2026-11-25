@@ -1414,6 +1414,23 @@ impl Host {
     /// bottom-of-pipe writes require GPU completion, or returns asynchronously
     /// so CPU recording overlaps GPU execution.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_inner(runs, false);
+    }
+
+    /// As [`Host::execute`] for the title's own submissions, the only ones
+    /// that may return before the host GPU is done
+    /// (`VICTORY_ASYNC_SUBMIT=1`): the title waits for its fences, which are
+    /// signalled after the wait (`crate::timeline`). Our own submissions
+    /// (present, captures, read-backs, texture uploads) read or free what
+    /// they made as soon as the call returns: unwaited, the present's
+    /// capture buffer was freed with its copy still pending, which the
+    /// debug layer names (#921, object deleted while still in use) and the
+    /// AMD driver answered by removing the device at the first frame.
+    pub(crate) fn execute_title(&self, runs: &[&HostList]) {
+        self.execute_inner(runs, true);
+    }
+
+    fn execute_inner(&self, runs: &[&HostList], may_return_early: bool) {
         #[cfg(feature = "diagnostics")]
         let _inside = crate::profile::here();
         // One submission at a time from preparation to copy-back: snapshots
@@ -1514,6 +1531,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
         let can_async = !cfg!(test)
+            && may_return_early
             && !each
             && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
             && card_writes.is_empty()
