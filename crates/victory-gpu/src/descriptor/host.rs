@@ -17,6 +17,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, stale_views, view_at};
 use crate::host::{Host, host};
 
+/// A range of title memory a slot reads: its host copy, address and bytes.
+pub(crate) type CopyRange = (Arc<crate::shadow::Shadow>, usize, usize);
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -245,6 +248,9 @@ impl Bindless {
 /// Slots waiting to be made: at submission, at recording (for the log).
 pub(crate) static BACKLOG: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// A slot's record and what it needs, once looked at (`None`: left null).
+type MadeSlot = Option<((u32, u32), Option<SlotUse>)>;
+
 /// What one bindless slot needs at submission.
 #[derive(Default)]
 struct SlotUse {
@@ -384,7 +390,7 @@ impl BindlessPlan {
     /// Returns the title memory to bring up to date, by the same rule.
     /// And whether it is all of it (and may be looked at less often where it
     /// does not change) rather than what is new.
-    pub(crate) fn copy_constants(&self) -> (&[(Arc<crate::shadow::Shadow>, usize, usize)], bool) {
+    pub(crate) fn copy_constants(&self) -> (&[CopyRange], bool) {
         let frame = crate::queue::presented() + 1;
         // Counted for all plans: each is the one before with a few changes.
         static FRAME: AtomicU64 = AtomicU64::new(0);
@@ -1729,18 +1735,15 @@ impl HostHeap {
         let mut made_any = false;
         let mut fresh = Vec::new();
         let mut fresh_reads = Vec::new();
-        let mut results: Vec<(u32, Option<((u32, u32), Option<SlotUse>)>)> =
-            Vec::with_capacity(todo.len());
+        let mut results: Vec<(u32, MadeSlot)> = Vec::with_capacity(todo.len());
         let mut over: Option<u32> = None;
         let mut todo = todo.into_iter();
-        let mut count = 0usize;
-        for (index, entry) in todo.by_ref() {
+        for (count, (index, entry)) in todo.by_ref().enumerate() {
             if count >= exempt && (count & 15) == 0 && started.elapsed().as_micros() as u64 > left {
                 // Over budget: the rest waits for the next submission.
                 over = Some(index);
                 break;
             }
-            count += 1;
             made_any = true;
             let made = entry.map(|e| (e, self.use_slot(index, e)));
             results.push((index, made));
@@ -1939,10 +1942,6 @@ impl HostHeap {
         Some(slot)
     }
 
-    /// The view host slot `index` was made from, in a few words, with the
-    /// title and host addresses of a buffer view (diagnostics). "null" for
-    /// a slot never made or left null.
-    #[cfg(feature = "diagnostics")]
     /// What a slot views and how it was made, for the device-removed report.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn report_slot(&self, index: u32) -> String {
@@ -1979,6 +1978,10 @@ impl HostHeap {
         text
     }
 
+    /// The view host slot `index` was made from, in a few words, with the
+    /// title and host addresses of a buffer view (diagnostics). "null" for
+    /// a slot never made or left null.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self
             .made
@@ -2130,15 +2133,21 @@ fn view_stride(view: &View) -> u32 {
 fn view_count(view: &View) -> u32 {
     let srv = |w: &[u32; 10]| {
         let desc = srv_desc(w);
-        // SAFETY: a buffer view's union member.
-        (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
-            .then(|| unsafe { desc.Anonymous.Buffer }.NumElements)
+        if desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
+            // SAFETY: a buffer view's union member.
+            Some(unsafe { desc.Anonymous.Buffer }.NumElements)
+        } else {
+            None
+        }
     };
     let uav = |w: &[u32; 10]| {
         let desc = uav_desc(w);
-        // SAFETY: a buffer view's union member.
-        (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
-            .then(|| unsafe { desc.Anonymous.Buffer }.NumElements)
+        if desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
+            // SAFETY: a buffer view's union member.
+            Some(unsafe { desc.Anonymous.Buffer }.NumElements)
+        } else {
+            None
+        }
     };
     match view {
         View::Shader(_, Some(desc)) => srv(desc),
