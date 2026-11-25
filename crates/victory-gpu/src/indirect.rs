@@ -393,7 +393,7 @@ pub(crate) fn bound_before(
     if records == 0 {
         return None;
     }
-    let (c, budget) = (clamp()?, clamps.budget()?);
+    let (c, (budget, budget_resource)) = (clamp()?, clamps.budget_with_resource()?);
     // SAFETY: live buffers.
     let (src_base, count_base) =
         unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
@@ -432,7 +432,15 @@ pub(crate) fn bound_before(
         // Mode 7: one clamp after another, so that the budget is charged in
         // the order of the draws as it is when each clamp precedes its draw.
         if hoist_mode() == 7 {
-            l.ResourceBarrier(&[uav_barrier()]);
+            // The destination ranges are disjoint. Only the shared budget
+            // needs ordering here; clamp_room/clamp_end keep their barriers.
+            // Experimental until validated on real D3D12 adapters.
+            let barrier = if scoped_budget_barrier() {
+                uav_barrier_on(budget_resource)
+            } else {
+                uav_barrier()
+            };
+            l.ResourceBarrier(&[barrier]);
         }
     }
     Some((dst, at))
@@ -453,6 +461,26 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// Opt-in A/B test for mode 7; leave the global barrier as the baseline.
+fn scoped_budget_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOIST_SCOPED_BUDGET").is_some_and(|v| v == "1"))
+}
+
+fn uav_barrier_on(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: borrowed interface pointer; the budget stays alive
+                // in HostList and the barrier never releases the pointer.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+            }),
+        },
+    }
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {

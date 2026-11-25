@@ -2635,6 +2635,11 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_with_resource().map(|(gpu, _)| gpu)
+    }
+
+    /// The budget address and its backing resource, for scoped UAV ordering.
+    pub(crate) fn budget_with_resource(&self) -> Option<(u64, &ID3D12Resource)> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -2652,7 +2657,7 @@ impl HostList {
                 .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((unsafe { buffer.GetGPUVirtualAddress() }, buffer))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
