@@ -451,6 +451,17 @@ impl Shader {
         if !self.root_uavs.is_empty() && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
+        // The flags of what lowering made, as the module writes it: what only
+        // unread values or never-taken edges used is not written.
+        let uses = self.m.uses();
+        for (flag, used) in [
+            (flags::RESOURCE_HEAP, uses.heap),
+            (flags::SAMPLER_HEAP, uses.sampler_heap),
+            (flags::WAVE_OPS, uses.wave),
+            (flags::INT64, uses.int64),
+        ] {
+            self.flags = if used { self.flags | flag } else { self.flags & !flag };
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
