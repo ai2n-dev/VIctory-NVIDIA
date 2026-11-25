@@ -3125,14 +3125,15 @@ impl Early {
     }
 }
 
-/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
+/// Runs `f` on pieces of `list`, of `least` items or more, on the threads of
+/// the work pool and the calling one.
 pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
-    const THREADS: usize = 6;
     if list.len() <= least {
         return f(list);
     }
+    let pool_threads = crate::workpool::threads();
     // Small pieces, taken in turn: they are not equally long to do.
-    let piece = (list.len() / (THREADS * 8)).max(least);
+    let piece = (list.len() / (pool_threads * 8)).max(least);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let work = || {
         loop {
@@ -3143,13 +3144,8 @@ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + 
             f(&list[from..(from + piece).min(list.len())]);
         }
     };
-    let threads = THREADS.min(list.len().div_ceil(piece));
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(work);
-        }
-        work();
-    });
+    let threads = pool_threads.min(list.len().div_ceil(piece));
+    crate::workpool::broadcast(threads - 1, &work);
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.

@@ -71,6 +71,8 @@ mod texpool;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod workpool;
 
 #[cfg(windows)]
 pub use host::on_failure;
