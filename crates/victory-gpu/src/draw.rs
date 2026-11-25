@@ -762,10 +762,8 @@ impl State {
                 self.apply_depth_bounds(list);
             }
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(p);
         }
         if p.stages.iter().any(|s| s.translated().resource_heap)
             && self.heaps[0] != 0
