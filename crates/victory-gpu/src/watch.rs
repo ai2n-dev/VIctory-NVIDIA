@@ -248,6 +248,13 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Guards {
+    fn expire_pins(&mut self) {
+        if !self.pins.is_empty() {
+            let now = std::time::Instant::now();
+            self.pins.retain(|&(_, _, until)| until > now);
+        }
+    }
+
     /// Whether `block` is left writable for a kernel write.
     fn pinned(&self, block: usize) -> bool {
         self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
@@ -452,6 +459,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     {
         let mut g = guards();
         if g.protected.contains(&first) || g.holes.contains(&first) {
+            g.expire_pins();
             // All blocks are already clean: one ordered walk instead of
             // repeated logarithmic lookups, under the same guard lock.
             if fully_clean(&g.clean, first, last) {
@@ -462,7 +470,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             for block in first..=last {
                 let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
                 if open {
-                    if g.protected.contains(&block) {
+                    // Like the slow path, never re-protect a block while
+                    // a kernel write may still be in progress.
+                    if g.pinned(block) {
+                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                        bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+                    } else if g.protected.contains(&block) {
                         g.clean.insert(block);
                         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                     } else {
@@ -488,10 +501,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let check_each = probe != start;
     install();
     let mut g = guards();
-    if !g.pins.is_empty() {
-        let now = std::time::Instant::now();
-        g.pins.retain(|&(_, _, until)| until > now);
-    }
+    g.expire_pins();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     for block in first..=last {
@@ -1189,6 +1199,31 @@ mod tests {
         title_memory_remapped(p, 4 * PAGE);
         // SAFETY: our allocation, journal entries cleared before releasing the VA.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn guard_fast_path_keeps_kernel_write_pins_open() {
+        let (one, two) = two_views();
+        let _ = guard(one, one + 2 * BLOCK).expect("mapped");
+        // The first block remains protected, selecting the fast path.
+        writing(one + BLOCK, BLOCK);
+        let page = (one + BLOCK) / PAGE;
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![page]));
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![page]));
+        {
+            let mut g = guards();
+            assert!(g.protected.contains(&(one / BLOCK)));
+            assert!(!g.protected.contains(&page));
+            assert!(g.pinned(page));
+            // Expire only this test's pins, including the second view.
+            let test_pages = [one / BLOCK + 1, two / BLOCK + 1];
+            g.pins.retain(|&(first, last, _)| {
+                !test_pages.iter().any(|&p| first <= p && p < last)
+            });
+        }
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![page]));
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(Vec::new()));
+        drop_views(&[one, two]);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
