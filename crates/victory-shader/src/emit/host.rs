@@ -15,6 +15,10 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    /// Held while a WARP `Host` is alive so concurrent tests never run on
+    /// `d3d10warp`'s threadpool at the same time (avoids `0xC0000005` races in
+    /// `d3d10warp!OpenAdapter10_2` / `TpCallbackMayRunLong`).
+    _warp_guard: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 /// What the stage declares that a pipeline must match.
@@ -60,6 +64,29 @@ fn target_format(e: &SigElement) -> DXGI_FORMAT {
 
 fn err(e: windows::core::Error) -> String {
     e.message().to_string()
+}
+
+fn check_sm66(device: &ID3D12Device) -> Result<(), String> {
+    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: plain D3D12 feature query on a live device.
+    unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .map_err(err)?;
+    }
+    if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+        return Err(format!(
+            "the device supports SM {:#x} only",
+            sm.HighestShaderModel.0
+        ));
+    }
+    Ok(())
 }
 
 /// The hardware adapters, in DXGI's order: each one's description.
@@ -121,38 +148,52 @@ impl Host {
         Self::create(false, Some(adapter.cast().map_err(err)?))
     }
 
+    pub(crate) fn from_device(device: ID3D12Device) -> Self {
+        Self {
+            device,
+            _warp_guard: None,
+        }
+    }
+
     fn create(warp: bool, adapter: Option<IDXGIAdapter>) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
-            let mut device: Option<ID3D12Device> = None;
             if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else if let Some(adapter) = &adapter {
-                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                static WARP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                let guard = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                // Reuse one process-wide WARP device so concurrent tests never
+                // tear down `d3d10warp`'s threadpool while another thread uses it.
+                static WARP_DEVICE: std::sync::OnceLock<Result<ID3D12Device, String>> =
+                    std::sync::OnceLock::new();
+                return WARP_DEVICE
+                    .get_or_init(|| {
+                        let factory: IDXGIFactory4 =
+                            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                        let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                        let mut dev: Option<ID3D12Device> = None;
+                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev)
+                            .map_err(err)?;
+                        let dev = dev.ok_or("no device")?;
+                        check_sm66(&dev)?;
+                        Ok(dev)
+                    })
+                    .clone()
+                    .map(|device| Host {
+                        device,
+                        _warp_guard: Some(guard),
+                    });
+            }
+            let device = if let Some(adapter) = &adapter {
+                let mut dev: Option<ID3D12Device> = None;
+                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(err)?;
+                dev.ok_or("no device")?
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            }
-            let device = device.ok_or("no device")?;
-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+                let mut dev: Option<ID3D12Device> = None;
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).map_err(err)?;
+                dev.ok_or("no device")?
             };
-            device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_SHADER_MODEL,
-                    (&raw mut sm).cast(),
-                    size_of_val(&sm) as u32,
-                )
-                .map_err(err)?;
-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-                return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
-                ));
-            }
-            Ok(Host { device })
+            check_sm66(&device)?;
+            Ok(Host::from_device(device))
         }
     }
 

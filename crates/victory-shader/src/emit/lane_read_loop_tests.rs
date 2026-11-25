@@ -109,7 +109,7 @@ fn devices() -> Vec<(String, Host)> {
             if D3D12CreateDevice(&a, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
                 && let Some(device) = device
             {
-                out.push((name, Host { device }));
+                out.push((name, Host::from_device(device)));
             }
         }
     }
