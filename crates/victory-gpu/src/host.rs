@@ -284,6 +284,11 @@ pub(crate) fn host() -> Option<&'static Host> {
 
 /// Waits for any in-flight async host GPU submissions without creating the
 /// host device if it has not been initialised yet.
+/// Whether a submission is still to be waited for and finished.
+pub(crate) fn has_in_flight() -> bool {
+    matches!(HOST.get(), Some(Some(h)) if h.has_in_flight())
+}
+
 pub(crate) fn wait_in_flight_if_ready() {
     if let Some(Some(h)) = HOST.get() {
         h.wait_in_flight();
