@@ -7,6 +7,7 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
@@ -108,12 +109,16 @@ static BLOB_VTABLE: BlobVtable = BlobVtable {
     len: blob_len,
 };
 
+/// `dxil.dll` holds non-thread-safe global state across `DxcCreateInstance`
+/// and `Validate` calls, so serialize host validation calls.
+static DXIL_LOCK: Mutex<()> = Mutex::new(());
+
 pub struct Validator {
     object: Object,
 }
 
-// SAFETY: the validator object is free-threaded (DXC's validator has no
-// thread affinity); calls are serialised by `&mut self`.
+// SAFETY: every call into `dxil.dll` (`load`, `validate`, `drop`) acquires
+// `DXIL_LOCK`.
 unsafe impl Send for Validator {}
 
 impl Validator {
@@ -135,6 +140,7 @@ impl Validator {
 
     /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
+        let _guard = DXIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let name: Vec<u16> = path
             .map_or_else(|| "dxil.dll".into(), |p| p.as_os_str().to_owned())
             .to_string_lossy()
@@ -164,6 +170,7 @@ impl Validator {
     /// Validates `container` and signs it in place; the error text if it
     /// is rejected.
     pub fn validate(&mut self, container: &mut [u8]) -> Result<(), String> {
+        let _guard = DXIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut blob = Blob {
             vtable: &BLOB_VTABLE,
             data: container.as_mut_ptr(),
@@ -215,6 +222,7 @@ impl Validator {
 
 impl Drop for Validator {
     fn drop(&mut self) {
+        let _guard = DXIL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: we own one reference.
         unsafe { release(self.object) };
     }
