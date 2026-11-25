@@ -275,11 +275,11 @@ impl CardState {
 
     fn take_dirty_up(&self) -> Vec<(usize, usize)> {
         self.queued.store(false, Ordering::Release);
-        let mut dirty = self.dirty_up.lock().unwrap_or_else(|e| e.into_inner());
-        if dirty.is_empty() {
-            return Vec::new();
-        }
-        let mut ranges = std::mem::take(&mut *dirty);
+        let mut ranges = {
+            let mut dirty = self.dirty_up.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *dirty)
+        };
+        // The detached ranges no longer need the per-card mutex while sorting.
         merge_byte_ranges(&mut ranges);
         ranges
     }
@@ -287,6 +287,29 @@ impl CardState {
     pub(crate) fn total_pieces(&self) -> u32 {
         (self.size / PAGE as u64) as u32
     }
+}
+
+/// Groups consecutive runs by entry without allocating a vector per shadow.
+/// Entries arrive in plan order; the returned spans index the flat pieces.
+type ReadbackGroup = (usize, std::ops::Range<usize>);
+type ReadbackPiece = (u32, u32, usize);
+
+fn group_readback_runs(
+    runs: impl IntoIterator<Item = (usize, u32, u32, usize)>,
+) -> (Vec<ReadbackGroup>, Vec<ReadbackPiece>) {
+    let mut groups: Vec<ReadbackGroup> = Vec::new();
+    let runs = runs.into_iter();
+    let mut pieces = Vec::with_capacity(runs.size_hint().0);
+    for (entry, first, count, ptr) in runs {
+        let at = pieces.len();
+        pieces.push((first, count, ptr));
+        if let Some((_, span)) = groups.last_mut().filter(|(i, _)| *i == entry) {
+            span.end = at + 1;
+        } else {
+            groups.push((entry, at..at + 1));
+        }
+    }
+    (groups, pieces)
 }
 
 /// Merges overlapping or adjacent `[from, to)` ranges in place.
@@ -1013,22 +1036,21 @@ impl CardEngine {
                     }
 
                     // Group dirty runs by entry so distinct shadows merge in parallel.
-                    let mut per_entry: Vec<(usize, Vec<(u32, u32, usize)>)> = Vec::new();
-                    for run in &dirty_runs {
-                        let ptr = fetch_ptr + run.rb_offset as usize;
-                        // Runs were emitted in entry order above, so only
-                        // the last group can belong to the current entry.
-                        if let Some(g) = per_entry.last_mut().filter(|(i, _)| *i == run.entry_idx) {
-                            g.1.push((run.first_piece, run.count, ptr));
-                        } else {
-                            per_entry.push((run.entry_idx, vec![(run.first_piece, run.count, ptr)]));
-                        }
-                    }
+                    let (per_entry, pieces) = group_readback_runs(dirty_runs.iter().map(|run| {
+                        (
+                            run.entry_idx,
+                            run.first_piece,
+                            run.count,
+                            fetch_ptr + run.rb_offset as usize,
+                        )
+                    }));
                     let total_written = AtomicU64::new(0);
                     crate::host::in_parallel(&per_entry, 4, |chunk| {
-                        for (entry_idx, runs) in chunk {
+                        for (entry_idx, span) in chunk {
                             let entry = &plan.entries[*entry_idx];
-                            let n = entry.shadow.merge_card_pieces(&entry.card, runs);
+                            let n = entry
+                                .shadow
+                                .merge_card_pieces(&entry.card, &pieces[span.clone()]);
                             total_written.fetch_add(n as u64, Ordering::Relaxed);
                         }
                     });
@@ -1157,6 +1179,26 @@ mod tests {
             }
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn readback_groups_preserve_order_and_offsets() {
+        let input = [
+            (0, 1, 2, 0x1000),
+            (0, 5, 1, 0x3000),
+            (2, 0, 3, 0x4000),
+            (7, 9, 1, 0x7000),
+            (7, 11, 4, 0x8000),
+        ];
+        let (groups, pieces) = group_readback_runs(input);
+        assert_eq!(groups, vec![(0, 0..2), (2, 2..3), (7, 3..5)]);
+        assert_eq!(
+            pieces,
+            input.map(|(_, first, count, ptr)| (first, count, ptr))
+        );
+        let (groups, pieces) = group_readback_runs(std::iter::empty());
+        assert!(groups.is_empty());
+        assert!(pieces.is_empty());
     }
 
     #[test]
