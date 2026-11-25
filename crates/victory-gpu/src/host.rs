@@ -2574,15 +2574,11 @@ impl HostList {
         });
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
-        Some((buffer, data))
+    /// `size` bytes of mapped upload memory, 512-byte aligned for a placed
+    /// footprint, alive until the list is reset: the buffer, the offset in
+    /// it and the CPU pointer.
+    pub(crate) fn upload(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(size, 512, |buffer, at, _, data| (buffer.clone(), at, data))
     }
 
     /// A mapped readback buffer of `size` bytes, alive until the list is
@@ -2597,6 +2593,18 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    /// `len` bytes of upload memory at a multiple of `align` until the list
+    /// is reset, handed to `f` with the buffer, the offset in it, the host GPU
+    /// address and the CPU pointer.
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        align: u64,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -2605,10 +2613,11 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let made = f(&buffer, 0, gpu, data);
             self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some(made);
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        if s.used.next_multiple_of(align) + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -2626,10 +2635,11 @@ impl HostList {
             s.chunks.push(chunk);
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let (buffer, data, gpu) = &s.chunks[s.current];
+        let at = s.used.next_multiple_of(align);
+        let made = f(buffer, at, gpu + at, (data + at as usize) as *mut u8);
+        s.used = at + len;
+        Some(made)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
