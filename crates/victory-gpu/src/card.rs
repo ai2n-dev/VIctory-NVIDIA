@@ -197,7 +197,7 @@ impl CardState {
             return None;
         }
         let (min_bytes, max_bytes) = limits();
-        if size < min_bytes || size >= (1 << 30) || size % PAGE as u64 != 0 {
+        if size < min_bytes || size >= (1 << 30) || !size.is_multiple_of(PAGE as u64) {
             return None;
         }
         if !host.card_ready() {
@@ -293,6 +293,8 @@ impl CardState {
 /// Entries arrive in plan order; the returned spans index the flat pieces.
 type ReadbackGroup = (usize, std::ops::Range<usize>);
 type ReadbackPiece = (u32, u32, usize);
+type DirtyCard = (Arc<CardState>, Vec<(usize, usize)>);
+type RehashUpload = (Arc<CardState>, ID3D12Resource, Vec<(u32, u32)>);
 
 fn group_readback_runs(
     runs: impl IntoIterator<Item = (usize, u32, u32, usize)>,
@@ -606,16 +608,12 @@ impl CardEngine {
         vram: &ID3D12Resource,
         hashes: &ID3D12Resource,
         differs: &ID3D12Resource,
-        first: u32,
-        size: u32,
-        count: u32,
-        out_at_bytes: u32,
-        compare: u32,
+        constants: [u32; 6],
     ) {
+        let count = constants[3];
         if count == 0 {
             return;
         }
-        let constants = [first, 0u32, size, count, out_at_bytes, compare];
         // SAFETY: caller ensures `list` is open with `root_sig` and `pso` bound
         // and all 3 buffers are live with valid states.
         unsafe {
@@ -636,7 +634,7 @@ impl CardEngine {
         writes: &[(Arc<crate::shadow::Shadow>, usize, usize)],
     ) -> (Option<ID3D12CommandList>, CardPlan) {
         // 1. Drain all card shadows with pending CPU -> VRAM uploads.
-        let mut dirty_cards: Vec<(Arc<CardState>, Vec<(usize, usize)>)> = Vec::new();
+        let mut dirty_cards: Vec<DirtyCard> = Vec::new();
         {
             let mut q = DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner());
             // Swap reusable queue storage, then release the global lock
@@ -699,7 +697,7 @@ impl CardEngine {
 
         // Also check which dirty-uploaded shadows already have hashes (so we
         // re-hash their newly uploaded pieces after CopyBufferRegion).
-        let mut rehash_uploads: Vec<(Arc<CardState>, ID3D12Resource, Vec<(u32, u32)>)> = Vec::new();
+        let mut rehash_uploads: Vec<RehashUpload> = Vec::new();
         for (card, ranges) in &dirty_cards {
             // Skip partial rehash if this card is already getting a full hash below.
             if need_full_hash.iter().any(|(c, _)| Arc::ptr_eq(c, card)) {
@@ -801,11 +799,7 @@ impl CardEngine {
                         &card.vram,
                         hashes,
                         &self.dummy_uav,
-                        0,
-                        card.size as u32,
-                        card.total_pieces(),
-                        0,
-                        0,
+                        [0, 0, card.size as u32, card.total_pieces(), 0, 0],
                     );
                 }
                 card.hashes_ready.store(true, Ordering::Release);
@@ -819,11 +813,7 @@ impl CardEngine {
                             &card.vram,
                             hashes,
                             &self.dummy_uav,
-                            first,
-                            card.size as u32,
-                            count,
-                            0,
-                            0,
+                            [first, 0, card.size as u32, count, 0, 0],
                         );
                     }
                 }
@@ -873,11 +863,8 @@ impl CardEngine {
                         &entry.card.vram,
                         &entry.hashes,
                         &self.differs_gpu,
-                        first,
-                        entry.card.size as u32,
-                        count,
-                        out_idx * 4,
-                        2, // compare against previous hash AND store updated hash
+                        // Mode 2 compares and stores the updated hash.
+                        [first, 0, entry.card.size as u32, count, out_idx * 4, 2],
                     );
                     out_idx += count;
                 }
@@ -936,8 +923,9 @@ impl CardEngine {
         if plan.entries.is_empty() {
             return 0;
         }
-        // SAFETY: GPU finished writing `differs_rb` before the fence returned.
         let differs: &[u32] = if plan.total_pieces > 0 {
+            // SAFETY: the caller waits for the compare list's fence; the
+            // allocated mapping covers plan.total_pieces u32 flag values.
             unsafe {
                 std::slice::from_raw_parts(
                     self.differs_rb.1 as *const u32,
@@ -1000,6 +988,8 @@ impl CardEngine {
         if total_bytes > 0
             && let Some((fetch_res, fetch_ptr)) = self.ensure_fetch_capacity(host, total_bytes)
         {
+            // SAFETY: the submitted lock serializes access to the allocator;
+            // previous fetch commands have completed before it is reused.
             let ok = unsafe {
                 self.fetch_alloc.Reset().is_ok()
                     && self.fetch_list.Reset(&self.fetch_alloc, None).is_ok()
@@ -1018,6 +1008,7 @@ impl CardEngine {
                         );
                     }
                 }
+                // SAFETY: the fetch list is open and all recorded resources are live.
                 if unsafe { self.fetch_list.Close() }.is_ok()
                     && let Ok(cmd) = self.fetch_list.cast::<ID3D12CommandList>()
                 {
