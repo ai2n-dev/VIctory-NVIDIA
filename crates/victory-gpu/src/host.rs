@@ -61,18 +61,52 @@ unsafe impl Send for Finish {}
 
 /// Whether the title's submissions may return before the host GPU is done
 /// (`VICTORY_ASYNC_SUBMIT=1`; off by default).
+#[cfg(not(test))]
 fn async_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1"))
+}
+
+/// Tests run submissions synchronously, whatever the environment says,
+/// unless a test of the asynchronous path turns it on.
+#[cfg(test)]
+static ASYNC_IN_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn async_submit() -> bool {
+    ASYNC_IN_TESTS.load(Ordering::Relaxed)
 }
 
 /// Microseconds spent bringing buffer copies up to date while the
 /// submission before ran ([`Host::prewarm`]), since the last frame line.
 static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The newest unwaited submission (its fence value) that is finished:
-/// waited for and its results put back.
-static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// This thread is putting back the results of an unwaited submission,
+    /// holding `Host::submitted`: what it calls meanwhile must not wait for
+    /// that submission or take the lock again.
+    static FINISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the thread as finishing a submission until dropped.
+struct Finishing;
+
+impl Finishing {
+    fn enter() -> Finishing {
+        FINISHING.with(|finishing| finishing.set(true));
+        Finishing
+    }
+}
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        FINISHING.with(|finishing| finishing.set(false));
+    }
+}
+
+fn finishing_here() -> bool {
+    FINISHING.with(std::cell::Cell::get)
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -85,6 +119,10 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     /// Async submissions not yet retired, oldest first.
     in_flight: Mutex<std::collections::VecDeque<InFlight>>,
+    /// The newest fence value of `fence` whose submission is finished: its
+    /// results are put back, not just run. One per host, as each counts its
+    /// own fence.
+    finished_fence: std::sync::atomic::AtomicU64,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -428,6 +466,7 @@ impl Host {
                 fence,
                 submitted: Mutex::new(0),
                 in_flight: Mutex::new(std::collections::VecDeque::new()),
+                finished_fence: std::sync::atomic::AtomicU64::new(0),
                 event,
                 rtvs,
                 rtv_size,
@@ -820,6 +859,33 @@ mod tests {
         unsafe { slot(1).write_volatile(0) };
         host.execute(&[&list]);
         assert_eq!(value(1), 5);
+    }
+
+    /// With asynchronous submission on, a title submission may return before
+    /// its results are put back; they are there once it is waited for.
+    #[test]
+    fn an_unwaited_submission_is_finished_when_waited_for() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut memory = [0u64; 2];
+        let at = memory.as_mut_ptr();
+        list.count_work();
+        list.defer_write(at.cast(), crate::queue::Written::Value(5), 8);
+        list.close();
+        let list = std::sync::Arc::new(list);
+
+        ASYNC_IN_TESTS.store(true, Ordering::Relaxed);
+        host.execute_title(std::slice::from_ref(&list));
+        ASYNC_IN_TESTS.store(false, Ordering::Relaxed);
+
+        host.wait_in_flight();
+        // SAFETY: inside the array.
+        assert_eq!(unsafe { at.read_volatile() }, 5);
+        let (finished, last) = (
+            host.finished_fence.load(Ordering::Acquire),
+            list.last_fence.load(Ordering::Acquire),
+        );
+        assert!(finished >= last, "finished {finished}, list's last fence {last}");
     }
 
     /// A name picks an adapter by a part of its description, ignoring case.
@@ -1363,27 +1429,36 @@ impl Host {
         let completed = unsafe { self.fence.GetCompletedValue() };
         let mut last_sub = 0u64;
         loop {
-            let done = {
+            // The entry stays queued until it is finished: a thread that
+            // looks for unfinished submissions meanwhile (a fence about to
+            // be signalled) has to wait for this one, whoever finishes it.
+            let ready = {
                 let mut q = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                match q.front() {
-                    Some(front) if front.fence <= completed => q.pop_front(),
+                match q.front_mut() {
+                    Some(front) if front.fence <= completed => {
+                        Some((front.fence, front.submission, front.finish.take()))
+                    }
                     _ => None,
                 }
             };
-            let Some(mut done) = done else { break };
-            last_sub = last_sub.max(done.submission);
-            if let Some(Finish { lists, back }) = done.finish.take() {
+            let Some((fence, submission, finish)) = ready else { break };
+            last_sub = last_sub.max(submission);
+            if let Some(Finish { lists, back }) = finish {
+                let _finishing = Finishing::enter();
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+                    self.fail_if_device_removed(&runs);
                     self.finish_submission(&runs, back);
+                    self.log_messages();
                 }
                 // Before its lists go: a list that goes with it waits for
                 // this fence, with `submitted` held here.
-                FINISHED_FENCE.fetch_max(done.fence, Ordering::AcqRel);
+                self.finished_fence.fetch_max(fence, Ordering::AcqRel);
                 drop(lists);
             } else {
-                FINISHED_FENCE.fetch_max(done.fence, Ordering::AcqRel);
+                self.finished_fence.fetch_max(fence, Ordering::AcqRel);
             }
+            self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         }
         if last_sub != 0 {
             FINISHED.fetch_max(last_sub, Ordering::AcqRel);
@@ -1393,12 +1468,12 @@ impl Host {
 
     /// Whether a submission is still to be waited for and finished.
     fn has_in_flight(&self) -> bool {
-        !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        !finishing_here() && !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Waits until the host GPU fence reaches at least `target`.
     pub(crate) fn wait_fence(&self, target: u64) {
-        if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
+        if target == 0 || finishing_here() || self.finished_fence.load(Ordering::Acquire) >= target {
             return;
         }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1607,8 +1682,7 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
-        let can_async = !cfg!(test)
-            && keep.is_some()
+        let can_async = keep.is_some()
             && !each
             && async_submit()
             && card_writes.is_empty();
@@ -1647,15 +1721,18 @@ impl Host {
             let fence_val = *submitted;
             if can_async {
                 // SAFETY: the fence is ours.
-                if let Err(e) = unsafe { self.queue.Signal(&self.fence, fence_val) } {
-                    tracing::warn!(error = %e, "host async submission not signalled");
-                } else {
-                    for list in runs {
-                        list.last_fence.store(fence_val, Ordering::Release);
+                match unsafe { self.queue.Signal(&self.fence, fence_val) } {
+                    Ok(()) => {
+                        for list in runs {
+                            list.last_fence.store(fence_val, Ordering::Release);
+                        }
+                        async_signalled = true;
+                        continue;
                     }
-                    async_signalled = true;
+                    // Waited for below like a synchronous submission: its
+                    // resources must not be released while the GPU runs.
+                    Err(e) => tracing::warn!(error = %e, "host async submission not signalled"),
                 }
-                continue;
             }
             // SAFETY: the fence and event are ours.
             unsafe {
@@ -1735,15 +1812,7 @@ impl Host {
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
-            ));
-        }
+        self.fail_if_device_removed(runs);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -1764,7 +1833,22 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.finish_submission(runs, cpu_back);
+        self.finished_fence.fetch_max(*submitted, Ordering::AcqRel);
         self.log_messages();
+    }
+
+    /// Stops the process with the removal data when the host device was
+    /// removed while `runs` ran.
+    fn fail_if_device_removed(&self, runs: &[&HostList]) {
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            fail(format_args!(
+                "host GPU device removed after a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs)
+            ));
+        }
     }
 
     /// After a submission ran: what its shaders wrote goes back into title
