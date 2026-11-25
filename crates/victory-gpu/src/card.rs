@@ -380,6 +380,7 @@ pub(crate) struct CardEngine {
     differs_rb: (ID3D12Resource, usize, u64),
     dummy_uav: ID3D12Resource,
     fetch_rb: Option<(ID3D12Resource, usize, u64)>,
+    dirty_queue: Vec<Weak<CardState>>,
 }
 
 // SAFETY: accessed only under `Host::submitted` lock or `CardEngine` mutex;
@@ -475,6 +476,7 @@ impl CardEngine {
             differs_rb: (rb_res, rb_ptr as usize, init_diff_bytes),
             dummy_uav,
             fetch_rb: None,
+            dirty_queue: Vec::new(),
         })
     }
 
@@ -550,12 +552,15 @@ impl CardEngine {
         let mut dirty_cards: Vec<(Arc<CardState>, Vec<(usize, usize)>)> = Vec::new();
         {
             let mut q = DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner());
-            for weak in q.drain(..) {
-                if let Some(card) = weak.upgrade() {
-                    let ranges = card.take_dirty_up();
-                    if !ranges.is_empty() {
-                        dirty_cards.push((card, ranges));
-                    }
+            // Swap reusable queue storage, then release the global lock
+            // before inspecting cards or sorting their dirty ranges.
+            std::mem::swap(&mut *q, &mut self.dirty_queue);
+        }
+        for weak in self.dirty_queue.drain(..) {
+            if let Some(card) = weak.upgrade() {
+                let ranges = card.take_dirty_up();
+                if !ranges.is_empty() {
+                    dirty_cards.push((card, ranges));
                 }
             }
         }
