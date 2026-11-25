@@ -1171,6 +1171,10 @@ struct Deferred {
     copies: Vec<Step>,
     /// Post-submission readbacks from GPU textures into title buffers.
     readbacks: Vec<Readback>,
+    /// Title textures of kinds copied back (`crate::texback`) written via UAV in this list.
+    back_wanted: Vec<usize>,
+    /// Readback copies recorded when closing the list, landed into title memory after GPU completion.
+    texture_backs: Vec<crate::texback::Back>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1523,7 +1527,9 @@ impl Host {
             && cpu_back.is_empty()
             && runs.iter().all(|list| {
                 let d = list.deferred();
-                d.readbacks.is_empty() && d.writes[d.early..].is_empty()
+                d.readbacks.is_empty()
+                    && d.texture_backs.is_empty()
+                    && d.writes[d.early..].is_empty()
             });
         if let Some(first) = first {
             // SAFETY: a closed list.
@@ -1712,6 +1718,9 @@ impl Host {
             }
         }
         for list in runs {
+            for back in &list.deferred().texture_backs {
+                crate::texback::land(back);
+            }
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
                     let bytes = rb.row_bytes * rb.lines;
@@ -2164,6 +2173,7 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        self.textures_back();
         crate::cardmeter::end(
             &self.list,
             crate::cardmeter::Span::from_raw(
@@ -2682,6 +2692,34 @@ impl HostList {
             lines,
             row_bytes,
         });
+    }
+
+    /// Records that a draw or dispatch in this list writes `resource` through
+    /// unordered access; wanted kinds are copied back to title memory on close.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.contains(&(resource as usize)) {
+            deferred.back_wanted.push(resource as usize);
+        }
+    }
+
+    /// Before the list closes: copies wanted UAV-written textures into readback buffers.
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for resource in wanted {
+            let resource = resource as crate::object::This;
+            let Some(copy) = crate::resource::host_copy(resource) else {
+                continue;
+            };
+            crate::list::ensure_state(self, resource, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is

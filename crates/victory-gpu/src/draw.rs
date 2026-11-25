@@ -1919,6 +1919,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         (View::Unordered(resource, _, desc), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Read by the title's CPU code: copied back into title memory.
+            list.texture_written(*resource as This);
             // Written through its twins, copied in after the dispatch.
             if crate::resource::depth_twin(*resource as This).is_some() {
                 crate::twin::note(*resource as This, desc.as_ref());

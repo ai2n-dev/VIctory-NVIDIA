@@ -1112,6 +1112,35 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// Width, height and format of texture `this` (`None` for a buffer), for
+/// [`crate::texback`].
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension != BUFFER).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s single-plane console layout, title memory address and layout
+/// byte size for [`crate::texback`]; `None` for a buffer or multi-plane texture.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
+
 #[cfg(windows)]
 thread_local! {
     /// The texture being made is one the title placed in memory it streams.
@@ -2097,6 +2126,43 @@ pub(crate) fn test_buffer(width: u64) -> This {
         sample_quality: 0,
         layout: 1,
         flags: 0,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &heap,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_texture(width: u64, height: u32, format: u32) -> This {
+    let heap = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 4, // ALLOW_UNORDERED_ACCESS
     };
     let mut out = std::ptr::null();
     let hr = create_committed(
