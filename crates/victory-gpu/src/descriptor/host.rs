@@ -585,18 +585,20 @@ impl HostHeap {
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                // The title keeps as many of its slots as fit beside the
+                // smaller dynamic reserve, and the dynamic slots take the
+                // rest: a heap of few title slots is not padded to the cap
+                // with title slots (its dynamic ones started past them).
+                let room = PORTABLE_VIEWS - crate::memory::SLOTS;
+                let kept = count.min(room - DYNAMIC_CAPPED);
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = kept,
+                    lost = wanted - kept,
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
-                (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
-                    DYNAMIC_CAPPED,
-                )
+                (make(room).ok()?, kept, room - kept)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
