@@ -1031,9 +1031,9 @@ mod tests {
             )
             .is_none()
         );
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         title_memory_remapped(p, 4 * PAGE);
+        // SAFETY: our allocation, journal entries cleared before releasing the VA.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

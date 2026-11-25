@@ -1045,7 +1045,8 @@ mod tests {
         run_once();
         assert_eq!(staging.gpu_uploads(), 2);
 
-        // SAFETY: freeing our own allocation.
+        crate::watch::title_memory_remapped(raw as usize, alloc_size);
+        // SAFETY: freeing our own allocation after clearing its journal entries.
         unsafe { VirtualFree(raw.cast(), 0, MEM_RELEASE) };
     }
 
