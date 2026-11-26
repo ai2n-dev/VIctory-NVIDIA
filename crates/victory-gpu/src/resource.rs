@@ -1014,7 +1014,7 @@ impl Drop for HostTexture {
         #[cfg(feature = "diagnostics")]
         census(&self.texture, -(self.bytes as i64));
         // A submission recorded but not yet run may still name it.
-        crate::host::retire((self.texture.clone(), self.slot.take()));
+        crate::host::retire_bytes((self.texture.clone(), self.slot.take()), self.bytes);
     }
 }
 

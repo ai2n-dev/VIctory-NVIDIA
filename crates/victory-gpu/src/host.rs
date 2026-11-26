@@ -193,6 +193,9 @@ struct Retired {
     frame: u64,
     /// When.
     at: std::time::Instant,
+    /// The video memory it holds as far as the retiring code knows (0 if
+    /// it did not say), counted in [`crate::memstat::RETIRED_BYTES`].
+    bytes: u64,
     #[allow(dead_code)]
     object: Box<dyn std::any::Any>,
 }
@@ -203,14 +206,86 @@ unsafe impl Send for Retired {}
 /// Drops `object` once every submission running now has finished and
 /// [`KEEP_FRAMES`] more frames were presented.
 pub(crate) fn retire<T: 'static>(object: T) {
+    retire_bytes(object, 0);
+}
+
+/// [`retire`] for an object that holds `bytes` of video memory, so that what
+/// is kept waiting for the GPU shows in the memory report and in the
+/// pressure that shortens the wait ([`keep_time`]).
+pub(crate) fn retire_bytes<T: 'static>(object: T, bytes: u64) {
     let submission = STARTED.load(Ordering::Acquire);
     let frame = crate::queue::presented();
+    crate::memstat::add(&crate::memstat::RETIRED_BYTES, bytes);
+    crate::memstat::add(&crate::memstat::RETIRED_COUNT, 1);
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back(Retired {
         submission,
         frame,
         at: std::time::Instant::now(),
+        bytes,
         object: Box::new(object),
     });
+}
+
+/// The time a retired object is kept for at least: [`KEEP_TIME`], or
+/// `VICTORY_KEEP_SECS` seconds, and none while the host GPU's video memory is
+/// nearly full ([`PRESSURE_PERCENT`] of its budget), when waiting costs more than
+/// it protects: the submissions that named an object must still have
+/// finished and [`KEEP_FRAMES`] frames been presented.
+fn keep_time(under_pressure: impl FnOnce() -> bool) -> std::time::Duration {
+    static CONFIGURED: OnceLock<std::time::Duration> = OnceLock::new();
+    let configured = *CONFIGURED.get_or_init(|| {
+        std::env::var("VICTORY_KEEP_SECS")
+            .ok()
+            .and_then(|secs| secs.trim().parse::<f64>().ok())
+            .filter(|secs| secs.is_finite() && *secs >= 0.0)
+            .map_or(KEEP_TIME, std::time::Duration::from_secs_f64)
+    });
+    if configured.is_zero() || !under_pressure() {
+        configured
+    } else {
+        std::time::Duration::ZERO
+    }
+}
+
+/// Percent of the video memory budget from which retired objects stop
+/// waiting for [`KEEP_TIME`] (the host already keeps uploads out of video memory
+/// above 85 %).
+const PRESSURE_PERCENT: u64 = 90;
+
+/// Whether video memory is used up to [`PRESSURE_PERCENT`] of its budget, asked of
+/// the driver at most every 200 ms.
+fn video_memory_pressure() -> bool {
+    static CHECKED: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
+    let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, pressure)) = *checked
+        && at.elapsed() < std::time::Duration::from_millis(200)
+    {
+        return pressure;
+    }
+    let pressure = video_memory().is_some_and(|[(used, budget), _]| {
+        budget != 0 && used.saturating_mul(100) >= budget.saturating_mul(PRESSURE_PERCENT)
+    });
+    *checked = Some((std::time::Instant::now(), pressure));
+    pressure
+}
+
+/// How many objects at the front of `retired` (oldest first) may be dropped:
+/// those whose submissions are among the `finished` ones, that were retired
+/// `keep_frames` presented frames and `keep_time` ago.
+fn expired(
+    retired: &std::collections::VecDeque<Retired>,
+    finished: u64,
+    frame: u64,
+    keep_time: std::time::Duration,
+) -> usize {
+    retired
+        .iter()
+        .take_while(|r| {
+            r.submission <= finished
+                && frame.saturating_sub(r.frame) >= KEEP_FRAMES
+                && r.at.elapsed() >= keep_time
+        })
+        .count()
 }
 
 /// Drops what waited for submissions up to `finished` and is old enough
@@ -225,16 +300,17 @@ fn bury(finished: u64) {
     let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         // In the order they came: the old ones are at the front.
-        let n = retired
-            .iter()
-            .take_while(|r| {
-                r.submission <= finished
-                    && now.saturating_sub(r.frame) >= KEEP_FRAMES
-                    && r.at.elapsed() >= KEEP_TIME
-            })
-            .count();
+        let mut n = expired(&retired, finished, now, keep_time(|| false));
+        // The pressure is asked only when it would free more.
+        if n < retired.len() && retired.iter().nth(n).is_some_and(|r| r.submission <= finished) {
+            n = expired(&retired, finished, now, keep_time(video_memory_pressure));
+        }
         retired.drain(..n).collect()
     };
+    for r in &done {
+        crate::memstat::sub(&crate::memstat::RETIRED_BYTES, r.bytes);
+        crate::memstat::sub(&crate::memstat::RETIRED_COUNT, 1);
+    }
     drop(done);
 }
 
@@ -1055,6 +1131,50 @@ mod tests {
             list.last_fence.load(Ordering::Acquire),
         );
         assert!(finished >= last, "finished {finished}, list's last fence {last}");
+    }
+
+    fn retired_at(submission: u64, frame: u64, age: std::time::Duration) -> Retired {
+        Retired {
+            submission,
+            frame,
+            at: std::time::Instant::now() - age,
+            bytes: 0,
+            object: Box::new(()),
+        }
+    }
+
+    /// An object leaves the queue only when its submissions finished, the
+    /// frames passed and the time passed; time that is not asked for
+    /// (pressure) leaves the other two as they are.
+    #[test]
+    fn retired_objects_wait_for_submissions_and_frames_whatever_the_time() {
+        use std::time::Duration;
+        let old = Duration::from_secs(60);
+        let queue: std::collections::VecDeque<Retired> = [
+            retired_at(3, 10, old),
+            retired_at(4, 10, Duration::ZERO),
+            retired_at(9, 10, old),
+        ]
+        .into();
+        let all_frames = 10 + KEEP_FRAMES;
+        // Nothing finished: nothing goes.
+        assert_eq!(expired(&queue, 2, all_frames, KEEP_TIME), 0);
+        // The first has everything; the second is too young.
+        assert_eq!(expired(&queue, 9, all_frames, KEEP_TIME), 1);
+        // Without the wait for time, the second goes too, but not the
+        // third (its submission is not finished) ...
+        assert_eq!(expired(&queue, 8, all_frames, Duration::ZERO), 2);
+        // ... nor does an object whose frames have not passed.
+        assert_eq!(expired(&queue, 9, all_frames - 1, Duration::ZERO), 0);
+        assert_eq!(expired(&queue, 9, all_frames, Duration::ZERO), 3);
+    }
+
+    /// Pressure asks the driver only when the configured time is not zero,
+    /// and takes the whole time off.
+    #[test]
+    fn pressure_takes_the_waiting_time_off() {
+        assert_eq!(keep_time(|| false), KEEP_TIME);
+        assert_eq!(keep_time(|| true), std::time::Duration::ZERO);
     }
 
     /// A name picks an adapter by a part of its description, ignoring case.

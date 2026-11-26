@@ -20,6 +20,11 @@ pub(crate) static HOST_TEXTURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HOST_TEXTURE_COUNT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PLACED_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Video memory (as far as the retiring code says) and number of objects
+/// that were let go but wait for the GPU ([`crate::host::retire_bytes`]).
+pub(crate) static RETIRED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static RETIRED_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn add(counter: &AtomicU64, bytes: u64) {
     counter.fetch_add(bytes, Relaxed);
 }
@@ -122,6 +127,7 @@ pub fn report() -> String {
             let _ = write!(line, ", {name} {} MiB ({})", mib(b[0].load(Relaxed)), b[1].load(Relaxed));
         }
         let _ = write!(line, ", {} lists", LISTS.load(Relaxed));
+        let _ = write!(line, ", retired {} MiB ({})", mib(RETIRED_BYTES.load(Relaxed)), RETIRED_COUNT.load(Relaxed));
     }
     #[cfg(windows)]
     {
