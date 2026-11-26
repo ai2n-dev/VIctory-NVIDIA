@@ -21,6 +21,75 @@ use super::HostShader;
 use super::container::SigElement;
 use crate::dxbc::{Container, FourCC};
 
+// Test-only: validate the runtime-info extent before interpreting PSV0.
+#[cfg(test)]
+fn test_psv_wave_range(psv: &[u8]) -> Result<(u32, u32), &'static str> {
+    let size = crate::dxbc::u32_at(psv, 0).map_err(|_| "missing runtime info size")? as usize;
+    if size < 24 || size > psv.len().saturating_sub(4) {
+        return Err("invalid runtime info size");
+    }
+    let min = crate::dxbc::u32_at(psv, 20).map_err(|_| "missing wave minimum")?;
+    let max = crate::dxbc::u32_at(psv, 24).map_err(|_| "missing wave maximum")?;
+    if min > max {
+        return Err("reversed wave range");
+    }
+    Ok((min, max))
+}
+
+#[cfg(test)]
+fn test_wave_range_supported((min, max): (u32, u32), target: super::Target) -> bool {
+    min <= target.lanes_max && max >= target.lanes_min
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn psv(min: u32, max: u32) -> [u8; 52] {
+        let mut bytes = [0; 52];
+        bytes[..4].copy_from_slice(&48u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&min.to_le_bytes());
+        bytes[24..28].copy_from_slice(&max.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn psv_wave_range_rejects_malformed_runtime_info() {
+        assert_eq!(test_psv_wave_range(&psv(32, 32)), Ok((32, 32)));
+        assert_eq!(test_psv_wave_range(&psv(0, u32::MAX)), Ok((0, u32::MAX)));
+        assert!(test_psv_wave_range(&[]).is_err());
+        assert!(test_psv_wave_range(&psv(32, 32)[..28]).is_err());
+        assert!(test_psv_wave_range(&psv(64, 32)).is_err());
+        let mut short = psv(32, 32);
+        short[..4].copy_from_slice(&16u32.to_le_bytes());
+        assert!(test_psv_wave_range(&short).is_err());
+    }
+
+    #[test]
+    fn psv_wave_range_matches_adapter_capabilities() {
+        let warp = super::super::Target {
+            lanes_min: 4,
+            lanes_max: 4,
+        };
+        let nvidia = super::super::Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        let amd = super::super::Target {
+            lanes_min: 32,
+            lanes_max: 64,
+        };
+        for target in [warp, nvidia, amd] {
+            assert!(test_wave_range_supported((0, u32::MAX), target));
+        }
+        assert!(!test_wave_range_supported((32, 32), warp));
+        assert!(test_wave_range_supported((32, 32), nvidia));
+        assert!(test_wave_range_supported((32, 32), amd));
+        assert!(!test_wave_range_supported((64, 64), nvidia));
+        assert!(test_wave_range_supported((64, 64), amd));
+    }
+}
+
 #[cfg(test)]
 struct SharedQueue {
     queue: ID3D12CommandQueue,
@@ -445,10 +514,9 @@ impl Host {
     pub(crate) fn test_shader_wave(&self, shader: &HostShader) -> bool {
         let c = crate::Container::parse(&shader.dxil).expect("parse test DXIL");
         let psv = c.part(crate::FourCC::PSV0).expect("test DXIL PSV0").data;
-        let min = crate::dxbc::u32_at(psv, 4 + 16).expect("PSV wave minimum");
-        let max = crate::dxbc::u32_at(psv, 4 + 20).expect("PSV wave maximum");
+        let (min, max) = test_psv_wave_range(psv).expect("valid test PSV wave range");
         let target = self.target();
-        if min <= target.lanes_max && max >= target.lanes_min {
+        if test_wave_range_supported((min, max), target) {
             return true;
         }
         eprintln!(
