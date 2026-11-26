@@ -242,14 +242,18 @@ fn pattern(kind: usize, element_log2: u32, block_log2: u32) -> [Vec<u32>; 3] {
 
 /// Byte offsets inside a block for coordinates 0..2^bits of one axis.
 fn spread(bits: &[u32]) -> Vec<u32> {
-    (0..1u32 << bits.len())
-        .map(|c| {
-            bits.iter()
-                .enumerate()
-                .map(|(i, &to)| ((c >> i) & 1) << to)
-                .sum()
-        })
-        .collect()
+    // Each newly introduced coordinate bit doubles the table: the upper
+    // half is the already-built lower half plus that bit's address weight.
+    // This avoids scanning all coordinate bits for every table entry.
+    let mut offsets = Vec::with_capacity(1usize << bits.len());
+    offsets.push(0);
+    for &to in bits {
+        let weight = 1u32 << to;
+        for i in 0..offsets.len() {
+            offsets.push(offsets[i] + weight);
+        }
+    }
+    offsets
 }
 
 /// Tables depend only on the micro-tile kind, block size and element size.
@@ -993,6 +997,31 @@ mod tests {
         // Blocks row by row: (16, 0) is the second block, (0, 16) the third.
         assert_eq!(l.offset(0, 16, 0, 0), Ok(4096));
         assert_eq!(l.offset(0, 0, 16, 0), Ok(8192));
+    }
+
+    #[test]
+    fn spread_matches_independent_bit_sum_for_every_pattern_key() {
+        let mut checked = 0;
+        for kind in 0..3 {
+            for element in 0..5 {
+                for block in [8, 12, 16] {
+                    for bits in pattern(kind, element, block) {
+                        let actual = spread(&bits);
+                        let expected: Vec<u32> = (0..1u32 << bits.len())
+                            .map(|c| {
+                                bits.iter()
+                                    .enumerate()
+                                    .map(|(i, &to)| ((c >> i) & 1) << to)
+                                    .sum()
+                            })
+                            .collect();
+                        assert_eq!(actual, expected, "{kind}/{element}/{block}: {bits:?}");
+                        checked += actual.len();
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4540);
     }
 
     #[test]
