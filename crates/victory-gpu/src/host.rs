@@ -4,6 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -127,7 +128,7 @@ pub(crate) struct Host {
     /// results are put back, not just run. One per host, as each counts its
     /// own fence.
     finished_fence: std::sync::atomic::AtomicU64,
-    event: HANDLE,
+    event: OwnedHandle,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
@@ -508,7 +509,9 @@ impl Host {
                 ..Default::default()
             })?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-            let event = CreateEventW(None, false, false, None)?;
+            // SAFETY: CreateEventW returns a newly owned handle on success.
+            // Own it immediately, including if later heap creation fails.
+            let event = OwnedHandle::from_raw_handle(CreateEventW(None, false, false, None)?.0);
             let rtvs: ID3D12DescriptorHeap =
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -579,7 +582,7 @@ impl Host {
         unsafe {
             self.queue.ExecuteCommandLists(&[Some(cmd)]);
             match self.queue.Signal(&self.fence, fence_val) {
-                Ok(()) => wait_for_value(&self.fence, self.event, fence_val),
+                Ok(()) => wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val),
                 Err(e) => tracing::warn!(error = %e, "card GPU wait failed"),
             }
         }
@@ -1676,7 +1679,7 @@ impl Host {
             return;
         }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        wait_for_value(&self.fence, self.event, target);
+        wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), target);
         self.reap_completed();
     }
 
@@ -1710,7 +1713,7 @@ impl Host {
         if unsafe { self.fence.GetCompletedValue() } < target {
             let waited = std::time::Instant::now();
             // The fence and event are ours; the caller holds `submitted`.
-            wait_for_value(&self.fence, self.event, target);
+            wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), target);
             submission_us(1, waited.elapsed().as_micros() as u64);
         }
         self.reap_completed();
@@ -1922,7 +1925,7 @@ impl Host {
             }
             // SAFETY: the fence is ours.
             match unsafe { self.queue.Signal(&self.fence, fence_val) } {
-                Ok(()) => wait_for_value(&self.fence, self.event, fence_val),
+                Ok(()) => wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val),
                 Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
             }
             #[cfg(feature = "diagnostics")]
