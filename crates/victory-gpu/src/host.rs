@@ -3882,6 +3882,7 @@ impl HostList {
                         copy_count += 1;
                     }
                     let started = std::time::Instant::now();
+                    batch.check_textures(&mut uploads);
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     copy_us += started.elapsed().as_micros() as u64;
@@ -3909,6 +3910,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
+                        batch.check_textures(&mut uploads);
                         batch.title_written();
                     }
                     work();
@@ -3924,12 +3926,17 @@ impl HostList {
                     shadow.writing(*address, *len);
                 }
                 Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging) && staging.refresh() {
-                        uploads.push((staging.clone(), copy.clone()));
+                    if batch.texture_due(staging) {
+                        if parallel_refresh() {
+                            batch.due_textures.push((staging.clone(), copy.clone()));
+                        } else if staging.refresh() {
+                            uploads.push((staging.clone(), copy.clone()));
+                        }
                     }
                 }
             }
         }
+        batch.check_textures(&mut uploads);
         if copy_bytes > 0 || copy_us > 0 {
             preparing(0, copy_us);
             preparing(1, copy_bytes);
@@ -3963,6 +3970,12 @@ struct Batch {
     pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Opt-in (`VICTORY_PARALLEL_REFRESH=1|alt`): textures queued for a
+    /// parallel check before the next title write or end of the list.
+    due_textures: Vec<(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    )>,
     /// View heaps the submission's draws index directly, and whether their
     /// shaders may write memory.
     bindless: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, bool)>,
@@ -4012,8 +4025,24 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        debug_assert!(self.due_textures.is_empty());
         self.flush();
         self.textures.clear();
+    }
+
+    /// Flushes queued texture checks on the work pool, keeping list order.
+    fn check_textures(
+        &mut self,
+        uploads: &mut Vec<(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+        )>,
+    ) {
+        if self.due_textures.is_empty() {
+            return;
+        }
+        let due = std::mem::take(&mut self.due_textures);
+        refresh_textures_with(due, uploads, |staging| staging.refresh());
     }
 
     fn flush(&mut self) {
@@ -4103,6 +4132,26 @@ struct Early {
 }
 
 impl Early {
+    fn push_copy(
+        &mut self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;
+        let (to, from) = (D3D12_RESOURCE_STATES(COPY_DEST), D3D12_RESOURCE_STATES(real));
+        if real != COPY_DEST {
+            self.before.push(transition(&copy.texture, from, to));
+        }
+        self.after.push(transition(
+            &copy.texture,
+            to,
+            D3D12_RESOURCE_STATES(SHADER_RESOURCE as i32),
+        ));
+        self.copies.push((staging, copy));
+    }
+
     /// Takes the textures waiting; `late`: after the lists' preludes took
     /// the textures' states, so not those the lists use (they upload them).
     fn take(&mut self, batch: &mut Batch, runs: &[&HostList], late: bool) {
@@ -4117,23 +4166,26 @@ impl Early {
                 used.extend(states.values().map(|s| std::sync::Arc::as_ptr(&s.2) as usize));
             }
         }
-        const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
-        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        let mut due = Vec::new();
+        let parallel = parallel_refresh();
         for (staging, copy) in first {
             if used.contains(&(std::sync::Arc::as_ptr(&copy) as usize))
                 || !batch.texture_due(&staging)
-                || !staging.refresh()
             {
                 continue;
             }
-            let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;
-            let (to, from) = (D3D12_RESOURCE_STATES(COPY_DEST), D3D12_RESOURCE_STATES(real));
-            if real != COPY_DEST {
-                self.before.push(transition(&copy.texture, from, to));
+            if parallel {
+                due.push((staging, copy));
+            } else if staging.refresh() {
+                self.push_copy(staging, copy);
             }
-            self.after
-                .push(transition(&copy.texture, to, D3D12_RESOURCE_STATES(SHADER_RESOURCE as i32)));
-            self.copies.push((staging, copy));
+        }
+        if !due.is_empty() {
+            let mut dirty = Vec::new();
+            refresh_textures_with(due, &mut dirty, |staging| staging.refresh());
+            for (staging, copy) in dirty {
+                self.push_copy(staging, copy);
+            }
         }
     }
 
@@ -4181,6 +4233,74 @@ impl Early {
                 fail(format_args!("texture uploads did not record ({e})"));
             }
             list.cast().ok()
+        }
+    }
+}
+
+/// Opt-in (`VICTORY_PARALLEL_REFRESH=1|alt`, off by default): run queued
+/// texture checks across work pool threads while preserving list upload order.
+/// Adapted from fxceless/victory-fork ceb9e1f7.
+fn parallel_refresh() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_PARALLEL_REFRESH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20).is_multiple_of(2);
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "texture checks run in parallel from now (VICTORY_PARALLEL_REFRESH=alt): {}",
+                    if on { "ON" } else { "off" }
+                );
+            }
+            on
+        }
+    }
+}
+
+fn refresh_textures_with<S: Sync, T: Sync>(
+    due: Vec<(S, T)>,
+    uploads: &mut Vec<(S, T)>,
+    check: impl Fn(&S) -> bool + Sync,
+) {
+    if due.is_empty() {
+        return;
+    }
+    if due.len() == 1 {
+        for (staging, copy) in due {
+            if check(&staging) {
+                uploads.push((staging, copy));
+            }
+        }
+        return;
+    }
+    let started = std::time::Instant::now();
+    let before = PREPARING[2].load(Ordering::Relaxed);
+    let items: Vec<_> = due
+        .into_iter()
+        .map(|(staging, copy)| (staging, copy, std::sync::atomic::AtomicBool::new(false)))
+        .collect();
+    in_parallel(&items, 1, |chunk| {
+        for (staging, _, dirty) in chunk {
+            if check(staging) {
+                dirty.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+    let summed = PREPARING[2].load(Ordering::Relaxed).saturating_sub(before);
+    let wall = started.elapsed().as_micros() as u64;
+    // Individual checks add per-thread time to PREPARING[2]; subtract the
+    // overlap so the frame breakdown tracks wall time for this batch.
+    PREPARING[2].fetch_sub(summed.saturating_sub(wall), Ordering::Relaxed);
+    for (staging, copy, dirty) in items {
+        if dirty.into_inner() {
+            uploads.push((staging, copy));
         }
     }
 }
@@ -5564,6 +5684,21 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn parallel_texture_checks_preserve_dirty_order() {
+        let items = vec![
+            (1usize, "a"),
+            (2, "b"),
+            (3, "c"),
+            (4, "d"),
+            (5, "e"),
+            (6, "f"),
+        ];
+        let mut uploads = Vec::new();
+        super::refresh_textures_with(items, &mut uploads, |n| n % 2 == 0);
+        assert_eq!(uploads, vec![(2, "b"), (4, "d"), (6, "f")]);
     }
 
     /// The hashing a submission does for textures in physical-page memory,

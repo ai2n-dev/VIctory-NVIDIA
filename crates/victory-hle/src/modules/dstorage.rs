@@ -356,6 +356,10 @@ struct Lanes {
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
+    /// Slowest request in the current window and counts >= 250 ms / >= 1 s
+    /// for plain and BCPack requests.
+    slowest: (u64, u32, u64),
+    slow: [u64; 4],
 }
 
 /// A queue's requests in the scheduler.
@@ -413,6 +417,8 @@ fn scheduler() -> Option<&'static Scheduler> {
                     refused: 0,
                     bcpack: Default::default(),
                     since: None,
+                    slowest: (0, 0, 0),
+                    slow: [0; 4],
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -480,6 +486,17 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        let ms = started.elapsed().as_millis() as u64;
+        let bc = job.request.options & BCPACK != 0;
+        if ms > self.slowest.0 {
+            self.slowest = (ms, job.request.destination_size, job.request.options);
+        }
+        if ms >= 250 {
+            self.slow[usize::from(bc) * 2] += 1;
+        }
+        if ms >= 1000 {
+            self.slow[usize::from(bc) * 2 + 1] += 1;
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -500,6 +517,22 @@ impl Lanes {
             self.done = Default::default();
             self.bcpack = Default::default();
             self.since = None;
+            let (ms, bytes, options) = std::mem::take(&mut self.slowest);
+            let slow = std::mem::take(&mut self.slow);
+            if ms >= 250 {
+                tracing::info!(
+                    slowest_ms = ms,
+                    mb = format_args!("{:.1}", f64::from(bytes) / 1e6),
+                    options = format_args!("{options:#x}"),
+                    bcpack = options & BCPACK != 0,
+                    plain_250ms = slow[0],
+                    plain_1s = slow[1],
+                    bcpack_250ms = slow[2],
+                    bcpack_1s = slow[3],
+                    "dstorage: slow requests in last {:.1} s",
+                    elapsed.as_secs_f64()
+                );
+            }
         }
     }
 
@@ -1363,6 +1396,8 @@ mod tests {
             refused: 0,
             bcpack: Default::default(),
             since: None,
+            slowest: (0, 0, 0),
+            slow: [0; 4],
         }
     }
 
