@@ -4046,26 +4046,43 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
-            update(&shadow, from, to - from);
-        }
-        let mut pieces = std::mem::take(&mut self.pieces);
-        pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
-        let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
-        for (shadow, from, to) in pieces {
-            if let Some((s, _, end)) = &mut run
-                && s.root_key() == shadow.root_key()
-                && from <= *end + 4096
-            {
-                *end = (*end).max(to);
-                continue;
+        let refreshes = std::mem::take(&mut self.refreshes);
+        let parallel = port_guard_plan();
+        if parallel && refreshes.len() >= 2 {
+            let started = std::time::Instant::now();
+            let before = PREPARING[0].load(Ordering::Relaxed);
+            in_parallel(&refreshes, 1, |chunk| {
+                for (shadow, from, to) in chunk {
+                    update(shadow, *from, *to - *from);
+                }
+            });
+            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+            let wall = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_sub(summed.saturating_sub(wall), Ordering::Relaxed);
+        } else {
+            for (shadow, from, to) in refreshes {
+                update(&shadow, from, to - from);
             }
-            if let Some((s, a, b)) = run.replace((shadow, from, to)) {
-                update(&s, a, b - a);
-            }
         }
-        if let Some((s, a, b)) = run {
-            update(&s, a, b - a);
+        let pieces = std::mem::take(&mut self.pieces);
+        let (groups, merged) = group_piece_runs(pieces);
+        if parallel && groups.len() >= 2 {
+            let started = std::time::Instant::now();
+            let before = PREPARING[0].load(Ordering::Relaxed);
+            in_parallel(&groups, 1, |chunk| {
+                for span in chunk {
+                    for (shadow, from, to) in &merged[span.clone()] {
+                        update(shadow, *from, *to - *from);
+                    }
+                }
+            });
+            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+            let wall = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_sub(summed.saturating_sub(wall), Ordering::Relaxed);
+        } else {
+            for (shadow, from, to) in merged {
+                update(&shadow, from, to - from);
+            }
         }
     }
 
@@ -4234,6 +4251,60 @@ impl Early {
             }
             list.cast().ok()
         }
+    }
+}
+
+/// Opt-in (`VICTORY_PORT_GUARD_PLAN=1`, off by default): refresh distinct
+/// buffer shadows and sparse shadow roots across work pool threads during
+/// `Batch::flush`. Adapted from AvatarManz cc761bf3 (Renderer Port 6).
+fn port_guard_plan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD_PLAN").is_some_and(|v| v == "1"))
+}
+
+type PieceRuns<T> = (Vec<std::ops::Range<usize>>, Vec<(T, usize, usize)>);
+
+fn group_piece_runs<T>(
+    pieces: Vec<(T, usize, usize)>,
+) -> PieceRuns<T>
+where
+    T: RootKeyed,
+{
+    let mut pieces = pieces;
+    pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
+    let mut merged: Vec<(T, usize, usize)> = Vec::with_capacity(pieces.len());
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut cur_key: Option<usize> = None;
+    for (shadow, from, to) in pieces {
+        let key = shadow.root_key();
+        if let Some((last_shadow, _, end)) = merged.last_mut()
+            && last_shadow.root_key() == key
+            && from <= *end + 4096
+        {
+            *end = (*end).max(to);
+            continue;
+        }
+        let idx = merged.len();
+        merged.push((shadow, from, to));
+        if cur_key == Some(key)
+            && let Some(span) = groups.last_mut()
+        {
+            span.end = idx + 1;
+        } else {
+            cur_key = Some(key);
+            groups.push(idx..idx + 1);
+        }
+    }
+    (groups, merged)
+}
+
+trait RootKeyed {
+    fn root_key(&self) -> usize;
+}
+
+impl RootKeyed for std::sync::Arc<crate::shadow::Shadow> {
+    fn root_key(&self) -> usize {
+        crate::shadow::Shadow::root_key(self)
     }
 }
 
@@ -5711,6 +5782,34 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let mut uploads = Vec::new();
         super::refresh_textures_with(items, &mut uploads, |n| n % 2 == 0);
         assert_eq!(uploads, vec![(2, "b"), (4, "d"), (6, "f")]);
+    }
+
+    #[test]
+    fn piece_runs_group_by_root_and_merge_within_page_gap() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Keyed(usize);
+        impl super::RootKeyed for Keyed {
+            fn root_key(&self) -> usize {
+                self.0
+            }
+        }
+        let pieces = vec![
+            (Keyed(2), 10_000, 12_000),
+            (Keyed(1), 8_000, 9_000),
+            (Keyed(1), 1_000, 2_000),
+            (Keyed(1), 5_500, 7_000),
+            (Keyed(2), 20_000, 21_000),
+        ];
+        let (groups, merged) = super::group_piece_runs(pieces);
+        assert_eq!(groups, vec![0..1, 1..3]);
+        assert_eq!(
+            merged,
+            vec![
+                (Keyed(1), 1_000, 9_000),
+                (Keyed(2), 10_000, 12_000),
+                (Keyed(2), 20_000, 21_000),
+            ]
+        );
     }
 
     /// The hashing a submission does for textures in physical-page memory,
