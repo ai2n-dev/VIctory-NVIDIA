@@ -206,6 +206,36 @@ fn run_with_views(
 }
 
 #[test]
+fn full_width_unsigned_conversion_rounds_once() {
+    let shader = build_valu_cs(&[vop1(0x006, 0, vgpr(1))]);
+    let cases = [
+        0u32, 1, 0xffff, 0x10000, 0x00ff_ffff, 0x0100_0001,
+        0x0100_0003, 0x7fff_ffff, 0x8000_0080, 0x8000_0180,
+        0xffff_ff7f, 0xffff_ff80, u32::MAX,
+    ].map(|n| [n, 0, 0, 0]);
+    run_cases(&shader, &cases, |device, _, inputs, result| {
+        assert_eq!(result, (inputs[0] as f32).to_bits(), "{device}: {:#x}", inputs[0]);
+    });
+}
+
+#[test]
+fn sdwa_half_word_zero_sign_extends_bit_fifteen() {
+    // v_add_f16 v0, v1, v2 SDWA: low-word sources and WORD_0/SEXT destination.
+    let op = (0x32u32 << 25) | (2 << 9) | 0xf9;
+    let ext = 1 | (4 << 8) | (1 << 11) | (4 << 16) | (4 << 24);
+    let shader = build_valu_cs(&[op, ext]);
+    let cases = [
+        [0xbc00, 0, 0, 0], // -1.0
+        [0x3c00, 0, 0, 0], // +1.0
+        [0xc000, 0xbc00, 0, 0], // -2.0 + -1.0
+    ];
+    let expected = [0xffff_bc00, 0x0000_3c00, 0xffff_c200];
+    run_cases(&shader, &cases, |device, i, _, result| {
+        assert_eq!(result, expected[i], "{device}: case {i}");
+    });
+}
+
+#[test]
 fn data_only_structured_srv_reads_its_bound_record_count() {
     // The second heap slot contains an SRV. Its only use is a read of dword 2.
     let mut load = s_load_dwordx4(12, 4);
