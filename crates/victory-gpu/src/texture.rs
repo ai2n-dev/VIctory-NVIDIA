@@ -212,6 +212,25 @@ thread_local! {
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Configurable per-thread scratch retention, adapted from cool_fox
+/// cf3f6156. Unlike the donor, keep our existing 64 MiB default cap.
+/// Lower values trade more allocations for lower retained commit.
+fn read_keep_limit(value: Option<&str>) -> usize {
+    value.and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(64 << 20, |mb| mb.saturating_mul(1 << 20))
+}
+
+fn read_keep() -> usize {
+    static KEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| read_keep_limit(std::env::var("VICTORY_READ_KEEP_MB").ok().as_deref()))
+}
+
+fn release_large_read(read: &mut Vec<u8>, keep: usize) {
+    if read.capacity() > keep {
+        *read = Vec::new();
+    }
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
@@ -408,9 +427,7 @@ impl Staging {
                 k => frame + (1 << (k - 1).min(5)) - (self.memory as u64 >> 16) % 2,
             };
             // As in `with_tiled_copy`: a one-off huge read is not kept.
-            if scratch.capacity() > 64 << 20 {
-                *scratch = Vec::new();
-            }
+            release_large_read(scratch, read_keep());
             read
         })
     }
@@ -609,9 +626,7 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
         detile(tiled);
         // Keep the room for the next texture unless it is far bigger than
         // usual (a one-off, like a whole pool): it is commit charge.
-        if read.capacity() > 64 << 20 {
-            *read = Vec::new();
-        }
+        release_large_read(read, read_keep());
     });
 }
 
@@ -819,6 +834,24 @@ mod tests {
         assert!(watched_refresh_due(8, false, &[(1, 9)]));
         assert!(watched_refresh_due(8, true, &[]));
         assert!(watched_refresh_due(8, true, &[(1, 7)]));
+    }
+
+    #[test]
+    fn texture_read_retention_preserves_default_and_releases_oversized_buffers() {
+        assert_eq!(read_keep_limit(None), 64 << 20);
+        assert_eq!(read_keep_limit(Some("invalid")), 64 << 20);
+        assert_eq!(read_keep_limit(Some(" 8 ")), 8 << 20);
+        assert_eq!(read_keep_limit(Some("0")), 0);
+        let mut read = vec![0xabu8; 1024];
+        let cap = read.capacity();
+        release_large_read(&mut read, cap);
+        assert_eq!(read, vec![0xabu8; 1024]);
+        release_large_read(&mut read, cap - 1);
+        assert_eq!(read.capacity(), 0);
+        read.resize(7, 0xcd);
+        release_large_read(&mut read, 0);
+        assert!(read.is_empty());
+        assert_eq!(read.capacity(), 0);
     }
 
     #[test]
