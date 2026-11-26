@@ -426,6 +426,9 @@ mod tests {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
         use windows::Win32::Graphics::Dxgi::*;
         use windows::core::Interface;
+        // The default adapter may also be WARP on a software-only runner.
+        // Keep the guard until every test-owned D3D12 object is dropped.
+        let _serial = crate::host::warp_serial();
         let mut device: Option<ID3D12Device> = None;
         // SAFETY: probe hardware adapter first, then WARP fallback.
         unsafe {
