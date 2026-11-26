@@ -122,7 +122,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use container::MESH_OUTPUT_LIMIT;
 pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    LAUNCH_SPACE, MESH_PAYLOAD_BYTES, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

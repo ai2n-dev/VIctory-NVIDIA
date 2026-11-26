@@ -41,6 +41,8 @@ pub mod framelog;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod launch;
 pub mod list;
 #[cfg(windows)]
 mod memwait;

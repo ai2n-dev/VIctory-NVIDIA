@@ -4178,6 +4178,10 @@ impl Meter {
                     }
                 }
                 crate::copystat::log(frames);
+            }
+            crate::launch::line(frames);
+            #[cfg(feature = "diagnostics")]
+            {
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",

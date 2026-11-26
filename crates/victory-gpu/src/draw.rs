@@ -1219,6 +1219,8 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let launch = crate::pipeline::host_pipeline(self.pipeline as This)
+            .and_then(|p| p.launch.as_ref());
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -1226,11 +1228,23 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false, false));
         #[cfg(feature = "diagnostics")]
         crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("mesh {x}"), false, true));
-                    // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
-                    list.count_work();
-                    DRAWN.fetch_add(1, Ordering::Relaxed);
-                    true
+                    let ok = match launch {
+                        Some(launch) => crate::launch::record(
+                            list,
+                            launch.roots,
+                            crate::launch::Launch::Direct(x),
+                        ),
+                        None => {
+                            // SAFETY: an open list with everything set.
+                            unsafe { l6.DispatchMesh(x, 1, 1) };
+                            true
+                        }
+                    };
+                    if ok {
+                        list.count_work();
+                        DRAWN.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ok
                 }
                 Err(_) => false,
             };
@@ -1770,6 +1784,50 @@ impl State {
             why("arguments outside title buffers");
             return false;
         };
+        // One mesh record of a pipeline with the launch stage: the draw
+        // reads it itself (`crate::launch`), no clamp of ours before it.
+        if kind == MESH
+            && max == 1
+            && count.is_none()
+            && let Some(launch) = &p.launch
+        {
+            let offset = args.offset(arguments);
+            if !offset.is_multiple_of(4) {
+                why("a mesh record not 4-byte aligned");
+                return false;
+            }
+            args.refresh(list, arguments, len);
+            if !self.prepare_for(list, false, true) {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                self.op_text(
+                    format!("indirect kind {kind} max {max} at {arguments:#x} launched"),
+                    false,
+                    false,
+                )
+            });
+            #[cfg(feature = "diagnostics")]
+            crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || {
+                self.op_text(
+                    format!("indirect kind {kind} max {max} at {arguments:#x} launched"),
+                    false,
+                    true,
+                )
+            });
+            // SAFETY: a live buffer.
+            let record = unsafe { args.buffer.GetGPUVirtualAddress() } + offset;
+            list.keep(&args.buffer);
+            if !crate::launch::record(list, launch.roots, crate::launch::Launch::Record(record)) {
+                why("no budget for the launch");
+                return false;
+            }
+            list.count_work();
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
@@ -1910,6 +1968,21 @@ impl State {
                 )),
             }
             return false;
+        }
+        // A mesh call the launch stage does not take (a count buffer, more
+        // than one record): the same pipeline without the stage.
+        if kind == MESH
+            && let Some(launch) = &p.launch
+        {
+            let Some(plain) = launch.plain() else {
+                why("no host pipeline without the launch stage");
+                return false;
+            };
+            // SAFETY: an open list and a live pipeline of the same root
+            // signature.
+            unsafe { list.list.SetPipelineState(plain) };
+            self.host_pipeline = plain.as_raw() as usize;
+            list.keep(plain);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
