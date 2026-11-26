@@ -1027,24 +1027,31 @@ impl HostHeap {
         if n >= *no_run {
             return None;
         }
-        // Releases come all the time and each allows a search again: no
-        // more than a few failed walks a frame.
-        static FAILED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-        const WALKS: u64 = 8;
-        let frame = crate::queue::presented();
-        if FAILED[0].swap(frame, Ordering::Relaxed) != frame {
-            FAILED[1].store(0, Ordering::Relaxed);
-        }
-        if FAILED[1].load(Ordering::Relaxed) >= WALKS {
-            return None;
-        }
-        let found = free_dynamic_run(&taken[..spare], *next as usize, n);
-        let Some(first) = found else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
-            *no_run = n;
-            FAILED[1].fetch_add(1, Ordering::Relaxed);
-            return None;
+        // A bounded probe at the cursor remains cheap even after a
+        // different heap has exhausted the full-walk failure budget.
+        // Its result is always the first run in the usual search order.
+        let first = if let Some(first) = free_dynamic_near_cursor(&taken[..spare], *next as usize, n) {
+            first
+        } else {
+            // Releases come all the time and each allows a search again:
+            // no more than a few failed full walks a frame.
+            static FAILED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+            const WALKS: u64 = 8;
+            let frame = crate::queue::presented();
+            if FAILED[0].swap(frame, Ordering::Relaxed) != frame {
+                FAILED[1].store(0, Ordering::Relaxed);
+            }
+            if FAILED[1].load(Ordering::Relaxed) >= WALKS {
+                return None;
+            }
+            let Some(first) = free_dynamic_run(&taken[..spare], *next as usize, n) else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
+                *no_run = n;
+                FAILED[1].fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+            first
         };
         let first_slot = self.count + first as u32;
         let null_slot = self.reserved_null_slot();
@@ -3229,6 +3236,24 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 /// Search candidate starts from the cursor, then before it. A run may
 /// cross the cursor but may never cross the physical end of the heap.
+/// Check at most 256 slots in the non-wrapping prefix of the normal
+/// search. A miss is not evidence that the heap has no suitable run.
+fn free_dynamic_near_cursor(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    const PROBE: usize = 256;
+    if n == 0 || n > PROBE {
+        return None;
+    }
+    let prefix = taken.get(cursor..cursor.saturating_add(PROBE).min(taken.len()))?;
+    let mut run = 0;
+    for (i, &used) in prefix.iter().enumerate() {
+        run = if used { 0 } else { run + 1 };
+        if run == n {
+            return Some(cursor + i + 1 - n);
+        }
+    }
+    None
+}
+
 fn free_dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
     let end = taken.len();
     if n == 0 || n > end || cursor >= end {
@@ -3528,6 +3553,11 @@ void main() {
                             start + n <= len && taken[start..start + n].iter().all(|&v| !v)
                         });
                         assert_eq!(free_dynamic_run(&taken, cursor, n), expected);
+                        // A bounded hit must agree with the full first-fit
+                        // search; a bounded miss can still fit after wrap.
+                        if let Some(first) = free_dynamic_near_cursor(&taken, cursor, n) {
+                            assert_eq!(Some(first), expected);
+                        }
                     }
                 }
             }
@@ -3535,6 +3565,24 @@ void main() {
         assert_eq!(free_dynamic_run(&[], 0, 1), None);
         assert_eq!(free_dynamic_run(&[false], 0, 0), None);
         assert_eq!(free_dynamic_run(&[false], 0, 2), None);
+    }
+
+    #[test]
+    fn bounded_dynamic_probe_does_not_wrap_or_walk_the_whole_heap() {
+        let mut taken = vec![true; 1024];
+        taken[300..304].fill(false);
+        assert_eq!(free_dynamic_near_cursor(&taken, 0, 4), None);
+        assert_eq!(free_dynamic_run(&taken, 0, 4), Some(300));
+        assert_eq!(free_dynamic_near_cursor(&taken, 100, 4), Some(300));
+        taken[0..4].fill(false);
+        assert_eq!(free_dynamic_near_cursor(&taken, 1020, 4), None);
+        assert_eq!(free_dynamic_run(&taken, 1020, 4), Some(0));
+        taken[512..800].fill(false);
+        assert_eq!(free_dynamic_near_cursor(&taken, 512, 256), Some(512));
+        assert_eq!(free_dynamic_near_cursor(&taken, 512, 257), None);
+        assert_eq!(free_dynamic_run(&taken, 512, 257), Some(512));
+        assert_eq!(free_dynamic_near_cursor(&taken, 0, 0), None);
+        assert_eq!(free_dynamic_near_cursor(&taken, 1024, 1), None);
     }
 
     #[test]
