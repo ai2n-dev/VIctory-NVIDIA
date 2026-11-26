@@ -323,17 +323,23 @@ fn bury(finished: u64) {
         return;
     }
     let now = crate::queue::presented();
+    let policy = KeepPolicy::current();
     let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         // In the order they came: the old ones are at the front.
-        let policy = KeepPolicy::current();
         let mut n = expired(&retired, finished, now, policy.time);
-        // Pressure is asked only when it would free the next object.
         if !policy.strict
             && retired.get(n).is_some_and(|r| waits_for_time_only(r, finished, now, policy.time))
-            && video_memory_pressure()
         {
-            n = expired(&retired, finished, now, std::time::Duration::ZERO);
+            // Resource releases can enqueue while DXGI queries the driver.
+            drop(retired);
+            let time = if video_memory_pressure() {
+                std::time::Duration::ZERO
+            } else {
+                policy.time
+            };
+            retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+            n = expired(&retired, finished, now, time);
         }
         retired.drain(..n).collect()
     };
