@@ -764,18 +764,21 @@ impl HostHeap {
             }
         };
         let made = Self::with(host, heap, kind, count, extra);
-        if capped && count == CAPPED_NULL_SLOT {
-            // Title slots were left out: the indices past the kept ones read
-            // the first dynamic slot, which must stay null.
-            made.reserve_first_dynamic_slot();
+        if capped {
+            // All shaders on this adapter use the same clamp, even when a
+            // smaller title heap places that slot inside its dynamic region.
+            made.reserve_dynamic_slot(CAPPED_NULL_SLOT);
         }
         Some(made)
     }
 
-    /// Keeps the first dynamic slot out of every table, so it stays null.
-    fn reserve_first_dynamic_slot(&self) {
+    /// Keeps the absolute slot out of every table, so it stays null.
+    fn reserve_dynamic_slot(&self, slot: u32) {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(taken) = guard.1.first_mut() {
+        if let Some(taken) = slot
+            .checked_sub(self.count)
+            .and_then(|at| guard.1.get_mut(at as usize))
+        {
             *taken = true;
         }
     }
@@ -3211,10 +3214,16 @@ mod tests {
         let all = heap.dynamic(DYNAMIC_CAPPED - 1).expect("the rest of the dynamic slots");
         assert_eq!(all, CAPPED_NULL_SLOT + 1);
 
-        // A heap that keeps all its title slots leaves nothing out.
+        // A small heap keeps all its title slots, but the global clamp
+        // still names a null slot somewhere inside its dynamic region.
         let small = HostHeap::new(false, 1000).expect("a small capped view heap");
         assert_eq!(small.count(), 1000);
         assert_eq!(small.dynamic(1), Some(1000));
+        assert_eq!(
+            small.dynamic(CAPPED_NULL_SLOT - 1001),
+            Some(1001)
+        );
+        assert_eq!(small.dynamic(1), Some(CAPPED_NULL_SLOT + 1));
     }
 
     const HEAP_IID: Iid = guid(
