@@ -242,13 +242,23 @@ fn trim_idle_snapshots() {
     if !crate::residency::snapshot_pressure() {
         return;
     }
-    // In-use snapshots are owned by their submissions, outside either pool.
-    let dense = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
-    let tiles = std::mem::take(&mut *TILE_POOL.lock().unwrap_or_else(|e| e.into_inner()));
-    let bytes: usize = dense.iter().chain(&tiles).map(Vec::capacity).sum();
+    let bytes = reclaim_idle_snapshots();
     if bytes != 0 {
         tracing::info!(bytes, "trimmed idle CPU snapshots under memory pressure");
     }
+}
+
+/// Detaches idle CPU snapshot caches without blocking if a pool lock is held.
+pub(crate) fn reclaim_idle_snapshots() -> usize {
+    let dense = match POOL.try_lock() {
+        Ok(mut guard) => std::mem::take(&mut *guard),
+        Err(_) => Vec::new(),
+    };
+    let tiles = match TILE_POOL.try_lock() {
+        Ok(mut guard) => std::mem::take(&mut *guard),
+        Err(_) => Vec::new(),
+    };
+    dense.iter().chain(&tiles).map(Vec::capacity).sum()
 }
 /// Empty tile buffers, acquired together under one pool lock.
 fn pooled_tiles(count: usize) -> Vec<Vec<u8>> {

@@ -123,10 +123,16 @@ fn budget() -> u64 {
 
 /// Releases the least recently used staging buffers no list holds until
 /// those kept fit [`budget`] with `more` bytes on top.
-fn evict(map: &mut HashMap<usize, Arc<Staging>>, more: u64) {
-    let budget = staging_budget(budget(), crate::residency::texture_pressure());
+/// Releases the least recently used staging buffers no list holds until
+/// those kept fit [`budget`] with `more` bytes on top. Returns freed bytes.
+fn evict(map: &mut HashMap<usize, Arc<Staging>>, more: u64) -> u64 {
+    let budget = staging_budget(
+        budget(),
+        crate::residency::texture_pressure(),
+        crate::residency::critical_commit(),
+    );
     if STAGED.load(Ordering::Relaxed).saturating_add(more) <= budget {
-        return;
+        return 0;
     }
     // Some more than needed: looking at all of them takes a while.
     let budget = budget / 4 * 3;
@@ -157,20 +163,39 @@ fn evict(map: &mut HashMap<usize, Arc<Staging>>, more: u64) {
             "texture staging buffers released"
         );
     }
+    freed
 }
 
-fn staging_budget(configured: u64, pressure: bool) -> u64 {
-    if pressure { configured.min(64 << 20) } else { configured }
+fn staging_budget(configured: u64, pressure: bool, critical: bool) -> u64 {
+    if critical {
+        configured.min(16 << 20)
+    } else if pressure {
+        configured.min(64 << 20)
+    } else {
+        configured
+    }
 }
 
 /// Trim only cache-exclusive staging. Recorded lists and pending uploads
 /// retain their own Arc, and the pool still applies its existing fence and
 /// retirement rules. The budget is soft: required uploads always proceed.
 pub(crate) fn trim_idle_staging() {
-    if crate::residency::texture_pressure()
+    if (crate::residency::texture_pressure() || crate::residency::critical_commit())
         && let Some(map) = STAGING.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
     {
         evict(map, 0);
+    }
+}
+
+/// Non-blocking trim for OOM recovery when `STAGING` may already be locked
+/// by `staging()` on the current thread.
+pub(crate) fn reclaim_idle_staging() -> u64 {
+    let Ok(mut guard) = STAGING.try_lock() else {
+        return 0;
+    };
+    match guard.as_mut() {
+        Some(map) => evict(map, 0),
+        None => 0,
     }
 }
 
@@ -777,11 +802,14 @@ mod tests {
 
     #[test]
     fn texture_staging_pressure_respects_configured_budget() {
-        assert_eq!(staging_budget(384 << 20, false), 384 << 20);
-        assert_eq!(staging_budget(384 << 20, true), 64 << 20);
-        assert_eq!(staging_budget(32 << 20, true), 32 << 20);
-        assert_eq!(staging_budget(0, true), 0);
-        assert_eq!(staging_budget(u64::MAX, true), 64 << 20);
+        assert_eq!(staging_budget(384 << 20, false, false), 384 << 20);
+        assert_eq!(staging_budget(384 << 20, true, false), 64 << 20);
+        assert_eq!(staging_budget(384 << 20, true, true), 16 << 20);
+        assert_eq!(staging_budget(384 << 20, false, true), 16 << 20);
+        assert_eq!(staging_budget(32 << 20, true, false), 32 << 20);
+        assert_eq!(staging_budget(0, true, true), 0);
+        assert_eq!(staging_budget(u64::MAX, true, false), 64 << 20);
+        assert_eq!(staging_budget(u64::MAX, false, true), 16 << 20);
     }
     use std::sync::atomic::{AtomicU32, Ordering};
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};

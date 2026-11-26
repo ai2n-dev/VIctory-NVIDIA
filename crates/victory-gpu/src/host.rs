@@ -4698,6 +4698,17 @@ impl Host {
         } else {
             try_make(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)
         };
+        let made = match made {
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => {
+                crate::residency::allocation_error(&e);
+                if crate::residency::reclaim_on_oom() {
+                    try_make(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)
+                } else {
+                    Err(e)
+                }
+            }
+            other => other,
+        };
         match made {
             Ok((buffer, data)) => {
                 let buffer = buffer?;
@@ -4705,6 +4716,7 @@ impl Host {
                 Some((buffer, data.cast()))
             }
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 wait_if_removed(&self.device, &e);
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
