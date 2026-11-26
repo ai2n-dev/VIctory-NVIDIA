@@ -138,12 +138,16 @@ static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// Tile snapshots kept at most (512 MiB).
 const TILE_POOL_MOST: usize = 8192;
 
-/// An empty buffer with room for a tile.
-fn pooled_tile() -> Vec<u8> {
-    let kept = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
-    let mut v = kept.unwrap_or_else(|| Vec::with_capacity(PAGE));
-    v.clear();
-    v
+/// `n` empty buffers with room for a tile, under one lock of the pool.
+fn pooled_tiles(n: usize) -> Vec<Vec<u8>> {
+    let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    (0..n)
+        .map(|_| {
+            let mut v = pool.pop().unwrap_or_else(|| Vec::with_capacity(PAGE));
+            v.clear();
+            v
+        })
+        .collect()
 }
 
 /// Returns tile snapshots to their pool.
@@ -1156,6 +1160,7 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
             }
         }
     });
+    let window = window.or_else(|| through_another_view(device, address, end));
     let Some(window) = window else {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1197,8 +1202,95 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
         );
     }
     let window = Arc::new(window);
-    map.insert(window.start, window.clone());
+    // A longer stretch from the same start replaces a shorter one, which
+    // lists may still name.
+    if let Some(before) = map.insert(window.start, window.clone()) {
+        crate::host::retire(before);
+    }
     Some(window)
+}
+
+/// Counts windows of title memory used in place that died (the title
+/// mapped other memory there): who holds such windows looks at them again
+/// only when it moved ([`died`]).
+static DIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn died() -> u64 {
+    DIED.load(Ordering::Acquire)
+}
+
+/// Stretches shorter than this are copied: each window is a host heap.
+const STRETCH_LEAST: usize = 4 << 20;
+
+/// A window on title memory the title shows page by page: Grand Theft Auto
+/// VI maps its streaming heaps one 64 KiB view at a time, every view its
+/// own allocation, which the host cannot open as one heap, though the pages
+/// follow one another in their section (1,200 views for 75 MiB, one stretch
+/// of one section: run mem1, 2026-11-25). The stretch is mapped once more,
+/// whole, at an address of ours, and the host heap is opened there: the
+/// same pages, so nothing is copied, and the title's own views stay as they
+/// are. When the title maps other pages there, the window goes as any other
+/// ([`title_memory_remapped`]).
+/// shortcut: the view of ours is never unmapped.
+fn through_another_view(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device13,
+    address: u64,
+    end: u64,
+) -> Option<Shadow> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Heap;
+    use windows_sys::Win32::System::Memory::{
+        FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+    };
+    if std::env::var_os("VICTORY_STRETCH").is_some_and(|v| v == "0") {
+        return None;
+    }
+    let (start, stop, section, offset) =
+        crate::watch::stretch(address as usize, end as usize, WINDOW_REACH as usize)?;
+    let len = stop - start;
+    if len < STRETCH_LEAST {
+        return None;
+    }
+    // SAFETY: a section the runtime told us of, alive while it has views;
+    // the stretch is inside it.
+    let view = unsafe {
+        MapViewOfFile(section as _, FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, len)
+    };
+    if view.Value.is_null() {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            start = format_args!("{start:#x}"),
+            len,
+            "a stretch of title memory could not be mapped again"
+        );
+        return None;
+    }
+    // Read-only guards would refuse the GPU's writes.
+    crate::watch::writing(start, len);
+    // SAFETY: committed pages of a view of ours; the heap keeps them.
+    let heap: Result<ID3D12Heap, _> = unsafe { device.OpenExistingHeapFromAddress1(view.Value, len) };
+    let window = match heap {
+        Ok(heap) => placed(&heap, 0, start as u64, len as u64),
+        Err(error) => {
+            tracing::warn!(%error, start = format_args!("{start:#x}"), len, "a stretch of title memory refused by the host GPU");
+            None
+        }
+    };
+    if window.is_none() {
+        // SAFETY: our view, used by nothing.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value }) };
+        return None;
+    }
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 32 || count.is_power_of_two() {
+        tracing::info!(
+            count,
+            start = format_args!("{start:#x}"),
+            len,
+            "title memory in place through a view of ours"
+        );
+    }
+    window
 }
 
 /// Where the unmapped title memory `address` is in ends, if it is.
@@ -1273,10 +1365,12 @@ pub(crate) fn remapped(start: u64, end: u64) {
         gone.insert(s.buffer.as_raw() as usize);
         if let Some(d) = &s.direct {
             d.dead.store(true, Ordering::Release);
+            DIED.fetch_add(1, Ordering::Release);
             for (_, a) in d.aliases.lock().unwrap_or_else(|e| e.into_inner()).iter() {
                 gone.insert(a.buffer.as_raw() as usize);
                 if let Some(d) = &a.direct {
                     d.dead.store(true, Ordering::Release);
+            DIED.fetch_add(1, Ordering::Release);
                 }
             }
         }
@@ -1749,7 +1843,13 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
     crate::host::name(&buffer, || format!("copies of title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::info!(start = format_args!("{start:#x}"), len, alias = of.is_some(), "sparse copies of title memory");
+    tracing::info!(
+        start = format_args!("{start:#x}"),
+        len,
+        alias = of.is_some(),
+        gpu = format_args!("{gpu:#x}"),
+        "sparse copies of title memory"
+    );
     Some(Shadow {
         buffer,
         data: std::ptr::null_mut(),
@@ -1931,74 +2031,138 @@ impl Shadow {
         None
     }
 
-    /// [`Shadow::writing`] of a sparse copy.
-    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
-        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+    /// The CPU's views of each tile's part of `[from, to)`: its title
+    /// address, the view, its length. Tiles already mapped are found under
+    /// one lock (the world declares ~160 GB of ranges a frame: one lock per
+    /// 64 KiB tile was a tenth of the submitting thread's time).
+    fn tiles_of(&self, s: &Sparse, from: usize, to: usize) -> Vec<(usize, usize, usize)> {
         let start = self.start as usize;
-        #[cfg(feature = "diagnostics")]
-        SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
-        self.each_tile(s, address, address + len, |at, data, _| {
-            let tile = ((at - start) / PAGE) as u32;
-            before.entry(tile).or_insert_with(|| {
-                #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[1].fetch_add(PAGE as u64, Ordering::Relaxed);
-                let whole = data as usize & !(PAGE - 1);
-                let mut buf = pooled_tile();
-                // SAFETY: the tile's mapping.
-                buf.extend_from_slice(unsafe { std::slice::from_raw_parts(whole as *const u8, PAGE) });
-                buf
-            });
-        });
+        let mut views = Vec::with_capacity((to - from).div_ceil(PAGE) + 1);
+        let mut missing = Vec::new();
+        {
+            let mut tiles = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            let frame = crate::queue::presented();
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                match tiles.get_mut(&(((at - start) / PAGE) as u32)) {
+                    Some(t) => {
+                        t.used = frame;
+                        views.push((at, t.data + at % PAGE, n));
+                    }
+                    None => missing.push((at, n)),
+                }
+                at += n;
+            }
+        }
+        for (at, n) in missing {
+            if let Some(data) = self.tile(s, at) {
+                views.push((at, data + at % PAGE, n));
+            }
+        }
+        views
     }
 
-    /// [`Shadow::copy_back`] of a sparse copy.
-    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+    /// [`Shadow::writing`] of a sparse copy. A range inside one already
+    /// declared for this submission has its tiles' snapshots taken; new
+    /// snapshots are copied on several threads (hundreds of MB a frame).
+    fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
+        let end = address + len;
+        let covered = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let covered = pending.iter().any(|&(a, b)| a <= address && end <= b);
+            pending.push((address, end));
+            covered
+        };
+        #[cfg(feature = "diagnostics")]
+        SPARSE_WRITES[0].fetch_add(len as u64, Ordering::Relaxed);
+        if covered {
+            return;
+        }
+        let views = self.tiles_of(s, address, end);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
-        let mut written = 0;
-        let mut title: Option<Vec<u8>> = None;
-        self.each_tile(s, address, address + len, |at, data, n| {
-            let Some(old) = before.get_mut(&(((at - start) / PAGE) as u32)) else {
-                return;
-            };
-            let old = &mut old[at % PAGE..at % PAGE + n];
-            // SAFETY: the tile's mapping; only this thread writes it.
-            let host = unsafe { std::slice::from_raw_parts_mut(data, n) };
-            #[cfg(feature = "diagnostics")]
-            SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
-            if host == old {
-                return;
-            }
-            #[cfg(feature = "diagnostics")]
-            SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
-            let buf = title.get_or_insert_with(|| {
-                let mut v = pooled(PAGE);
-                v.resize(PAGE, 0);
-                v
-            });
-            if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
-                return;
-            }
-            if let Some((dirty_start, dirty_end)) =
-                merge_gpu_writes_mut(&mut buf[..n], host, old)
-            {
-                let dirty_len = dirty_end - dirty_start;
-                crate::watch::writing(at + dirty_start, dirty_len);
-                crate::host::write_mapped(
-                    (at + dirty_start) as *mut u8,
-                    buf[dirty_start..].as_ptr(),
-                    dirty_len,
-                );
-                written += dirty_len;
+        // (tile, the start of its view) of tiles without a snapshot yet.
+        let new: Vec<(u32, usize)> = views
+            .iter()
+            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data & !(PAGE - 1)))
+            .filter(|(tile, _)| !before.contains_key(tile))
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        SPARSE_WRITES[1].fetch_add((new.len() * PAGE) as u64, Ordering::Relaxed);
+        let mut bufs = pooled_tiles(new.len());
+        let copies: Vec<(usize, usize)> =
+            new.iter().zip(&mut bufs).map(|(&(_, view), buf)| (view, buf.as_mut_ptr() as usize)).collect();
+        crate::host::in_parallel(&copies, 16, |chunk| {
+            for &(view, buf) in chunk {
+                // SAFETY: the tile's mapping; a buffer with room for a tile,
+                // each written by one thread.
+                unsafe { std::ptr::copy_nonoverlapping(view as *const u8, buf as *mut u8, PAGE) };
             }
         });
-        if let Some(buf) = title {
-            give_back(buf);
+        for (&(tile, _), mut buf) in new.iter().zip(bufs) {
+            // SAFETY: filled above, within its capacity.
+            unsafe { buf.set_len(PAGE) };
+            before.insert(tile, buf);
         }
+    }
+
+    /// [`Shadow::copy_back`] of a sparse copy, its tiles on several threads.
+    fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
+        let views = self.tiles_of(s, address, address + len);
+        let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+        let start = self.start as usize;
+        // (title address, view, length, the snapshot's bytes): one tile each,
+        // so no two touch the same memory.
+        let work: Vec<(usize, usize, usize, usize)> = views
+            .iter()
+            .filter_map(|&(at, data, n)| {
+                let old = before.get_mut(&(((at - start) / PAGE) as u32))?;
+                Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
+            })
+            .collect();
+        let written = std::sync::atomic::AtomicUsize::new(0);
+        crate::host::in_parallel(&work, 8, |chunk| {
+            let mut title: Option<Vec<u8>> = None;
+            for &(at, data, n, old) in chunk {
+                // SAFETY: the tile's mapping and its snapshot (kept under the
+                // lock held above); this tile is this thread's alone.
+                let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
+                let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                if host == old {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                let buf = title.get_or_insert_with(|| {
+                    let mut v = pooled(PAGE);
+                    v.resize(PAGE, 0);
+                    v
+                });
+                if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
+                    continue;
+                }
+                if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
+                    let dirty_len = dirty_end - dirty_start;
+                    crate::watch::writing(at + dirty_start, dirty_len);
+                    crate::host::write_mapped(
+                        (at + dirty_start) as *mut u8,
+                        buf[dirty_start..].as_ptr(),
+                        dirty_len,
+                    );
+                    written.fetch_add(dirty_len, Ordering::Relaxed);
+                }
+            }
+            if let Some(buf) = title {
+                give_back(buf);
+            }
+        });
+        let written = written.into_inner();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty() {
@@ -2167,13 +2331,18 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let before = buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // A buffer made again at the same place and address: its old copy may
+    // still be named by lists and descriptors, as one the title released.
+    if let Some(shadow) = before.and_then(|e| e.shadow) {
+        crate::host::retire(shadow);
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -2280,6 +2449,16 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// the host does not bound): in memory outside buffers, one with at least
 /// `reach` bytes after `address`. A window ending sooner than the data read
 /// through the view is a GPU page fault.
+/// Where the innermost title buffer holding `address` ends, if one does.
+pub(crate) fn buffer_end(address: u64) -> Option<u64> {
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .map(|(_, e)| e.end)
+        .find(|&e| e > address)
+}
+
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
     // To the end of the innermost buffer holding it: a window ending sooner
     // faults.

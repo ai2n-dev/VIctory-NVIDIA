@@ -209,7 +209,7 @@ mod tests {
                 Some(&mut total),
             );
         }
-        let (upload, ptr) = list.upload(host, total).expect("upload buffer");
+        let (upload, offset, ptr) = list.upload(total).expect("upload buffer");
         let pitch = footprints[0].Footprint.RowPitch as usize;
         let expected_texel = 0x3F80_1234u32;
         for y in 0..256usize {
@@ -224,6 +224,7 @@ mod tests {
                 }
             }
         }
+        footprints[0].Offset += offset;
         crate::list::ensure_state(&list, resource, 0x400); // COPY_DEST
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: borrowed COM pointer kept alive by `copy`.
