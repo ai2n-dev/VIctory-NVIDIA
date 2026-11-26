@@ -403,65 +403,87 @@ fn save_guard<T>(lock: &Mutex<T>, now: bool) -> Option<std::sync::MutexGuard<'_,
     }
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes only the dirty cache components. Early-use records can change
+/// without a new host PSO (including on hosts without pipeline libraries).
 pub(crate) fn save(now: bool) {
-    // Held over serialisation and both writes, so overlapping saves cannot
+    // Held over serialization and writes, so overlapping saves cannot
     // replace files under each other.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     let Some(mut last) = save_guard(&LAST, now) else { return };
     if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
         return;
     }
     *last = Some(std::time::Instant::now());
-    let (blob, saved_additions) = {
-        let l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe {
-            let mut bytes = vec![0u8; l.library.GetSerializedSize()];
-            l.library.Serialize(&mut bytes).map(|()| bytes)
+
+    if let Some(library) = library() {
+        let snapshot = {
+            let l = library.lock().unwrap_or_else(|e| e.into_inner());
+            serialize_if_dirty(l.added, || {
+                // SAFETY: a buffer of the size the library asks for.
+                let bytes = unsafe {
+                    let mut bytes = vec![0u8; l.library.GetSerializedSize()];
+                    l.library.Serialize(&mut bytes).map(|()| bytes)
+                };
+                match bytes {
+                    Ok(bytes) => Some(bytes),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "host pipeline library not serialised");
+                        None
+                    }
+                }
+            })
         };
-        match bytes {
-            Ok(bytes) => (bytes, l.added),
-            Err(e) => {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
+        if let Some((blob, saved_additions)) = snapshot {
+            match std::fs::create_dir_all(dir)
+                .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+            {
+                Ok(()) => {
+                    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+                    // Keep pipelines stored while the file was being written.
+                    l.added = l.added.saturating_sub(saved_additions);
+                    tracing::info!(
+                        bytes = blob.len(),
+                        made = MADE.load(Ordering::Relaxed),
+                        loaded = LOADED.load(Ordering::Relaxed),
+                        started_early = EARLY.load(Ordering::Relaxed),
+                        "host pipeline library saved"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
             }
-        }
-    };
-    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
-        Ok(()) => {
-            let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-            // Keep pipelines stored while the files were being written.
-            l.added = l.added.saturating_sub(saved_additions);
-            tracing::info!(
-                bytes = blob.len(),
-                early = used.len(),
-                made = MADE.load(Ordering::Relaxed),
-                loaded = LOADED.load(Ordering::Relaxed),
-                started_early = EARLY.load(Ordering::Relaxed),
-                "host pipeline library saved"
-            );
-        }
-        Err(e) => {
-            // At least one cache file was not published. Keep the counters
-            // dirty for the next save.
-            if used_changed {
-                USED_CHANGED.store(true, Ordering::Relaxed);
-            }
-            tracing::warn!(error = %e, "host pipeline library not saved");
         }
     }
+
+    // Snapshot under USED: a note arriving after the snapshot will leave
+    // the dirty flag set for a later save. Failed writes also restore it.
+    let snapshot = {
+        let used = USED.lock().unwrap_or_else(|e| e.into_inner());
+        USED_CHANGED.swap(false, Ordering::Relaxed).then(|| {
+            let mut keys: Vec<&str> = used.iter().flatten().map(String::as_str).collect();
+            keys.sort_unstable();
+            (keys.join("\n"), keys.len())
+        })
+    };
+    if let Some((bytes, count)) = snapshot {
+        match std::fs::create_dir_all(dir)
+            .and_then(|()| write_atomically(&dir.join(EARLY_FILE), bytes.as_bytes()))
+        {
+            Ok(()) => tracing::info!(early = count, "early pipeline list saved"),
+            Err(e) => {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+                tracing::warn!(error = %e, "early pipeline list not saved");
+            }
+        }
+    }
+}
+
+fn serialize_if_dirty<T>(added: u64, serialize: impl FnOnce() -> Option<T>) -> Option<(T, u64)> {
+    if added == 0 {
+        return None;
+    }
+    serialize().map(|value| (value, added))
 }
 
 /// Writes `bytes` to a unique temporary file beside `path`, then renames it
@@ -531,7 +553,8 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    if set.len() < EARLY_MAX && !set.contains(key) {
+        set.insert(key.to_owned());
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -539,6 +562,13 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_library_never_calls_serializer() {
+        assert_eq!(serialize_if_dirty::<Vec<u8>>(0, || panic!("clean library")), None);
+        assert_eq!(serialize_if_dirty(3, || Some(vec![1u8, 2])), Some((vec![1, 2], 3)));
+        assert_eq!(serialize_if_dirty::<Vec<u8>>(3, || None), None);
+    }
 
     #[test]
     fn a_periodic_save_does_not_wait_for_another_save() {
