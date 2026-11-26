@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod gpu_gate;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,6 +27,11 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Inter-process GPU test gatekeeper, preflight check, and quarantine journal.
+    GpuGate {
+        #[command(subcommand)]
+        command: gpu_gate::GateCmd,
+    },
 }
 
 fn main() -> Result<()> {
@@ -45,6 +51,7 @@ fn main() -> Result<()> {
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
         }
+        Cmd::GpuGate { command } => gpu_gate::run(&root, command),
     }
 }
 
