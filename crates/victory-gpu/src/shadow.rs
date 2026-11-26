@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -237,6 +237,47 @@ static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// Tile snapshots kept at most (512 MiB).
 const TILE_POOL_MOST: usize = 8192;
 
+static SNAPSHOT_PRESSURE: AtomicBool = AtomicBool::new(false);
+
+fn snapshot_pressure(was_pressured: bool, free_ram: u64, free_commit: u64) -> bool {
+    const GIB: u64 = 1 << 30;
+    if was_pressured {
+        free_ram < 5 * GIB || free_commit < 6 * GIB
+    } else {
+        free_ram <= 3 * GIB || free_commit <= 4 * GIB
+    }
+}
+
+/// Reclaim only idle CPU snapshots under host memory pressure. Checked at
+/// the sparse sweep cadence and enabled by VICTORY_TRIM_SNAPSHOTS=1.
+fn trim_idle_snapshots() {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_TRIM_SNAPSHOTS").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: status is a writable record sized by dwLength.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        return;
+    }
+    let previous = SNAPSHOT_PRESSURE.load(Ordering::Relaxed);
+    let pressured = snapshot_pressure(previous, status.ullAvailPhys, status.ullAvailPageFile);
+    SNAPSHOT_PRESSURE.store(pressured, Ordering::Relaxed);
+    if pressured && !previous {
+        // Detach both caches before freeing buffers. In-use snapshots are
+        // owned by their submissions, outside either pool.
+        let dense = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
+        let tiles = std::mem::take(&mut *TILE_POOL.lock().unwrap_or_else(|e| e.into_inner()));
+        let bytes: usize = dense.iter().chain(&tiles).map(Vec::capacity).sum();
+        tracing::info!(bytes, "trimmed idle CPU snapshots under memory pressure");
+    }
+}
+
 /// Empty tile buffers, acquired together under one pool lock.
 fn pooled_tiles(count: usize) -> Vec<Vec<u8>> {
     let mut buffers = Vec::with_capacity(count);
@@ -294,6 +335,11 @@ fn parallel_snapshots() -> bool {
 /// Returns tile snapshots to their pool.
 fn give_back_tiles(all: impl Iterator<Item = Vec<u8>>) {
     let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if SNAPSHOT_PRESSURE.load(Ordering::Relaxed) {
+        drop(pool);
+        all.for_each(drop);
+        return;
+    }
     for v in all {
         if pool.len() < TILE_POOL_MOST && v.capacity() >= PAGE {
             pool.push(v);
@@ -329,6 +375,9 @@ const POOL_BYTES: usize = 512 << 20;
 /// and no more than [`POOL_BYTES`] in all).
 fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if SNAPSHOT_PRESSURE.load(Ordering::Relaxed) {
+        return;
+    }
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     pool.truncate(8);
@@ -1773,13 +1822,17 @@ fn sweeps() -> u8 {
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
     const EVERY: u64 = 32;
-    let mode = sweeps();
-    if !frame.is_multiple_of(EVERY) || mode == 0 {
+    if !frame.is_multiple_of(EVERY) {
         return;
     }
     // Once a frame, whoever asks.
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if LAST.swap(frame, Ordering::Relaxed) == frame {
+        return;
+    }
+    trim_idle_snapshots();
+    let mode = sweeps();
+    if mode == 0 {
         return;
     }
     let gone_only = mode >= 2;
@@ -2736,6 +2789,17 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_pressure_requires_both_resources_to_recover() {
+        const GIB: u64 = 1 << 30;
+        assert!(snapshot_pressure(false, 3 * GIB, 16 * GIB));
+        assert!(snapshot_pressure(false, 16 * GIB, 4 * GIB));
+        assert!(!snapshot_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(snapshot_pressure(true, 4 * GIB, 6 * GIB));
+        assert!(snapshot_pressure(true, 5 * GIB, 5 * GIB));
+        assert!(!snapshot_pressure(true, 5 * GIB, 6 * GIB));
+    }
+
     #[test]
     fn copy_back_dirty_runs_preserve_late_cpu_writes_between_gpu_changes() {
         let before = [0; 19];
