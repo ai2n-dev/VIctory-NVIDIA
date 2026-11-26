@@ -123,7 +123,10 @@ fn card_ceiling(budget: u64) -> u64 {
 
 /// With `VICTORY_RESERVE_CARD_VRAM=1`, optional GPU upload heaps leave room
 /// for card buffers. Ordinary upload heaps preserve the same data in RAM.
-pub(crate) fn gpu_upload_ceiling(budget: u64, non_local_budget: u64) -> u64 {
+pub(crate) fn gpu_upload_fits(used: u64, budget: u64, non_local_budget: u64, size: u64) -> bool {
+    if budget == 0 {
+        return true;
+    }
     static RESERVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let reserve = non_local_budget != 0
         && enabled()
@@ -135,7 +138,15 @@ pub(crate) fn gpu_upload_ceiling(budget: u64, non_local_budget: u64) -> u64 {
     } else {
         (0, 0)
     };
-    gpu_upload_limit(budget, card_limit, active_card_bytes)
+    committed_upload_fits(used, gpu_upload_limit(budget, card_limit, active_card_bytes), size)
+}
+
+/// A committed D3D12 buffer consumes whole 64 KiB allocation units.
+fn committed_upload_fits(used: u64, limit: u64, size: u64) -> bool {
+    size.max(1)
+        .checked_next_multiple_of(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64)
+        .and_then(|bytes| used.checked_add(bytes))
+        .is_some_and(|total| total < limit)
 }
 
 fn gpu_upload_limit(budget: u64, card_limit: u64, active_card_bytes: u64) -> u64 {
@@ -1151,6 +1162,16 @@ mod tests {
         assert_eq!(gpu_upload_limit(budget, target, 0), 7 * GIB / 2);
         assert_eq!(gpu_upload_limit(0, target, 0), 0);
         assert!(gpu_upload_limit(u64::MAX, u64::MAX, 0) < u64::MAX);
+    }
+
+    #[test]
+    fn committed_upload_budget_counts_the_whole_allocation() {
+        let unit = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+        assert!(!committed_upload_fits(unit, 2 * unit, 1));
+        assert!(committed_upload_fits(unit, 2 * unit + 1, 0));
+        assert!(!committed_upload_fits(unit, 3 * unit, unit + 1));
+        assert!(!committed_upload_fits(0, u64::MAX, u64::MAX));
+        assert!(!committed_upload_fits(u64::MAX - 1, u64::MAX, 1));
     }
 
     #[test]

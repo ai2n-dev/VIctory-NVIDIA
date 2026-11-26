@@ -4443,9 +4443,8 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 }
 
 impl Host {
-    /// A buffer in GPU-upload (Resizable BAR VRAM, when supported and within
-    /// 85% of the live VRAM budget) or standard upload heap, mapped for CPU
-    /// writing.
+    /// A mapped upload buffer. The DXGI budget and optional card reserve
+    /// determine whether to prefer the GPU-upload heap.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
@@ -4462,8 +4461,7 @@ impl Host {
         };
         let use_gpu_upload = self.gpu_upload
             && video_memory().is_none_or(|[(used, budget), (_, non_local_budget)]| {
-                budget == 0
-                    || used.saturating_add(size) < crate::card::gpu_upload_ceiling(budget, non_local_budget)
+                crate::card::gpu_upload_fits(used, budget, non_local_budget, size)
             });
         let try_make = |heap_type: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
             let heap = D3D12_HEAP_PROPERTIES {
