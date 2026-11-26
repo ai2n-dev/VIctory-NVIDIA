@@ -64,6 +64,9 @@ pub(crate) struct Shader {
     /// It animates or draws hair strands ([`hair_strands`]).
     #[cfg(all(windows, feature = "diagnostics"))]
     hair: bool,
+    /// It serves rays that do not run ([`idle_without_rays`]).
+    #[cfg(windows)]
+    idle_without_rays: bool,
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
@@ -76,6 +79,19 @@ pub(crate) struct Shader {
     pub(crate) ends_reflections: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// Whether a container's program only makes sense with the title's rays,
+/// which do not run (`VICTORY_RAYS` has them run, and it with them): the
+/// program that tells the screen probes which rays to trace.
+/// shortcut: left out. The AMD driver never ended its pipeline until the
+/// clean-up passes shortened it; once it ran, with no rays behind it, the
+/// whole picture lost light, shadows and reflections (run opt31b against
+/// sans39, 2026-11-25).
+#[cfg(windows)]
+fn idle_without_rays(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    !victory_shader::emit::rays() && container.windows(NAME.len()).any(|w| w == NAME)
 }
 
 /// Whether a container's program is one of those that animate and draw hair
@@ -193,6 +209,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(all(windows, feature = "diagnostics"))]
                 hair: hair_strands(bytes),
                 #[cfg(windows)]
+                idle_without_rays: idle_without_rays(bytes),
+                #[cfg(windows)]
                 resolves_light: bytes
                     .windows(crate::ambient::PROGRAM.len())
                     .any(|w| w == crate::ambient::PROGRAM),
@@ -277,6 +295,18 @@ fn dump(shader: &Shader) {
     } else if let Err(error) = std::fs::write(&path, &shader.container) {
         tracing::warn!(%error, "shader not saved");
     }
+}
+
+/// As [`dump`], for the shaders of a pipeline the host refused: they
+/// translate, so only this tells which containers to look at.
+#[cfg(windows)]
+fn dump_all(shaders: &[Arc<Shader>]) {
+    #[cfg(feature = "diagnostics")]
+    for shader in shaders {
+        dump(shader);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shaders;
 }
 
 #[cfg(windows)]
@@ -367,6 +397,7 @@ impl Shader {
             container: source.container.clone(),
             #[cfg(feature = "diagnostics")]
             hair: source.hair,
+            idle_without_rays: source.idle_without_rays,
             resolves_light: source.resolves_light,
             draws_sky: source.draws_sky,
             ends_reflections: source.ends_reflections,
@@ -560,13 +591,26 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     });
     p.shaders
         .iter()
-        .find(|shader| shader.hair || !hashes.is_empty() && hashes.contains(&shader.hash))
+        .find(|shader| {
+            shader.hair
+                || shader.idle_without_rays
+                || !hashes.is_empty() && hashes.contains(&shader.hash)
+        })
         .map(|shader| shader.hash.as_str())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
+}
+
+#[cfg(all(windows, not(feature = "diagnostics")))]
+pub(crate) fn is_skipped(this: This) -> bool {
+    !this.is_null()
+        && pipeline(this)
+            .shaders
+            .iter()
+            .any(|shader| shader.idle_without_rays)
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped

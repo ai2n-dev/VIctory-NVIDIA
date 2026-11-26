@@ -468,9 +468,21 @@ impl Shader {
         self.update_stage_uav_flag();
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
-        let compute = self.threads.is_some() && self.mesh.is_none() && !self.rectangles;
-        if !self.root_uavs.is_empty() && !self.pixel && !compute {
-            self.flags |= flags::UAVS_EVERY_STAGE;
+        // The clean-up, before anything is declared about the code: a
+        // feature whose last use it removed must not be declared (the
+        // validator compares the flags with what the code uses).
+        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        if passes != 0 {
+            self.m.optimise(passes);
+            let used = self.m.usage();
+            for (flag, used) in [
+                (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+                (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+            ] {
+                if !used {
+                    self.flags &= !flag;
+                }
+            }
         }
         // The flags of what lowering made, as the module writes it: what only
         // unread values or never-taken edges used is not written.
