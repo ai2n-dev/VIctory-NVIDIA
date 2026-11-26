@@ -676,11 +676,11 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
-            if let Err(err) = crate::preflight::validate_dxil_container(&t.dxil) {
+            if let Err(err) = crate::preflight::validate_dxil_semantic(&t.dxil) {
                 tracing::warn!(
                     %err,
                     ?shaders,
-                    "refused malformed DXIL container before D3D12 PSO creation"
+                    "refused invalid DXIL container/semantics before D3D12 PSO creation"
                 );
                 return None;
             }
@@ -735,6 +735,7 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            crate::preflight::record_last_op("pso_create:compute");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -917,6 +918,7 @@ impl HostPipeline {
             &[&code_bytes(&code(0)), &code_bytes(&code(1))],
             &state,
         );
+        crate::preflight::record_last_op("pso_create:graphics");
         let made = if let Some(depth) = depth_with_bounds {
             let vertex = VertexStream {
                 vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc.VS),

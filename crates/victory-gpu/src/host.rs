@@ -589,7 +589,9 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if (cfg!(feature = "diagnostics") || cfg!(test))
+            && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+        {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -607,6 +609,11 @@ fn create() -> windows::core::Result<Host> {
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
         let host = Host::from_device(device, messages)?;
+        if std::env::var_os("VICTORY_LAST_OP_FILE").is_some_and(|v| !v.is_empty()) {
+            let report = probe_device(&host.device);
+            crate::preflight::record_last_op(format_args!("device_init:{}", report.name));
+            eprintln!("[gpu-gate adapter] {}", report.name);
+        }
         tracing::info!("host D3D12 device ready");
         Ok(host)
     }
@@ -723,10 +730,12 @@ impl Host {
     fn signal_and_wait_locked(&self, submitted: &mut u64, warn_msg: &str) {
         *submitted += 1;
         let fence_val = *submitted;
+        crate::preflight::record_last_op(format_args!("fence_signal:{fence_val}"));
         // SAFETY: caller holds `self.submitted`; fence & event are ours.
         match unsafe { self.queue.Signal(&self.fence, fence_val) } {
             Ok(()) => {
                 crate::cardmeter::signalled(&self.fence, fence_val);
+                crate::preflight::record_last_op(format_args!("fence_wait:{fence_val}"));
                 wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val);
             }
             Err(e) => tracing::warn!(error = %e, "{warn_msg}"),
@@ -738,6 +747,7 @@ impl Host {
     pub(crate) fn execute_and_wait_locked(&self, cmd: ID3D12CommandList, submitted: &mut u64) {
         let lists = [Some(cmd)];
         crate::cardmeter::executing(&lists, &self.fence);
+        crate::preflight::record_last_op("execute_and_wait:1");
         // SAFETY: caller holds `self.submitted` and `cmd` is closed.
         unsafe { self.queue.ExecuteCommandLists(&lists) };
         self.signal_and_wait_locked(submitted, "card GPU wait failed");
@@ -2362,6 +2372,10 @@ impl Host {
             *submitted += 1;
             let started = std::time::Instant::now();
             crate::cardmeter::executing(group, &self.fence);
+            crate::preflight::record_last_op(format_args!(
+                "execute_lists:group_len={}:sub={this_submission}",
+                group.len()
+            ));
             // SAFETY: closed lists.
             unsafe { self.queue.ExecuteCommandLists(group) };
             if !each && i + 1 < groups.len() {

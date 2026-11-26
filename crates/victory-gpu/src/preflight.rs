@@ -7,6 +7,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Maximum thread groups per dispatch dimension guaranteed by D3D12 (`CS 5.0+`).
 pub const MAX_DISPATCH_GROUPS_PER_DIM: u32 = 65_535;
@@ -145,6 +149,78 @@ pub fn validate_dxil_container(bytes: &[u8]) -> Result<(), PreflightError> {
         ));
     }
     Ok(())
+}
+
+/// Validates a DXBC/DXIL container structurally and, whenever `dxil.dll`
+/// (`IDxcValidator`) is available and `VICTORY_VALIDATE_DXIL != "0"`, runs
+/// full semantic DXIL verification before passing the shader to the driver.
+pub fn validate_dxil_semantic(bytes: &[u8]) -> Result<(), PreflightError> {
+    validate_dxil_container(bytes)?;
+    if std::env::var_os("VICTORY_VALIDATE_DXIL").is_some_and(|v| v == "0") {
+        return Ok(());
+    }
+    static VALIDATOR: OnceLock<
+        Result<Mutex<victory_shader::emit::validator::Validator>, String>,
+    > = OnceLock::new();
+    let loaded = VALIDATOR.get_or_init(|| {
+        let path = victory_shader::emit::validator::Validator::default_path();
+        victory_shader::emit::validator::Validator::load(path.as_deref()).map(Mutex::new)
+    });
+    match loaded {
+        Ok(lock) => {
+            let mut validator = lock.lock().unwrap_or_else(|e| e.into_inner());
+            validator
+                .validate_readonly(bytes)
+                .map_err(|err| PreflightError::new("dxil_semantic", err))
+        }
+        Err(load_err) => {
+            if std::env::var_os("VICTORY_REQUIRE_DXIL_VALIDATOR").is_some_and(|v| v == "1") {
+                return Err(PreflightError::new(
+                    "dxil_semantic",
+                    format!("IDxcValidator unavailable: {load_err}"),
+                ));
+            }
+            static WARNED: OnceLock<()> = OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!(error = %load_err, "dxil.dll unavailable; semantic DXIL validation skipped");
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Persists the exact pre-GPU operation into `VICTORY_LAST_OP_FILE` (when set
+/// by `cargo xtask gpu-gate`) so post-reboot crash/hang triage sees the real
+/// GPU call that executed last.
+pub fn record_last_op(op: impl fmt::Display) {
+    static TARGET: OnceLock<Option<Mutex<PathBuf>>> = OnceLock::new();
+    let target = TARGET.get_or_init(|| {
+        std::env::var_os("VICTORY_LAST_OP_FILE")
+            .filter(|v| !v.is_empty())
+            .map(|v| Mutex::new(PathBuf::from(v)))
+    });
+    let Some(lock) = target else {
+        return;
+    };
+    let text = op.to_string();
+    if let Ok(path) = lock.lock() {
+        record_last_op_path(Some(&path), &text);
+    }
+}
+
+pub(crate) fn record_last_op_path(path: Option<&Path>, op: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        let _ = file.write_all(op.as_bytes());
+        let _ = file.sync_data();
+    }
 }
 
 fn validate_dxil_program_header(part: &[u8]) -> Result<(), PreflightError> {
@@ -813,5 +889,32 @@ mod tests {
         assert_eq!(effective_fence_timeout_ms(None, false), None);
         assert_eq!(effective_fence_timeout_ms(Some("0"), true), None);
         assert_eq!(effective_fence_timeout_ms(Some("5000"), false), Some(5000));
+    }
+
+    #[test]
+    fn dxil_semantic_validator_rejects_structurally_valid_corrupt_bitcode() {
+        let dxil_part = build_dxil_chunk(b"BC\xc0\xde\x01\x02\x03\x04\x05\x06\x07\x08");
+        let container = build_dxbc_container(&[(b"DXIL", &dxil_part)]);
+        assert!(validate_dxil_container(&container).is_ok());
+
+        let path = victory_shader::emit::validator::Validator::default_path();
+        if victory_shader::emit::validator::Validator::load(path.as_deref()).is_ok() {
+            let err = validate_dxil_semantic(&container)
+                .expect_err("IDxcValidator must reject truncated/corrupt DXIL bitcode");
+            assert_eq!(err.stage, "dxil_semantic");
+        }
+    }
+
+    #[test]
+    fn last_op_recorder_persists_latest_gpu_operation_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last_op.txt");
+        record_last_op_path(Some(&path), "device_init:NVIDIA");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "device_init:NVIDIA");
+        record_last_op_path(Some(&path), "execute_lists:count=2:sub=7");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "execute_lists:count=2:sub=7"
+        );
     }
 }
