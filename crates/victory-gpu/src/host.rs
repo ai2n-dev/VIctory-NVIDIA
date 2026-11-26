@@ -211,7 +211,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
 
 /// [`retire`] for an object that holds `bytes` of video memory, so that what
 /// is kept waiting for the GPU shows in the memory report and in the
-/// pressure that shortens the wait ([`keep_time`]).
+/// pressure that shortens the wait ([`KeepPolicy`]).
 pub(crate) fn retire_bytes<T: 'static>(object: T, bytes: u64) {
     let submission = STARTED.load(Ordering::Acquire);
     let frame = crate::queue::presented();
@@ -226,25 +226,49 @@ pub(crate) fn retire_bytes<T: 'static>(object: T, bytes: u64) {
     });
 }
 
-/// The time a retired object is kept for at least: [`KEEP_TIME`], or
-/// `VICTORY_KEEP_SECS` seconds, and none while the host GPU's video memory is
-/// nearly full ([`PRESSURE_PERCENT`] of its budget), when waiting costs more than
-/// it protects: the submissions that named an object must still have
-/// finished and [`KEEP_FRAMES`] frames been presented.
-fn keep_time(under_pressure: impl FnOnce() -> bool) -> std::time::Duration {
-    static CONFIGURED: OnceLock<std::time::Duration> = OnceLock::new();
-    let configured = *CONFIGURED.get_or_init(|| {
-        std::env::var("VICTORY_KEEP_SECS")
-            .ok()
+/// The longest wait `VICTORY_KEEP_SECS` can ask for (larger values, and values
+/// [`Duration`] cannot hold, are cut to it).
+const LONGEST_KEEP: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// How long retired objects wait, and whether video memory pressure may
+/// shorten it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeepPolicy {
+    /// At least this long after they were retired ([`KEEP_TIME`] by default,
+    /// `VICTORY_KEEP_SECS=<seconds>`).
+    time: std::time::Duration,
+    /// `VICTORY_KEEP_STRICT=1`: the time is kept whatever the video memory
+    /// does, for comparing runs.
+    strict: bool,
+}
+
+impl KeepPolicy {
+    fn parse(secs: Option<&str>, strict: Option<&str>) -> Self {
+        let time = secs
             .and_then(|secs| secs.trim().parse::<f64>().ok())
             .filter(|secs| secs.is_finite() && *secs >= 0.0)
-            .map_or(KEEP_TIME, std::time::Duration::from_secs_f64)
-    });
-    if configured.is_zero() || !under_pressure() {
-        configured
-    } else {
-        std::time::Duration::ZERO
+            .map_or(KEEP_TIME, |secs| {
+                std::time::Duration::try_from_secs_f64(secs).unwrap_or(LONGEST_KEEP).min(LONGEST_KEEP)
+            });
+        KeepPolicy { time, strict: strict.is_some_and(|v| !v.is_empty() && v != "0") }
     }
+
+    fn current() -> Self {
+        static POLICY: OnceLock<KeepPolicy> = OnceLock::new();
+        *POLICY.get_or_init(|| {
+            KeepPolicy::parse(
+                std::env::var("VICTORY_KEEP_SECS").ok().as_deref(),
+                std::env::var("VICTORY_KEEP_STRICT").ok().as_deref(),
+            )
+        })
+    }
+}
+
+/// Whether only the time still keeps `r`: its submissions finished and the
+/// frames passed. Only then can video memory pressure free it, and only
+/// then is the driver asked about the pressure.
+fn waits_for_time_only(r: &Retired, finished: u64, frame: u64, keep_time: std::time::Duration) -> bool {
+    r.submission <= finished && frame.saturating_sub(r.frame) >= KEEP_FRAMES && r.at.elapsed() < keep_time
 }
 
 /// Percent of the video memory budget from which retired objects stop
@@ -300,10 +324,14 @@ fn bury(finished: u64) {
     let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         // In the order they came: the old ones are at the front.
-        let mut n = expired(&retired, finished, now, keep_time(|| false));
-        // The pressure is asked only when it would free more.
-        if n < retired.len() && retired.iter().nth(n).is_some_and(|r| r.submission <= finished) {
-            n = expired(&retired, finished, now, keep_time(video_memory_pressure));
+        let policy = KeepPolicy::current();
+        let mut n = expired(&retired, finished, now, policy.time);
+        // Pressure is asked only when it would free the next object.
+        if !policy.strict
+            && retired.get(n).is_some_and(|r| waits_for_time_only(r, finished, now, policy.time))
+            && video_memory_pressure()
+        {
+            n = expired(&retired, finished, now, std::time::Duration::ZERO);
         }
         retired.drain(..n).collect()
     };
@@ -1169,12 +1197,37 @@ mod tests {
         assert_eq!(expired(&queue, 9, all_frames, Duration::ZERO), 3);
     }
 
-    /// Pressure asks the driver only when the configured time is not zero,
-    /// and takes the whole time off.
+    /// The wait and the strict mode come from the environment's texts; a
+    /// value too large for a duration is cut instead of panicking.
     #[test]
-    fn pressure_takes_the_waiting_time_off() {
-        assert_eq!(keep_time(|| false), KEEP_TIME);
-        assert_eq!(keep_time(|| true), std::time::Duration::ZERO);
+    fn keep_policy_reads_its_settings() {
+        use std::time::Duration;
+        let default = KeepPolicy::parse(None, None);
+        assert_eq!(default, KeepPolicy { time: KEEP_TIME, strict: false });
+        assert_eq!(KeepPolicy::parse(Some(" 2.5 "), Some("1")), KeepPolicy { time: Duration::from_millis(2500), strict: true });
+        assert_eq!(KeepPolicy::parse(Some("0"), Some("0")).time, Duration::ZERO);
+        assert!(!KeepPolicy::parse(None, Some("0")).strict);
+        for huge in ["1e300", "1e19", "99999999999", "inf"] {
+            let time = KeepPolicy::parse(Some(huge), None).time;
+            assert!(time == LONGEST_KEEP || time == KEEP_TIME, "{huge}: {time:?}");
+        }
+        for bad in ["", "abc", "-3", "NaN"] {
+            assert_eq!(KeepPolicy::parse(Some(bad), None).time, KEEP_TIME, "{bad}");
+        }
+    }
+
+    /// Pressure is asked about only for an object that nothing but the time
+    /// keeps: not before its submissions finished or its frames passed.
+    #[test]
+    fn pressure_is_asked_for_objects_kept_by_time_only() {
+        use std::time::Duration;
+        let young = retired_at(3, 10, Duration::ZERO);
+        let old = retired_at(3, 10, Duration::from_secs(60));
+        let frames = 10 + KEEP_FRAMES;
+        assert!(waits_for_time_only(&young, 3, frames, KEEP_TIME));
+        assert!(!waits_for_time_only(&young, 2, frames, KEEP_TIME), "its submission has not finished");
+        assert!(!waits_for_time_only(&young, 3, frames - 1, KEEP_TIME), "its frames have not passed");
+        assert!(!waits_for_time_only(&old, 3, frames, KEEP_TIME), "the time has passed");
     }
 
     /// A name picks an adapter by a part of its description, ignoring case.
