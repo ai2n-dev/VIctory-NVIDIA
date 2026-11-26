@@ -734,6 +734,24 @@ impl HostHeap {
                 SAMPLER_DYNAMIC,
             ));
         }
+        // Use the same capability decision as shader translation, including
+        // on a driver that accepts intermediate heap sizes but not VIEW_SLOTS.
+        if !sampler {
+            let _ = host.target();
+            if victory_shader::emit::heap_clamp() == CAPPED_NULL_SLOT {
+                let (kept, spare) = capped_layout(count);
+                let heap = match create(PORTABLE_VIEWS) {
+                    Ok(heap) => heap,
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, "no capped host view heap");
+                        return None;
+                    }
+                };
+                let made = Self::with(host, heap, kind, kept, spare);
+                made.reserve_dynamic_slot(CAPPED_NULL_SLOT);
+                return Some(made);
+            }
+        }
         let extra = if sampler { 0 } else { DYNAMIC };
         let wanted = count;
         let mut capped = false;
