@@ -538,12 +538,75 @@ pub fn emit(
     )
 }
 
+/// Select the existing Wave32 backends explicitly for differential
+/// translation. Auto retains the legacy policy; all other modes are
+/// experimental and refuse unsupported paths instead of approximating them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Wave64Policy {
+    Auto = 0,
+    Strict = 1,
+    Independent = 2,
+    Paired = 3,
+}
+
+impl Wave64Policy {
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("strict") => Self::Strict,
+            Some("independent") => Self::Independent,
+            Some("paired") => Self::Paired,
+            _ => Self::Auto,
+        }
+    }
+
+    fn for_shader(self, native: &NativeProgram, target: Target) -> Self {
+        if native.wave64 && native.stage == HwStage::Cs && !target.runs(64) && target.runs(32) {
+            self
+        } else {
+            Self::Auto
+        }
+    }
+
+    fn allows_exchange(self, threads: u32) -> bool {
+        self == Self::Auto || (self != Self::Independent && threads <= 64)
+    }
+
+    fn allows_independent(self) -> bool {
+        self != Self::Paired
+    }
+
+    fn allows_legacy_fallback(self) -> bool {
+        self == Self::Auto
+    }
+}
+
+fn wave64_policy() -> Wave64Policy {
+    static POLICY: std::sync::OnceLock<Wave64Policy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| Wave64Policy::parse(std::env::var("VICTORY_WAVE64_MODE").ok().as_deref()))
+}
+
+/// Cache namespace for the selected Wave64 translation policy.
+pub fn wave64_policy_key() -> u8 {
+    wave64_policy() as u8
+}
+
 fn emit_pruned(
     input: &EmitInput<'_>,
     target: Target,
     keep: Option<&lower::KeptOutputs>,
 ) -> Result<HostShader, ShaderError> {
-    let original = emit_program_pruned(input, target, keep);
+    emit_pruned_with_policy(input, target, keep, wave64_policy())
+}
+
+fn emit_pruned_with_policy(
+    input: &EmitInput<'_>,
+    target: Target,
+    keep: Option<&lower::KeptOutputs>,
+    policy: Wave64Policy,
+) -> Result<HostShader, ShaderError> {
+    let policy = policy.for_shader(input.native, target);
+    let original = emit_program_pruned(input, target, keep, policy);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -570,6 +633,7 @@ fn emit_pruned(
         },
         target,
         keep,
+        policy,
     )
 }
 
@@ -577,6 +641,7 @@ fn emit_program_pruned(
     input: &EmitInput<'_>,
     target: Target,
     keep: Option<&lower::KeptOutputs>,
+    policy: Wave64Policy,
 ) -> Result<HostShader, ShaderError> {
     let EmitInput {
         c,
@@ -680,8 +745,24 @@ fn emit_program_pruned(
         console_cf: false,
         per_lane_only: false,
     };
+    let threads = match native.io {
+        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+        _ => 0,
+    };
+    // The experimental policies do not enable a new synchronization
+    // scheme. In particular, reject cross-wave permutes and multi-wave
+    // LDS before attempting the existing lowerer, rather than guessing.
+    if policy != Wave64Policy::Auto
+        && (p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name().contains("permute"))
+            || matches!(native.io, crate::native::StageIo::Cs(cs) if threads > 64 && cs.lds_bytes() > 0))
+    {
+        return Err(ShaderError::Unsupported { offset: 0, what: "Wave64 policy: cross-wave permute or multi-wave LDS is unverified" });
+    }
     let l = match lower::lower_pruned(&parts, keep) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+            if !policy.allows_exchange(threads) {
+                return Err(ShaderError::Unsupported { offset: 0, what: "Wave64 policy: paired exchange is unavailable for this group" });
+            }
             let console = structure::structure_console(p);
             let lowered = match &console {
                 Ok(console) => {
@@ -701,13 +782,17 @@ fn emit_program_pruned(
                 Ok(l) => l,
                 // What the console flow cannot lower keeps the per-lane form
                 // where that translates; else the console flow's reason.
-                Err(e) => {
+                Err(e) if policy.allows_legacy_fallback() => {
                     parts.st = st;
                     parts.console_cf = false;
                     parts.per_lane_only = true;
                     lower::lower_pruned(&parts, keep).map_err(|_| e)?
                 }
+                Err(e) => return Err(e),
             }
+        }
+        Ok(_) if !policy.allows_independent() => {
+            return Err(ShaderError::Unsupported { offset: 0, what: "Wave64 policy: shader does not require paired exchange" });
         }
         l => l?,
     };
@@ -1433,6 +1518,45 @@ mod tests {
             host.compute_pipeline(&two)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+    }
+
+    #[test]
+    fn wave64_policies_keep_legacy_and_explicit_routes_separate() {
+        use super::Wave64Policy as P;
+        assert_eq!(P::parse(None), P::Auto);
+        assert_eq!(P::parse(Some("strict")), P::Strict);
+        assert_eq!(P::parse(Some("independent")), P::Independent);
+        assert_eq!(P::parse(Some("paired")), P::Paired);
+        assert!(P::Auto.allows_exchange(128));
+        assert!(P::Auto.allows_legacy_fallback());
+        assert!(P::Strict.allows_exchange(64));
+        assert!(!P::Strict.allows_exchange(128));
+        assert!(P::Independent.allows_independent());
+        assert!(!P::Independent.allows_exchange(64));
+        assert!(P::Paired.allows_exchange(64));
+        assert!(!P::Paired.allows_independent());
+        for mode in [P::Strict, P::Independent, P::Paired] {
+            assert!(!mode.allows_legacy_fallback());
+            let native = compute(&[0xBF81_0000], true);
+            assert_eq!(mode.for_shader(&native, NVIDIA), mode);
+            assert_eq!(mode.for_shader(&native, RDNA), P::Auto);
+            assert_eq!(mode.for_shader(&compute(&[0xBF81_0000], false), NVIDIA), P::Auto);
+        }
+    }
+
+    #[test]
+    fn independent_wave64_translation_does_not_require_paired_exchange() {
+        use super::{EmitInput, Wave64Policy, emit_pruned_with_policy};
+        let native = compute(&[0x7E02_0300, 0xBF81_0000], true);
+        let c = crate::Container { digest: [0; 16], version: (1, 0), parts: vec![] };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let input = EmitInput { c: &c, native: &native, p: &p, st: &st, io: &io, res: &res };
+        assert!(emit_pruned_with_policy(&input, NVIDIA, None, Wave64Policy::Independent).is_ok());
+        assert!(emit_pruned_with_policy(&input, NVIDIA, None, Wave64Policy::Strict).is_ok());
+        assert!(emit_pruned_with_policy(&input, NVIDIA, None, Wave64Policy::Paired).is_err());
     }
 
     #[test]

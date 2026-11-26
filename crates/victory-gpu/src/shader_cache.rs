@@ -106,6 +106,11 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    let wave64 = victory_shader::emit::wave64_policy_key();
+    if wave64 != 0 {
+        h.update(b"wave64 policy");
+        h.update(&[wave64]);
+    }
     // Where heap indices are cut is part of the translation.
     h.update(&victory_shader::emit::heap_clamp().to_le_bytes());
     // The clean-up passes are part of the translation; none leaves the key
