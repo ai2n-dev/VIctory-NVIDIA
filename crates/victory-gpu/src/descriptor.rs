@@ -261,7 +261,7 @@ impl RtvRecord {
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
         const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        Self::words_as(self.resolved_words(TEXTURE_2D)?)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -270,15 +270,27 @@ impl RtvRecord {
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
         const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        Self::words_as(self.resolved_words(TEXTURE_2D)?)
     }
 
-    /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
-    /// the title's format, which the host needs spelled out.
+    /// Resolved 24-byte RTV view words in host format, if any.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
-        assert!(size_of::<T>() <= size_of::<[u32; 6]>());
+    pub(crate) fn rtv_words(&self) -> Option<[u32; 6]> {
+        const TEXTURE_2D: u32 = 4;
+        self.resolved_words(TEXTURE_2D)
+    }
+
+    /// Resolved 24-byte DSV view words in host format, if any.
+    #[cfg(windows)]
+    pub(crate) fn dsv_words(&self) -> Option<[u32; 6]> {
+        const TEXTURE_2D: u32 = 3;
+        self.resolved_words(TEXTURE_2D)
+    }
+
+    /// The description words in host format (`dimension` for typeless
+    /// resources without an explicit view description).
+    #[cfg(windows)]
+    fn resolved_words(&self, dimension: u32) -> Option<[u32; 6]> {
         let mut words = if self.described != 0 {
             self.desc
         } else {
@@ -294,6 +306,13 @@ impl RtvRecord {
         // Render target and depth views: a packed 16-bit target may be
         // R8G8B8A8_UNORM on this GPU (`resource::target_format`).
         words[0] = crate::resource::target_format(words[0]);
+        Some(words)
+    }
+
+    /// Cast resolved 24-byte host view words to the D3D12 view descriptor type.
+    #[cfg(windows)]
+    pub(crate) fn words_as<T>(words: [u32; 6]) -> Option<T> {
+        assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }

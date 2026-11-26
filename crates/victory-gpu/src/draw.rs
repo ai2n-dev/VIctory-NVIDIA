@@ -51,6 +51,36 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundTargetKey {
+    title_resource: usize,
+    host_resource: usize,
+    view_words: Option<[u32; 6]>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct BoundTargets {
+    rtvs: Vec<BoundTargetKey>,
+    dsv: Option<BoundTargetKey>,
+}
+
+impl BoundTargets {
+    fn clear(&mut self) {
+        self.rtvs.clear();
+        self.dsv = None;
+    }
+
+    fn matches(&self, cached: Option<&Self>) -> bool {
+        cached == Some(self)
+    }
+}
+
+/// Whether `OMSetRenderTargets` bind caching is enabled (default on unless `VICTORY_BIND_CACHE=0`).
+fn bind_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"))
+}
+
 /// Fixed-function state and the views bound for output.
 #[derive(Default)]
 struct Fixed {
@@ -59,6 +89,10 @@ struct Fixed {
     blend: Option<Option<[f32; 4]>>,
     stencil: Option<u32>,
     views: Option<(Vec<crate::descriptor::RtvRecord>, Option<crate::descriptor::RtvRecord>)>,
+    /// Last render/depth target keys actually bound on the active host list.
+    host_views: Option<BoundTargets>,
+    /// Reusable candidate target-key buffer for `bind_targets`.
+    candidate_views: BoundTargets,
     /// CPU descriptor handles used only while recording OMSetRenderTargets.
     rtv_scratch: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
 }
@@ -511,6 +545,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.fixed.host_views = None;
         // Making one refreshes what it names, which is each list's own work.
         self.fresh_tables.clear();
         self.fresh_records.clear();
@@ -587,9 +622,7 @@ impl State {
             return;
         };
         self.targets.clear();
-        let rtvs = &mut self.fixed.rtv_scratch;
-        rtvs.clear();
-        rtvs.reserve(targets.len());
+        self.fixed.candidate_views.clear();
         for record in &targets {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
@@ -597,15 +630,61 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            self.fixed.candidate_views.rtvs.push(BoundTargetKey {
+                title_resource: record.resource as usize,
+                host_resource: texture.as_raw() as usize,
+                view_words: record.rtv_words(),
+            });
         }
         self.depth = 0;
-        let dsv = depth.and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+        if let Some(record) = depth
+            && let Some(texture) = crate::resource::host_resource(record.resource)
+        {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            self.fixed.candidate_views.dsv = Some(BoundTargetKey {
+                title_resource: record.resource as usize,
+                host_resource: texture.as_raw() as usize,
+                view_words: record.dsv_words(),
+            });
+        }
+        if bind_cache_enabled()
+            && self
+                .fixed
+                .candidate_views
+                .matches(self.fixed.host_views.as_ref())
+        {
+            self.fixed.views = Some((targets, depth));
+            return;
+        }
+        let rtvs = &mut self.fixed.rtv_scratch;
+        rtvs.clear();
+        rtvs.reserve(self.fixed.candidate_views.rtvs.len());
+        for (&key, record) in self
+            .fixed
+            .candidate_views
+            .rtvs
+            .iter()
+            .zip(targets.iter().filter(|r| crate::resource::host_resource(r.resource).is_some()))
+        {
+            let Some(texture) = crate::resource::host_resource(record.resource) else {
+                continue;
+            };
+            let desc = key
+                .view_words
+                .and_then(crate::descriptor::RtvRecord::words_as);
+            rtvs.push(host.rtv(texture, desc.as_ref()));
+        }
+        let dsv = depth.and_then(|record| {
+            let texture = crate::resource::host_resource(record.resource)?;
+            let desc = self
+                .fixed
+                .candidate_views
+                .dsv
+                .and_then(|key| key.view_words)
+                .and_then(crate::descriptor::RtvRecord::words_as);
+            Some(host.dsv(texture, desc.as_ref()))
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -616,6 +695,10 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        let cached = self.fixed.host_views.get_or_insert_with(BoundTargets::default);
+        cached.rtvs.clear();
+        cached.rtvs.extend_from_slice(&self.fixed.candidate_views.rtvs);
+        cached.dsv = self.fixed.candidate_views.dsv;
         self.fixed.views = Some((targets, depth));
     }
 
@@ -2336,5 +2419,38 @@ mod group_limit_tests {
         assert!(!super::dispatch_fits(65_536, 1, 1));
         assert!(!super::dispatch_fits(1, u32::MAX, 1));
         assert!(!super::dispatch_fits(1, 1, 65_536));
+    }
+
+    #[test]
+    fn bound_targets_cache_matches_only_when_resources_and_views_match() {
+        let rt0 = super::BoundTargetKey {
+            title_resource: 0x1000,
+            host_resource: 0x2000,
+            view_words: Some([28, 4, 0, 0, 0, 0]),
+        };
+        let dsv0 = super::BoundTargetKey {
+            title_resource: 0x3000,
+            host_resource: 0x4000,
+            view_words: Some([40, 3, 0, 0, 0, 0]),
+        };
+        let first = super::BoundTargets {
+            rtvs: vec![rt0],
+            dsv: Some(dsv0),
+        };
+        let identical = first.clone();
+        assert!(identical.matches(Some(&first)));
+        assert!(!identical.matches(None));
+
+        let mut diff_host = first.clone();
+        diff_host.rtvs[0].host_resource = 0x2001;
+        assert!(!diff_host.matches(Some(&first)));
+
+        let mut diff_desc = first.clone();
+        diff_desc.rtvs[0].view_words = Some([28, 4, 1, 0, 0, 0]);
+        assert!(!diff_desc.matches(Some(&first)));
+
+        let mut diff_dsv = first.clone();
+        diff_dsv.dsv = None;
+        assert!(!diff_dsv.matches(Some(&first)));
     }
 }
