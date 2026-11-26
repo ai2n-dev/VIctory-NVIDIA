@@ -159,8 +159,8 @@ fn gpu_upload_limit(budget: u64, card_limit: u64, active_card_bytes: u64) -> u64
     }
 }
 
-/// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
-static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
+/// A host's card buffers with pending CPU-to-VRAM uploads.
+pub(crate) type DirtyQueue = Mutex<Vec<Weak<CardState>>>;
 
 /// Whether VRAM card buffers are enabled (`VICTORY_CARD_BUFFERS=0` disables).
 pub(crate) fn enabled() -> bool {
@@ -212,7 +212,8 @@ pub(crate) struct CardState {
     /// that must be copied to `vram` (and re-hashed if `hashes_ready`) before
     /// the next GPU submission.
     dirty_up: Mutex<Vec<(usize, usize)>>,
-    /// Deduplication flag for [`DIRTY_CARDS`].
+    dirty_queue: Arc<DirtyQueue>,
+    /// Deduplication flag for `dirty_queue`.
     queued: AtomicBool,
 }
 
@@ -288,6 +289,7 @@ impl CardState {
             hashes: Mutex::new(None),
             hashes_ready: AtomicBool::new(false),
             dirty_up: Mutex::new(Vec::new()),
+            dirty_queue: host.card_dirty.clone(),
             queued: AtomicBool::new(false),
         }))
     }
@@ -302,7 +304,7 @@ impl CardState {
             dirty.push((from, to));
         }
         if !self.queued.swap(true, Ordering::AcqRel) {
-            DIRTY_CARDS
+            self.dirty_queue
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(Arc::downgrade(self));
@@ -342,19 +344,19 @@ impl CardState {
 /// Groups consecutive runs by entry without allocating a vector per shadow.
 /// Entries arrive in plan order; the returned spans index the flat pieces.
 type ReadbackGroup = (usize, std::ops::Range<usize>);
-type ReadbackPiece = (u32, u32, usize);
+type ReadbackPiece<'a> = (u32, &'a [u8]);
 type DirtyCard = (Arc<CardState>, Vec<(usize, usize)>);
 type RehashUpload = (Arc<CardState>, ID3D12Resource, Vec<(u32, u32)>);
 
-fn group_readback_runs(
-    runs: impl IntoIterator<Item = (usize, u32, u32, usize)>,
-) -> (Vec<ReadbackGroup>, Vec<ReadbackPiece>) {
+fn group_readback_runs<'a>(
+    runs: impl IntoIterator<Item = (usize, u32, &'a [u8])>,
+) -> (Vec<ReadbackGroup>, Vec<ReadbackPiece<'a>>) {
     let mut groups: Vec<ReadbackGroup> = Vec::new();
     let runs = runs.into_iter();
     let mut pieces = Vec::with_capacity(runs.size_hint().0);
-    for (entry, first, count, ptr) in runs {
+    for (entry, first, bytes) in runs {
         let at = pieces.len();
-        pieces.push((first, count, ptr));
+        pieces.push((first, bytes));
         if let Some((_, span)) = groups.last_mut().filter(|(i, _)| *i == entry) {
             span.end = at + 1;
         } else {
@@ -438,6 +440,56 @@ fn byte_ranges_to_piece_runs(ranges: &[(usize, usize)], max_pieces: u32) -> Vec<
 pub(crate) struct CardPlan {
     entries: Vec<CardWriteEntry>,
     total_pieces: u32,
+    uploads: Vec<DirtyCard>,
+    prefetched: Option<(ID3D12Resource, usize)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DirtyRun {
+    entry_idx: usize,
+    first: u32,
+    count: u32,
+    offset: usize,
+}
+
+/// Select dirty pages and coalesce adjacent copies. The optimistic readback
+/// uses the same packed offsets as the flags, including holes for clean pages.
+fn dirty_readback_runs(
+    entries: impl IntoIterator<Item = (u32, impl IntoIterator<Item = (u32, u32)>)>,
+    flags: &[u32],
+    prefetched: bool,
+) -> (Vec<DirtyRun>, usize) {
+    let mut dirty: Vec<DirtyRun> = Vec::new();
+    let mut bytes = 0;
+    for (entry_idx, (out_start, runs)) in entries.into_iter().enumerate() {
+        let mut index = out_start as usize;
+        for (first, count) in runs {
+            for piece in first..first + count {
+                let offset = if prefetched { index * PAGE } else { bytes };
+                let changed = flags[index] != 0;
+                index += 1;
+                if !changed {
+                    continue;
+                }
+                bytes += PAGE;
+                if let Some(last) = dirty.last_mut()
+                    && last.entry_idx == entry_idx
+                    && last.first + last.count == piece
+                    && last.offset + last.count as usize * PAGE == offset
+                {
+                    last.count += 1;
+                } else {
+                    dirty.push(DirtyRun { entry_idx, first: piece, count: 1, offset });
+                }
+            }
+        }
+    }
+    (dirty, bytes)
+}
+
+fn prefetch_bytes(pieces: u32, limit: u64) -> Option<u64> {
+    let bytes = u64::from(pieces) * PAGE as u64;
+    (bytes != 0 && bytes <= limit).then_some(bytes)
 }
 
 struct CardWriteEntry {
@@ -478,6 +530,7 @@ pub(crate) struct CardEngine {
     differs_gpu: ID3D12Resource,
     differs_rb: (ID3D12Resource, usize, u64),
     direct_flags: bool,
+    prefetch_limit: u64,
     dummy_uav: ID3D12Resource,
     fetch_rb: Option<(ID3D12Resource, usize, u64)>,
     dirty_queue: Vec<Weak<CardState>>,
@@ -497,10 +550,12 @@ impl Drop for CardEngine {
 impl CardEngine {
     pub(crate) fn new(host: &Host) -> windows::core::Result<Self> {
         let direct = std::env::var_os("VICTORY_CARD_DIRECT_FLAGS").is_some_and(|v| v == "1");
-        Self::new_with_direct_flags(host, direct)
+        let prefetch = !cfg!(test)
+            && std::env::var_os("VICTORY_CARD_PREFETCH_READBACK").is_some_and(|v| v == "1");
+        Self::new_with_options(host, direct, prefetch)
     }
 
-    fn new_with_direct_flags(host: &Host, direct: bool) -> windows::core::Result<Self> {
+    fn new_with_options(host: &Host, direct: bool, prefetch: bool) -> windows::core::Result<Self> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: valid HLSL source and entry point.
         unsafe {
@@ -583,6 +638,7 @@ impl CardEngine {
             differs_gpu,
             differs_rb: (rb_res, rb_ptr, init_diff_bytes),
             direct_flags,
+            prefetch_limit: if prefetch { 1 << 20 } else { 0 },
             dummy_uav,
             fetch_rb: None,
             dirty_queue: Vec::new(),
@@ -617,10 +673,11 @@ impl CardEngine {
         else {
             return false;
         };
-        let old_gpu = std::mem::replace(&mut self.differs_gpu, gpu);
-        let old_rb = std::mem::replace(&mut self.differs_rb, (rb, ptr, size));
+        // Only this engine records these resources. The previous submission
+        // has finished using them before this command list is recorded.
+        self.differs_gpu = gpu;
+        self.differs_rb = (rb, ptr, size);
         self.direct_flags = direct_flags;
-        crate::host::retire((old_gpu, old_rb.0));
         true
     }
 
@@ -630,12 +687,15 @@ impl CardEngine {
         {
             return Some((res.clone(), ptr));
         }
-        let size = needed_bytes.next_multiple_of(8 << 20);
+        let size = needed_bytes.next_multiple_of(if needed_bytes <= 1 << 20 {
+            1 << 20
+        } else {
+            8 << 20
+        });
         let (rb, ptr) = host.readback_buffer(size)?;
         crate::host::name(&rb, || format!("card fetch readback {size:#x}"));
-        if let Some((old, _, _)) = self.fetch_rb.replace((rb.clone(), ptr as usize, size)) {
-            crate::host::retire(old);
-        }
+        // The previous fetch and merge finished under the submission lock.
+        self.fetch_rb = Some((rb.clone(), ptr as usize, size));
         Some((rb, ptr as usize))
     }
 
@@ -674,7 +734,7 @@ impl CardEngine {
         // 1. Drain all card shadows with pending CPU -> VRAM uploads.
         let mut dirty_cards: Vec<DirtyCard> = Vec::new();
         {
-            let mut q = DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = host.card_dirty.lock().unwrap_or_else(|e| e.into_inner());
             // Swap reusable queue storage, then release the global lock
             // before inspecting cards or sorting their dirty ranges.
             std::mem::swap(&mut *q, &mut self.dirty_queue);
@@ -705,20 +765,21 @@ impl CardEngine {
             let Some(card) = shadow.card_state() else {
                 continue;
             };
-            if let Some((hashes, full_init)) = card.ensure_hashes(host) {
-                if full_init && full_hash_cards.insert(Arc::as_ptr(&card)) {
-                    need_full_hash.push((card.clone(), hashes.clone()));
-                }
-                entry_indices.insert(key, entries.len());
-                entries.push(CardWriteEntry {
-                    shadow: shadow.clone(),
-                    card: card.clone(),
-                    hashes,
-                    declared: vec![(*address, *len)],
-                    runs: Vec::new(),
-                    out_start: 0,
-                });
+            let Some((hashes, full_init)) = card.ensure_hashes(host) else {
+                crate::host::fail(format_args!("cannot allocate CARD_COMPARE hashes"));
+            };
+            if full_init && full_hash_cards.insert(Arc::as_ptr(&card)) {
+                need_full_hash.push((card.clone(), hashes.clone()));
             }
+            entry_indices.insert(key, entries.len());
+            entries.push(CardWriteEntry {
+                shadow: shadow.clone(),
+                card,
+                hashes,
+                declared: vec![(*address, *len)],
+                runs: Vec::new(),
+                out_start: 0,
+            });
         }
 
         for entry in &mut entries {
@@ -731,7 +792,10 @@ impl CardEngine {
             }
             entry.runs = byte_ranges_to_piece_runs(&byte_ranges, entry.card.total_pieces());
             entry.out_start = total_pieces;
-            total_pieces += entry.runs.iter().map(|&(_, c)| c).sum::<u32>();
+            total_pieces = total_pieces
+                .checked_add(entry.runs.iter().map(|&(_, c)| c).sum::<u32>())
+                .filter(|&pieces| pieces <= u32::MAX / 4)
+                .unwrap_or_else(|| crate::host::fail(format_args!("CARD_COMPARE flag offset overflow")));
         }
 
         // Also check which dirty-uploaded shadows already have hashes (so we
@@ -762,9 +826,11 @@ impl CardEngine {
         let plan = CardPlan {
             entries,
             total_pieces,
+            uploads: dirty_cards,
+            prefetched: None,
         };
 
-        if dirty_cards.is_empty() && need_full_hash.is_empty() {
+        if plan.uploads.is_empty() && need_full_hash.is_empty() {
             return (None, plan);
         }
 
@@ -773,14 +839,14 @@ impl CardEngine {
             if self.before_alloc.Reset().is_err()
                 || self.before_list.Reset(&self.before_alloc, None).is_err()
             {
-                return (None, plan);
+                crate::host::fail(format_args!("cannot reset CARD_COMPARE upload list"));
             }
             &self.before_list
         };
         let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
 
         // Step A: Copy dirty staging ranges -> VRAM.
-        for (card, ranges) in &dirty_cards {
+        for (card, ranges) in &plan.uploads {
             for &(from, to) in ranges {
                 // SAFETY: both buffers cover `[from, to)`; implicit COMMON promotion.
                 unsafe {
@@ -799,7 +865,7 @@ impl CardEngine {
         // (or COMMON if no hashing follows).
         let mut to_srv = Vec::new();
         let mut to_common = Vec::new();
-        for (card, _) in &dirty_cards {
+        for (card, _) in &plan.uploads {
             let key = Arc::as_ptr(card);
             let will_hash = full_hash_cards.contains(&key) || partial_hash_cards.contains(&key);
             let after = if will_hash {
@@ -844,7 +910,6 @@ impl CardEngine {
                         [0, 0, card.size as u32, card.total_pieces(), 0, 0],
                     );
                 }
-                card.hashes_ready.store(true, Ordering::Release);
             }
             for (card, hashes, runs) in &rehash_uploads {
                 for &(first, count) in runs {
@@ -872,27 +937,33 @@ impl CardEngine {
 
         crate::cardmeter::end(list, timed);
         // SAFETY: close command list.
-        if unsafe { list.Close() }.is_err() {
-            return (None, plan);
+        let cmd = unsafe { list.Close() }.and_then(|()| list.cast()).unwrap_or_else(|e| {
+            crate::host::fail(format_args!("cannot close CARD_COMPARE upload list: {e}"))
+        });
+        for (card, _) in need_full_hash {
+            card.hashes_ready.store(true, Ordering::Release);
         }
-        (list.cast().ok(), plan)
+        (Some(cmd), plan)
     }
 
     /// Records the post-submission GPU hash compare (`compare = 2`) and copies
     /// the tiny `differs` array to `differs_rb`, or writes it directly into
-    /// a mapped L0 UAV. Both paths retain the original submission fence.
-    pub(crate) fn record_after(&mut self, host: &Host, plan: &CardPlan) -> Option<ID3D12CommandList> {
+    /// a mapped L0 UAV. For small opt-in plans, also copy the declared pages
+    /// into the readback buffer before that same submission fence.
+    pub(crate) fn record_after(&mut self, host: &Host, plan: &mut CardPlan) -> Option<ID3D12CommandList> {
         if plan.total_pieces == 0 {
             return None;
         }
         let needed_bytes = u64::from(plan.total_pieces) * 4;
         if !self.ensure_differs_capacity(host, needed_bytes) {
-            return None;
+            crate::host::fail(format_args!("cannot allocate CARD_COMPARE flags ({needed_bytes} bytes)"));
         }
+        plan.prefetched = prefetch_bytes(plan.total_pieces, self.prefetch_limit)
+            .and_then(|bytes| self.ensure_fetch_capacity(host, bytes));
         // SAFETY: allocator & list are idle under `Host::submitted`.
-        unsafe {
-            self.after_alloc.Reset().ok()?;
-            self.after_list.Reset(&self.after_alloc, None).ok()?;
+        let cmd: windows::core::Result<ID3D12CommandList> = (|| unsafe {
+            self.after_alloc.Reset()?;
+            self.after_list.Reset(&self.after_alloc, None)?;
             let timed = crate::cardmeter::begin(&self.after_list, crate::cardmeter::Kind::Check);
             // Global UAV barrier ensures all shader writes from `runs` are visible.
             self.after_list.ResourceBarrier(&[uav_barrier()]);
@@ -911,6 +982,38 @@ impl CardEngine {
                         [first, 0, entry.card.size as u32, count, out_idx * 4, 2],
                     );
                     out_idx += count;
+                }
+            }
+
+            if let Some((readback, _)) = &plan.prefetched {
+                // Hash SRV use precedes copies from the same buffers. Leave
+                // each resource in COMMON for the next submission.
+                for entry in &plan.entries {
+                    if entry.runs.is_empty() {
+                        continue;
+                    }
+                    let to_copy = [transition_barrier(
+                        &entry.card.vram,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )];
+                    self.after_list.ResourceBarrier(&to_copy);
+                    drop_barriers(to_copy);
+                    let mut offset = u64::from(entry.out_start) * PAGE as u64;
+                    for &(first, count) in &entry.runs {
+                        let bytes = u64::from(count) * PAGE as u64;
+                        self.after_list.CopyBufferRegion(
+                            readback, offset, &entry.card.vram, u64::from(first) * PAGE as u64, bytes,
+                        );
+                        offset += bytes;
+                    }
+                    let to_common = [transition_barrier(
+                        &entry.card.vram,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )];
+                    self.after_list.ResourceBarrier(&to_common);
+                    drop_barriers(to_common);
                 }
             }
 
@@ -951,14 +1054,17 @@ impl CardEngine {
             }
 
             crate::cardmeter::end(&self.after_list, timed);
-            self.after_list.Close().ok()?;
-            self.after_list.cast().ok()
-        }
+            self.after_list.Close()?;
+            self.after_list.cast()
+        })();
+        Some(cmd.unwrap_or_else(|e| {
+            crate::host::fail(format_args!("cannot record CARD_COMPARE results: {e}"))
+        }))
     }
 
     /// Reads the `differs` results after the submission fence completes, fetches
-    /// ONLY the 64 KiB pages the GPU actually modified, and merges them into
-    /// title memory + `staging`. Returns total bytes written to title memory.
+    /// the 64 KiB pages the GPU actually modified if they were not prefetched,
+    /// and merges only those pages into title memory and `staging`.
     pub(crate) fn finish_back(
         &mut self,
         host: &Host,
@@ -981,119 +1087,78 @@ impl CardEngine {
             &[]
         };
 
-        // Collect coalesced runs of dirty 64 KiB pieces per entry.
-        struct DirtyRun {
-            entry_idx: usize,
-            first_piece: u32,
-            count: u32,
-            rb_offset: u64,
+        let prefetched = plan.prefetched.is_some();
+        let entries = plan.entries.iter().map(|e| (e.out_start, e.runs.iter().copied()));
+        let (dirty_runs, total_bytes) = dirty_readback_runs(entries, differs, prefetched);
+        #[cfg(feature = "diagnostics")]
+        if prefetched {
+            FETCH_STATS[2].fetch_add(u64::from(plan.total_pieces) * PAGE as u64, Ordering::Relaxed);
+            let copies = plan.entries.iter().map(|entry| entry.runs.len() as u64).sum();
+            FETCH_STATS[3].fetch_add(copies, Ordering::Relaxed);
         }
-        let mut dirty_runs: Vec<DirtyRun> = Vec::new();
-        let mut total_bytes = 0u64;
-
-        for (entry_idx, entry) in plan.entries.iter().enumerate() {
-            let mut out_idx = entry.out_start as usize;
-            let mut cur: Option<(u32, u32)> = None;
-            for &(first, count) in &entry.runs {
-                for k in 0..count {
-                    let piece = first + k;
-                    if differs.get(out_idx).copied().unwrap_or(0) != 0 {
-                        match &mut cur {
-                            Some((s, c)) if *s + *c == piece => *c += 1,
-                            Some((s, c)) => {
-                                let bytes = u64::from(*c) * PAGE as u64;
-                                dirty_runs.push(DirtyRun {
-                                    entry_idx,
-                                    first_piece: *s,
-                                    count: *c,
-                                    rb_offset: total_bytes,
-                                });
-                                total_bytes += bytes;
-                                cur = Some((piece, 1));
-                            }
-                            None => cur = Some((piece, 1)),
-                        }
-                    }
-                    out_idx += 1;
-                }
-            }
-            if let Some((s, c)) = cur {
-                let bytes = u64::from(c) * PAGE as u64;
-                dirty_runs.push(DirtyRun {
-                    entry_idx,
-                    first_piece: s,
-                    count: c,
-                    rb_offset: total_bytes,
-                });
-                total_bytes += bytes;
-            }
+        if dirty_runs.is_empty() {
+            plan.clear_pending();
+            return 0;
         }
 
-        let mut written = 0usize;
-        if total_bytes > 0
-            && let Some((fetch_res, fetch_ptr)) = self.ensure_fetch_capacity(host, total_bytes)
-        {
-            // SAFETY: the submitted lock serializes access to the allocator;
-            // previous fetch commands have completed before it is reused.
-            let ok = unsafe {
-                self.fetch_alloc.Reset().is_ok()
-                    && self.fetch_list.Reset(&self.fetch_alloc, None).is_ok()
+        let (readback, ptr, span) = if let Some((resource, ptr)) = &plan.prefetched {
+            (resource.clone(), *ptr, plan.total_pieces as usize * PAGE)
+        } else {
+            let Some((resource, ptr)) = self.ensure_fetch_capacity(host, total_bytes as u64) else {
+                crate::host::fail(format_args!("cannot allocate CARD_COMPARE data readback ({total_bytes} bytes)"));
             };
-            if ok {
+            // SAFETY: both command objects are idle under Host::submitted.
+            // The plan holds every source and the destination is owned here.
+            let cmd: windows::core::Result<ID3D12CommandList> = (|| unsafe {
+                self.fetch_alloc.Reset()?;
+                self.fetch_list.Reset(&self.fetch_alloc, None)?;
                 for run in &dirty_runs {
-                    let entry = &plan.entries[run.entry_idx];
-                    // SAFETY: `vram` is in COMMON (promotes to COPY_SOURCE, decays to COMMON).
-                    unsafe {
-                        self.fetch_list.CopyBufferRegion(
-                            &fetch_res,
-                            run.rb_offset,
-                            &entry.card.vram,
-                            u64::from(run.first_piece) * PAGE as u64,
-                            u64::from(run.count) * PAGE as u64,
-                        );
-                    }
+                    self.fetch_list.CopyBufferRegion(
+                        &resource,
+                        run.offset as u64,
+                        &plan.entries[run.entry_idx].card.vram,
+                        u64::from(run.first) * PAGE as u64,
+                        u64::from(run.count) * PAGE as u64,
+                    );
                 }
-                // SAFETY: the fetch list is open and all recorded resources are live.
-                if unsafe { self.fetch_list.Close() }.is_ok()
-                    && let Ok(cmd) = self.fetch_list.cast::<ID3D12CommandList>()
-                {
-                    #[cfg(feature = "diagnostics")]
-                    let fetch_started = std::time::Instant::now();
-                    host.execute_and_wait_locked(cmd, submitted);
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        FETCH_STATS[0].fetch_add(1, Ordering::Relaxed);
-                        FETCH_STATS[1].fetch_add(
-                            fetch_started.elapsed().as_micros() as u64,
-                            Ordering::Relaxed,
-                        );
-                        FETCH_STATS[2].fetch_add(total_bytes, Ordering::Relaxed);
-                        FETCH_STATS[3].fetch_add(dirty_runs.len() as u64, Ordering::Relaxed);
-                    }
-
-                    // Group dirty runs by entry so distinct shadows merge in parallel.
-                    let (per_entry, pieces) = group_readback_runs(dirty_runs.iter().map(|run| {
-                        (
-                            run.entry_idx,
-                            run.first_piece,
-                            run.count,
-                            fetch_ptr + run.rb_offset as usize,
-                        )
-                    }));
-                    let total_written = AtomicU64::new(0);
-                    crate::host::in_parallel(&per_entry, 4, |chunk| {
-                        for (entry_idx, span) in chunk {
-                            let entry = &plan.entries[*entry_idx];
-                            let n = entry
-                                .shadow
-                                .merge_card_pieces(&entry.card, &pieces[span.clone()]);
-                            total_written.fetch_add(n as u64, Ordering::Relaxed);
-                        }
-                    });
-                    written = total_written.into_inner() as usize;
-                }
+                self.fetch_list.Close()?;
+                self.fetch_list.cast()
+            })();
+            let cmd = cmd.unwrap_or_else(|e| {
+                crate::host::fail(format_args!("cannot record CARD_COMPARE readback: {e}"))
+            });
+            #[cfg(feature = "diagnostics")]
+            let fetch_started = std::time::Instant::now();
+            host.execute_and_wait_locked(cmd, submitted);
+            #[cfg(feature = "diagnostics")]
+            {
+                FETCH_STATS[0].fetch_add(1, Ordering::Relaxed);
+                FETCH_STATS[1].fetch_add(fetch_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                FETCH_STATS[2].fetch_add(total_bytes as u64, Ordering::Relaxed);
+                FETCH_STATS[3].fetch_add(dirty_runs.len() as u64, Ordering::Relaxed);
             }
-        }
+            (resource, ptr, total_bytes)
+        };
+
+        // SAFETY: the completed fence covers the copies into this live mapping.
+        // Both layouts wrote the entire packed span. Submission serialization
+        // prevents any reset or subsequent GPU writes while workers borrow it.
+        let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, span) };
+        let (per_entry, pieces) = group_readback_runs(dirty_runs.iter().map(|run| {
+            let end = run.offset + run.count as usize * PAGE;
+            (run.entry_idx, run.first, &data[run.offset..end])
+        }));
+        let total_written = AtomicU64::new(0);
+        crate::host::in_parallel(&per_entry, 4, |chunk| {
+            for (entry_idx, span) in chunk {
+                let entry = &plan.entries[*entry_idx];
+                let n = entry.shadow.merge_card_pieces(&entry.card, &pieces[span.clone()]);
+                total_written.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        });
+        drop(readback);
+        let written = total_written.into_inner() as usize;
+
 
         // Clear all declared pending ranges on each card shadow.
         for entry in &plan.entries {
@@ -1245,22 +1310,43 @@ mod tests {
 
     #[test]
     fn readback_groups_preserve_order_and_offsets() {
+        let data = [1, 2, 3, 4, 5];
         let input = [
-            (0, 1, 2, 0x1000),
-            (0, 5, 1, 0x3000),
-            (2, 0, 3, 0x4000),
-            (7, 9, 1, 0x7000),
-            (7, 11, 4, 0x8000),
+            (0, 1, &data[0..1]),
+            (0, 5, &data[1..2]),
+            (2, 0, &data[2..3]),
+            (7, 9, &data[3..4]),
+            (7, 11, &data[4..5]),
         ];
         let (groups, pieces) = group_readback_runs(input);
         assert_eq!(groups, vec![(0, 0..2), (2, 2..3), (7, 3..5)]);
         assert_eq!(
             pieces,
-            input.map(|(_, first, count, ptr)| (first, count, ptr))
+            input.map(|(_, first, bytes)| (first, bytes))
         );
         let (groups, pieces) = group_readback_runs(std::iter::empty());
         assert!(groups.is_empty());
         assert!(pieces.is_empty());
+    }
+
+    #[test]
+    fn dirty_readback_layout_preserves_clean_holes_only_when_prefetched() {
+        let entries = [(0, [(1, 3), (5, 2)]), (5, [(2, 2), (7, 1)])];
+        let flags = [0, 1, 1, 1, 0, 0, 1, 1];
+        for prefetched in [false, true] {
+            let (runs, bytes) = dirty_readback_runs(entries, &flags, prefetched);
+            assert_eq!(bytes, 5 * PAGE);
+            assert_eq!(
+                runs.iter().map(|r| (r.entry_idx, r.first, r.count)).collect::<Vec<_>>(),
+                [(0, 2, 2), (0, 5, 1), (1, 3, 1), (1, 7, 1)]
+            );
+            let offsets = runs.iter().map(|r| r.offset / PAGE).collect::<Vec<_>>();
+            assert_eq!(offsets, if prefetched { [1, 3, 6, 7] } else { [0, 2, 3, 4] });
+        }
+        assert_eq!(prefetch_bytes(0, 1 << 20), None);
+        assert_eq!(prefetch_bytes(1, 0), None);
+        assert_eq!(prefetch_bytes(16, 1 << 20), Some(1 << 20));
+        assert_eq!(prefetch_bytes(17, 1 << 20), None);
     }
 
     #[test]
@@ -1295,16 +1381,15 @@ mod tests {
 
     #[test]
     fn warp_card_roundtrip_upload_wave64_hash_and_concurrent_merge() {
-        for direct in [false, true] {
-            card_roundtrip(direct);
-        }
+        card_roundtrip(false, false);
+        card_roundtrip(true, true);
     }
 
-    fn card_roundtrip(direct: bool) {
+    fn card_roundtrip(direct: bool, prefetch: bool) {
         let Some(host) = Host::new_warp() else {
             return;
         };
-        let mut engine = CardEngine::new_with_direct_flags(&host, direct)
+        let mut engine = CardEngine::new_with_options(&host, direct, prefetch)
             .expect("CardEngine should build on WARP");
         assert_eq!(engine.direct_flags, direct);
         assert!(engine.ensure_differs_capacity(&host, (256 << 10) + 4));
@@ -1330,10 +1415,10 @@ mod tests {
         // Phase 1: Initial CPU copy -> upload to VRAM + Wave64 hash, no GPU writes.
         shadow.copy_for_test(base, base + size as usize);
         shadow.writing(base, size as usize);
-        let (before, plan) = engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
+        let (before, mut plan) = engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
         assert!(before.is_some(), "initial upload + hash must emit before list");
         assert_eq!(plan.total_pieces, pages as u32);
-        let after = engine.record_after(&host, &plan).expect("after list");
+        let after = engine.record_after(&host, &mut plan).expect("after list");
         host.execute_and_wait_locked(before.unwrap(), &mut submitted);
         host.execute_and_wait_locked(after, &mut submitted);
 
@@ -1372,10 +1457,11 @@ mod tests {
             let cmd: ID3D12CommandList = list.cast().expect("cast");
             // Execute immediately after record_before while alloc stays alive.
             shadow.writing(base, size as usize);
-            let (before2, plan2) =
+            let (before2, mut plan2) =
                 engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
             assert!(before2.is_none(), "no CPU dirty uploads expected in phase 2");
-            let after2 = engine.record_after(&host, &plan2).expect("after2");
+            let after2 = engine.record_after(&host, &mut plan2).expect("after2");
+            assert_eq!(plan2.prefetched.is_some(), prefetch);
             // Simulate concurrent CPU modification on page 2 while GPU runs.
             title[2 * PAGE + 256..2 * PAGE + 260].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
             host.execute_and_wait_locked(cmd, &mut submitted);
@@ -1385,7 +1471,9 @@ mod tests {
             let differs_2 =
                 std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec();
             assert_eq!(differs_2, vec![0, 0, 1, 0], "only page 2 should differ");
+            let compare_fence = submitted;
             let written_2 = engine.finish_back(&host, plan2, &mut submitted);
+            assert_eq!(submitted, compare_fence + u64::from(!prefetch));
             // The initial pattern already contains 0xBE at the third byte.
             assert_eq!(written_2, 3, "copy-back counts only changed bytes");
             assert_eq!(&title[2 * PAGE + 128..2 * PAGE + 132], &gpu_bytes);
@@ -1394,13 +1482,13 @@ mod tests {
             // Phase 3: Next submission uploads merged concurrent CPU write on page 2
             // back to VRAM and re-hashes page 2 so subsequent compare reports 0 diffs.
             shadow.writing(base, size as usize);
-            let (before3, plan3) =
+            let (before3, mut plan3) =
                 engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
             assert!(
                 before3.is_some(),
                 "concurrent CPU write must queue page 2 for re-upload and re-hash"
             );
-            let after3 = engine.record_after(&host, &plan3).expect("after3");
+            let after3 = engine.record_after(&host, &mut plan3).expect("after3");
             host.execute_and_wait_locked(before3.unwrap(), &mut submitted);
             host.execute_and_wait_locked(after3, &mut submitted);
             let written_3 = engine.finish_back(&host, plan3, &mut submitted);

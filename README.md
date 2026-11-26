@@ -287,6 +287,17 @@ info and above).
 
 ## Debugging
 
+On the NVIDIA development branch, `VICTORY_ASYNC_SUBMIT=1` opts into
+asynchronous title submissions. Add `VICTORY_ASYNC_CARD_COMPARE=1` to
+include submissions that write to card buffers. The host publishes the
+merged CPU results before signalling the title's completion.
+
+`VICTORY_CARD_PREFETCH_READBACK=1` is a separate experiment. For a declared
+card range of up to 1 MiB across the submission, it copies the pages with
+the comparison flags under a single fence. It trades extra copied bytes
+for one fewer GPU wait when any page is dirty. Faults or FPS gains should
+be measured with the two options controlled independently.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell

@@ -55,6 +55,7 @@ struct InFlight {
 struct Finish {
     lists: Vec<std::sync::Arc<HostList>>,
     back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    card: Option<crate::card::CardPlan>,
 }
 // SAFETY: host lists are free-threaded objects, run by one thread once
 // closed; the rest is ours and locked.
@@ -80,6 +81,17 @@ thread_local! {
 #[cfg(test)]
 fn async_submit() -> bool {
     ASYNC_IN_TESTS.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn async_card_compare() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_CARD_COMPARE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+fn async_card_compare() -> bool {
+    async_submit()
 }
 
 /// Microseconds spent bringing buffer copies up to date while the
@@ -142,6 +154,7 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// Device-local VRAM card buffer engine (Wave64 GPU page hashing), lazily initialized.
     card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
+    pub(crate) card_dirty: std::sync::Arc<crate::card::DirtyQueue>,
     /// Tests only: held by a WARP host while it lives, so that one WARP
     /// device works at a time ([`warp_serial`]). Declared last: it is
     /// released after every object of the host.
@@ -663,6 +676,7 @@ impl Host {
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
                 card: OnceLock::new(),
+                card_dirty: Default::default(),
                 #[cfg(test)]
                 warp_serial: None,
             })
@@ -704,7 +718,7 @@ impl Host {
                 crate::preflight::record_last_op(format_args!("fence_wait:{fence_val}"));
                 wait_for_value(&self.fence, Some(HANDLE(self.event.as_raw_handle())), fence_val);
             }
-            Err(e) => tracing::warn!(error = %e, "{warn_msg}"),
+            Err(e) => fail(format_args!("{warn_msg}: {e}")),
         }
     }
 
@@ -717,6 +731,7 @@ impl Host {
         // SAFETY: caller holds `self.submitted` and `cmd` is closed.
         unsafe { self.queue.ExecuteCommandLists(&lists) };
         self.signal_and_wait_locked(submitted, "card GPU wait failed");
+        self.fail_if_device_removed(&[]);
     }
 
     /// Creates an isolated WARP-backed `Host` for unit tests without touching
@@ -1217,6 +1232,55 @@ mod tests {
             list.last_fence.load(Ordering::Acquire),
         );
         assert!(finished >= last, "finished {finished}, list's last fence {last}");
+    }
+
+    #[test]
+    fn an_unwaited_card_submission_lands_before_title_completion() {
+        let Some(host) = Host::new_warp() else { return };
+        use std::sync::Arc;
+
+        let size = crate::watch::PAGE as u64;
+        let mut title = vec![0u8; size as usize];
+        let base = title.as_mut_ptr() as usize;
+        let (staging, ptr) = host.shared_buffer(size).expect("card staging");
+        let card = crate::card::CardState::new_unchecked(&host, &staging, size, false)
+            .expect("card buffer");
+        let shadow = crate::shadow::Shadow::new_card_test(card.clone(), ptr, base as u64, size);
+        shadow.copy_for_test(base, base + size as usize);
+        // The engine must drain a staged upload before the partial GPU write.
+        card.mark_dirty(0, size as usize);
+
+        let mut done = 0u64;
+        let list = Arc::new(host.new_list().expect("command list"));
+        let (upload, offset, src) = list.upload(4).expect("patch data");
+        // SAFETY: the list's upload covers four bytes and the card is live.
+        // Separate command lists handle transitions; this one promotes COMMON.
+        unsafe {
+            std::ptr::copy_nonoverlapping([1, 2, 3, 4].as_ptr(), src, 4);
+            list.list.CopyBufferRegion(&card.vram, 128, &upload, offset, 4);
+        }
+        list.count_work();
+        list.defer_gpu_write(&shadow, base + 128, 4);
+        list.defer_write(std::ptr::addr_of_mut!(done).cast(), crate::queue::Written::Value(7), 8);
+        list.close();
+        ASYNC_IN_TESTS.with(|on| on.set(true));
+        host.execute_title(std::slice::from_ref(&list));
+        ASYNC_IN_TESTS.with(|on| on.set(false));
+
+        let first_fence = list.last_fence.load(Ordering::Acquire);
+        assert!(first_fence > 0);
+        assert_eq!(&title[128..132], &[0; 4]);
+        assert_eq!(done, 0);
+        let list_ref = Arc::downgrade(&list);
+        drop((list, card, shadow));
+        assert!(list_ref.upgrade().is_some());
+
+        host.wait_in_flight();
+        assert_eq!(&title[128..132], &[1, 2, 3, 4]);
+        assert_eq!(done, 7);
+        assert!(list_ref.upgrade().is_none());
+        assert!(host.finished_fence.load(Ordering::Acquire) >= first_fence);
+        assert_eq!(*host.submitted.lock().unwrap(), first_fence + 1);
     }
 
     fn retired_at(submission: u64, frame: u64, age: std::time::Duration) -> Retired {
@@ -2025,7 +2089,7 @@ impl Host {
     /// Finishes the unwaited submissions that have run, oldest first, and
     /// buries objects retired before them. The caller holds `submitted`:
     /// finishing puts back what shaders wrote, as a submission does.
-    fn reap_completed(&self) {
+    fn reap_completed(&self, submitted: &mut u64) {
         // SAFETY: a plain fence query.
         let completed = unsafe { self.fence.GetCompletedValue() };
         let mut last_sub = 0u64;
@@ -2044,11 +2108,12 @@ impl Host {
             };
             let Some((fence, submission, finish)) = ready else { break };
             last_sub = last_sub.max(submission);
-            if let Some(Finish { lists, back }) = finish {
+            if let Some(Finish { lists, back, card }) = finish {
                 let _finishing = Finishing::enter();
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
                     self.fail_if_device_removed(&runs);
+                    self.finish_card(card, submitted);
                     self.finish_submission(&runs, back);
                     self.log_messages();
                 }
@@ -2077,9 +2142,9 @@ impl Host {
         if target == 0 || finishing_here() || self.finished_fence.load(Ordering::Acquire) >= target {
             return;
         }
-        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         wait_for_value(&self.fence, Some(HANDLE(self.event.as_raw_handle())), target);
-        self.reap_completed();
+        self.reap_completed(&mut submitted);
     }
 
     /// Waits for all in-flight asynchronous submissions to complete.
@@ -2097,7 +2162,7 @@ impl Host {
     }
 
     /// Waits for any in-flight async submission while `self.submitted` is already held.
-    fn drain_in_flight_locked(&self) {
+    fn drain_in_flight_locked(&self, submitted: &mut u64) {
         let target = self
             .in_flight
             .lock()
@@ -2115,7 +2180,7 @@ impl Host {
             wait_for_value(&self.fence, Some(HANDLE(self.event.as_raw_handle())), target);
             submission_us(1, waited.elapsed().as_micros() as u64);
         }
-        self.reap_completed();
+        self.reap_completed(submitted);
     }
 
     /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
@@ -2126,9 +2191,9 @@ impl Host {
     }
 
     /// As [`Host::execute`] for the title's own submissions, the only ones
-    /// that may return before the host GPU is done
-    /// (`VICTORY_ASYNC_SUBMIT=1`): the title waits for its fences, which are
-    /// signalled after the wait (`crate::timeline`). Our own submissions
+    /// that may return before the host GPU is done (`VICTORY_ASYNC_SUBMIT=1`,
+    /// plus `VICTORY_ASYNC_CARD_COMPARE=1` for card writes). The title's
+    /// fences are signalled after the wait (`crate::timeline`). Our own submissions
     /// (present, captures, read-backs, texture uploads) read or free what
     /// they made as soon as the call returns: unwaited, the present's
     /// capture buffer was freed with its copy still pending, which the
@@ -2149,14 +2214,18 @@ impl Host {
     /// Brings the buffer copies `runs` will ask for up to date while the
     /// submission before still runs: the same refreshes as the lists'
     /// steps make, early. The ranges that submission's shaders write are
-    /// left alone (`Shadow::update` goes around them), and the steps in
-    /// their order do it all again after the wait, finding little left.
+    /// left alone (`Shadow::update` goes around them). Card staging is also
+    /// skipped: the earlier submission may still be reading it for uploads,
+    /// and its copy-back uses whole pages as snapshots. The regular steps
+    /// refresh those buffers after completion.
     fn prewarm(&self, runs: &[&HostList]) {
         let started = std::time::Instant::now();
         let mut batch = Batch::default();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::Refresh(shadow, address, len) = step {
+                if let Step::Refresh(shadow, address, len) = step
+                    && !shadow.is_card()
+                {
                     batch.add(shadow, *address, *len);
                 }
             }
@@ -2178,7 +2247,7 @@ impl Host {
         if keep.is_some() && self.has_in_flight() {
             self.prewarm(runs);
         }
-        self.drain_in_flight_locked();
+        self.drain_in_flight_locked(&mut submitted);
         if !runs.is_empty() {
             use windows::core::Interface;
             let host_fence = self.fence.as_raw() as usize;
@@ -2261,14 +2330,17 @@ impl Host {
             if self.card.get().and_then(|o| o.as_ref()).is_some() || !card_writes.is_empty() {
                 if let Some(engine_lock) = self.card_engine() {
                     let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let (before, plan) = engine.record_before(self, &card_writes);
+                    let (before, mut plan) = engine.record_before(self, &card_writes);
                     let after = if plan.has_writes() {
-                        engine.record_after(self, &plan)
+                        engine.record_after(self, &mut plan)
                     } else {
                         None
                     };
                     (before, Some(plan), after)
                 } else {
+                    if !card_writes.is_empty() {
+                        fail(format_args!("CARD_COMPARE engine unavailable for live card buffers"));
+                    }
                     (None, None, None)
                 }
             } else {
@@ -2293,7 +2365,7 @@ impl Host {
         let can_async = keep.is_some()
             && !each
             && async_submit()
-            && card_writes.is_empty()
+            && (card_writes.is_empty() || async_card_compare())
             && runs.iter().all(|list| list.deferred().texture_backs.is_empty());
         let mut unsignalled_pre = false;
         if let Some(first) = first {
@@ -2395,9 +2467,7 @@ impl Host {
         }
         let _ = &firsts;
         if async_signalled {
-            if let Some(plan) = card_plan {
-                plan.clear_pending();
-            }
+            debug_assert!(card_after_ran || card_plan.as_ref().is_none_or(|p| !p.has_writes()));
             submission_us(0, (prepared - started).as_micros() as u64);
             self.in_flight
                 .lock()
@@ -2410,13 +2480,12 @@ impl Host {
                     finish: Some(Finish {
                         lists: keep.map(<[_]>::to_vec).unwrap_or_default(),
                         back: cpu_back,
+                        card: card_plan,
                     }),
                 });
             return;
         }
         drop(early);
-        FINISHED.fetch_max(this_submission, Ordering::AcqRel);
-        bury(this_submission);
         let gpu = prepared.elapsed();
         submission_us(0, (prepared - started).as_micros() as u64);
         submission_us(1, gpu.as_micros() as u64);
@@ -2435,24 +2504,30 @@ impl Host {
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
-        let copying = std::time::Instant::now();
-        if let Some(plan) = card_plan {
-            if card_after_ran {
-                if let Some(engine_lock) = self.card_engine() {
-                    let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let written = engine.finish_back(self, plan, &mut submitted);
-                    copy_back(1, written as u64);
-                } else {
-                    plan.clear_pending();
-                }
-            } else {
-                plan.clear_pending();
-            }
+        if card_after_ran {
+            self.finish_card(card_plan, &mut submitted);
+        } else if let Some(plan) = card_plan {
+            plan.clear_pending();
         }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.finish_submission(runs, cpu_back);
         self.finished_fence.fetch_max(*submitted, Ordering::AcqRel);
+        FINISHED.fetch_max(this_submission, Ordering::AcqRel);
+        bury(this_submission);
         self.log_messages();
+    }
+
+    fn finish_card(&self, plan: Option<crate::card::CardPlan>, submitted: &mut u64) {
+        let Some(plan) = plan else { return };
+        if !plan.has_writes() {
+            plan.clear_pending();
+            return;
+        }
+        let copying = std::time::Instant::now();
+        let mut engine = self.card_engine().expect("card plan has an engine")
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let written = engine.finish_back(self, plan, submitted);
+        copy_back(1, written as u64);
+        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Stops the process with the removal data when the host device was
@@ -4704,7 +4779,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 let [waits, wait_us, bytes, copies] = crate::card::take_fetch_stats();
-                if waits != 0 {
+                if copies != 0 {
                     tracing::info!(
                         waits,
                         wait_ms = wait_us as f64 / 1000.0,

@@ -487,12 +487,12 @@ impl Shadow {
     }
 
     /// Merges GPU-modified 64 KiB pieces (fetched from VRAM into `runs`:
-    /// `(first_piece, count, readback_ptr)`) into title memory and `card.staging`.
+    /// `(first_piece, bytes)`) into title memory and `card.staging`.
     /// Returns bytes written to title memory.
     pub(crate) fn merge_card_pieces(
         &self,
         card: &Arc<crate::card::CardState>,
-        runs: &[(u32, u32, usize)],
+        runs: &[(u32, &[u8])],
     ) -> usize {
         let start = self.start as usize;
         let shadow_len = self.len as usize;
@@ -505,20 +505,16 @@ impl Shadow {
         let mut min_addr = usize::MAX;
         let mut max_addr = 0usize;
 
-        for &(first_piece, count, rb_ptr) in runs {
-            for k in 0..count {
-                let piece = (first_piece + k) as usize;
+        for &(first_piece, bytes) in runs {
+            for (k, gpu_page) in bytes.as_chunks::<PAGE>().0.iter().enumerate() {
+                let piece = first_piece as usize + k;
                 let off = piece * PAGE;
                 if off >= shadow_len {
                     break;
                 }
                 let n = PAGE.min(shadow_len - off);
                 let title_addr = start + off;
-                // SAFETY: `rb_ptr` holds `count * PAGE` bytes fetched from VRAM;
-                // `self.data` maps `card.staging` of at least `shadow_len` bytes.
-                let gpu_new = unsafe {
-                    std::slice::from_raw_parts((rb_ptr + (k as usize) * PAGE) as *const u8, n)
-                };
+                let gpu_new = &gpu_page[..n];
                 // SAFETY: the staging mapping covers off..off+n; the
                 // submission's per-shadow merge has exclusive access here.
                 let staging_old =
