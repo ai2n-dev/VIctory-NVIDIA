@@ -1362,6 +1362,9 @@ mod tests {
             };
             let target = host.target();
             eprintln!("{name}: waves {}-{}", target.lanes_min, target.lanes_max);
+            if !host.test_console_wave(64) {
+                continue;
+            }
             let one =
                 emit_for(&compute(&words, true), target).unwrap_or_else(|e| panic!("{name}: {e}"));
             host.compute_pipeline(&one)

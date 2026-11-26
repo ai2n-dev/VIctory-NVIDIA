@@ -422,6 +422,22 @@ impl Host {
         }
     }
 
+    /// Wave-dependent execution tests require a native console wave or a
+    /// supported 32-lane split of a 64-lane console wave. This is a test
+    /// capability check, not a fallback for translation or PSO failures.
+    #[cfg(test)]
+    pub(crate) fn test_console_wave(&self, wave: u32) -> bool {
+        let target = self.target();
+        if target.runs(wave) || (wave == 64 && target.runs(32)) {
+            return true;
+        }
+        eprintln!(
+            "CAPABILITY_SKIP: console wave{wave} requires compatible waves; host reports {}-{}",
+            target.lanes_min, target.lanes_max
+        );
+        false
+    }
+
     /// Makes an object, naming the debug layer's reasons if it is refused:
     /// with the layer on (`VICTORY_D3D12_DEBUG=1` in a diagnostics build) the
     /// error carries what the layer said, not only the bare code. Creations

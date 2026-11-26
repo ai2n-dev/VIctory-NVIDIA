@@ -109,6 +109,9 @@ fn in_half_lane_reads_match_the_console_on_every_adapter() {
             eprintln!("{name}: no SM 6.6 device; skipped");
             continue;
         };
+        if !host.test_console_wave(64) {
+            continue;
+        }
         let target = host.target();
         // One console wave, two per group, and a group whose second wave
         // has its lower half only.
@@ -181,6 +184,9 @@ fn three_dimensional_groups_keep_the_consoles_lanes() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
+        if !host.test_console_wave(64) {
+            continue;
+        }
         let split = !host.target().runs(64);
         for threads in [
             [4, 4, 4],
@@ -218,6 +224,9 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
         let Ok(host) = Host::on(&name) else {
             continue;
         };
+        if !host.test_console_wave(64) {
+            continue;
+        }
         let p = program(body, threads);
         let split = !host.target().runs(64);
         let groups = 2;
@@ -427,6 +436,9 @@ fn lds_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32) 
         let Ok(host) = Host::on(&name) else {
             continue;
         };
+        if !host.test_console_wave(64) {
+            continue;
+        }
         let p = program_lds(body, threads);
         let split = !host.target().runs(64);
         let groups = 2;
@@ -794,6 +806,9 @@ fn several_console_waves_share_lds_within_each() {
         let Ok(host) = Host::on(&name) else {
             continue;
         };
+        if !host.test_console_wave(64) {
+            continue;
+        }
         let split = !host.target().runs(64);
         for threads in [128, 256] {
             let p = program_lds_bytes(&body, threads, threads * 4);

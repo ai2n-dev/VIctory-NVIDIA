@@ -1550,6 +1550,9 @@ fn loop_exit_mask_counted_after_the_loop() {
         eprintln!("no SM 6.6 hardware device; skipped");
         return;
     };
+    if !host.test_console_wave(64) {
+        return;
+    }
     let shader =
         build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("translation: {e}"));
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
@@ -1596,6 +1599,9 @@ fn scalar_counted_in_a_divergent_loop_read_after_it() {
         eprintln!("no SM 6.6 hardware device; skipped");
         return;
     };
+    if !host.test_console_wave(64) {
+        return;
+    }
     let shader =
         build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("translation: {e}"));
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
@@ -1637,6 +1643,9 @@ fn mask_grown_inside_a_branch_counted_after_it() {
         eprintln!("no SM 6.6 hardware device; skipped");
         return;
     };
+    if !host.test_console_wave(64) {
+        return;
+    }
     let shader =
         build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("translation: {e}"));
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
@@ -1691,6 +1700,9 @@ fn scalar_counted_in_nested_divergent_loops() {
         eprintln!("no SM 6.6 hardware device; skipped");
         return;
     };
+    if !host.test_console_wave(64) {
+        return;
+    }
     let shader =
         build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("translation: {e}"));
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
