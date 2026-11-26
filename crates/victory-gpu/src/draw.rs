@@ -1367,7 +1367,7 @@ impl State {
             }
         }
         // Reuse scratch across the root tables of this draw.
-        let mut entries = Vec::new();
+        let mut entries: Vec<&UsedResource> = Vec::new();
         let mut indices = Vec::new();
         for slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
