@@ -2051,7 +2051,7 @@ impl HostHeap {
         match &view {
             &View::Constant(address, size) => {
                 let capped = size.min(65_536);
-                if !valid_title_address(address, u64::from(capped)) {
+                if capped == 0 || !valid_title_address(address, u64::from(capped)) {
                     return unmapped(&view, address, u64::from(capped));
                 }
                 let (mut reads, mut bounces) = (Vec::new(), Vec::new());
@@ -2605,7 +2605,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || typed_store(own));
     }
     // A 32-bit texture shaders write, read as shared-exponent colors.
     if view == crate::resource::SHARED_EXPONENT
@@ -2620,7 +2620,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return true;
+        return !unordered || typed_store(own);
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -2631,7 +2631,39 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     {
         *format = d.Format;
     }
-    true
+    // Check the format actually passed to D3D12, not the requested one:
+    // unsupported typed texture UAVs can remove an NVIDIA device.
+    !unordered || typed_store(if typeless { view } else { own })
+}
+
+/// Whether the runtime's D3D12 device can create a typed unordered view.
+/// The global host is fixed for the process; avoid repeating driver queries.
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let Some(host) = host() else { return false };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: the feature query writes the structure of the given size.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0;
+    known.push((format, ok));
+    if !ok {
+        tracing::warn!(format, "typed UAV format unsupported by host; using null view");
+    }
+    ok
 }
 
 /// `d` made a view of a texture without the `skip` largest mips.
