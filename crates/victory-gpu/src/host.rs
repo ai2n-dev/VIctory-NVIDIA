@@ -2123,15 +2123,15 @@ impl Host {
             && card_writes.is_empty()
             && runs.iter().all(|list| list.deferred().texture_backs.is_empty());
         if let Some(first) = first {
-            // SAFETY: a closed list.
             let lists = [Some(first)];
             crate::cardmeter::executing(&lists, &self.fence);
+            // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&lists) };
         }
         if let Some(card_before) = card_before {
-            // SAFETY: a closed list.
             let lists = [Some(card_before)];
             crate::cardmeter::executing(&lists, &self.fence);
+            // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&lists) };
         }
         let mut async_signalled = false;
@@ -2145,8 +2145,8 @@ impl Host {
             }
             *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists.
             crate::cardmeter::executing(group, &self.fence);
+            // SAFETY: closed lists.
             unsafe { self.queue.ExecuteCommandLists(group) };
             if !each && i + 1 < groups.len() {
                 continue;
@@ -2154,9 +2154,9 @@ impl Host {
             if !each
                 && let Some(after) = card_after.take()
             {
-                // SAFETY: closed list; runs immediately after the final group under the same fence.
                 let lists = [Some(after)];
                 crate::cardmeter::executing(&lists, &self.fence);
+                // SAFETY: closed list; runs immediately after the final group under the same fence.
                 unsafe { self.queue.ExecuteCommandLists(&lists) };
                 card_after_ran = true;
             }
