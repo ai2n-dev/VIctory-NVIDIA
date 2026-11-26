@@ -2538,14 +2538,22 @@ fn merge_gpu_writes_mut(
 ) {
     let n = title.len().min(host.len()).min(old.len());
     dirty.clear();
-    let mut i = 0;
+    // The three buffers already agree on these bytes, so neither the
+    // host mapping nor the mutable snapshot needs a store.
+    let mut i = if n >= 64 {
+        skip_equal3(&title[..n], &host[..n], &old[..n])
+    } else {
+        0
+    };
     while i + 8 <= n {
         let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
         let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
         if hw == ow {
             let tw = &title[i..i + 8];
-            host[i..i + 8].copy_from_slice(tw);
-            old[i..i + 8].copy_from_slice(tw);
+            if host[i..i + 8] != *tw {
+                host[i..i + 8].copy_from_slice(tw);
+                old[i..i + 8].copy_from_slice(tw);
+            }
         } else {
             for k in i..i + 8 {
                 let h = host[k];
@@ -2559,6 +2567,9 @@ fn merge_gpu_writes_mut(
             }
         }
         i += 8;
+        if n - i >= 64 {
+            i += skip_equal3(&title[i..n], &host[i..n], &old[i..n]);
+        }
     }
     for k in i..n {
         let h = host[k];
@@ -2935,6 +2946,65 @@ mod tests {
         assert_eq!(landed[12], 9);
         landed[12] = title[12];
         assert_eq!(landed, merged);
+    }
+
+    #[test]
+    fn sparse_mutable_merge_matches_byte_oracle_with_clean_spans() {
+        // Include unaligned starts, tails, long clean gaps, CPU-only
+        // changes, GPU-only changes and conflicts at vector boundaries.
+        for offset in [0usize, 1, 7, 31, 63] {
+            for len in [0usize, 7, 8, 63, 64, 65, 129, 1025, 4097] {
+                for mode in 0..5 {
+                    let original: Vec<u8> = (0..offset + len + 9)
+                        .map(|i| (i.wrapping_mul(17) ^ 0x5a) as u8)
+                        .collect();
+                    let mut title = original.clone();
+                    let mut host = original.clone();
+                    let mut old = original.clone();
+                    for i in 0..len {
+                        let at = offset + i;
+                        if mode != 0 && (i % 257 == 0 || i == len - 1) {
+                            title[at] ^= 0x11;
+                        }
+                        if mode >= 2 && (i % 127 == 63 || i == len - 1) {
+                            host[at] ^= 0x22;
+                        }
+                        if mode == 3 && i % 127 == 63 {
+                            title[at] = host[at];
+                        }
+                        if mode == 4 && i % 5 == 0 {
+                            host[at] ^= 0x44;
+                        }
+                    }
+                    let mut expected_title = title.clone();
+                    let mut expected_host = host.clone();
+                    let mut expected_old = old.clone();
+                    let mut changed = Vec::new();
+                    for i in 0..len {
+                        let at = offset + i;
+                        if host[at] != old[at] && title[at] != host[at] {
+                            expected_title[at] = host[at];
+                            changed.push(i);
+                        }
+                        expected_host[at] = expected_title[at];
+                        expected_old[at] = expected_title[at];
+                    }
+                    let mut dirty = vec![(0, 999)];
+                    super::merge_gpu_writes_mut(
+                        &mut title[offset..offset + len],
+                        &mut host[offset..offset + len],
+                        &mut old[offset..offset + len],
+                        &mut dirty,
+                    );
+                    let actual: Vec<_> = dirty.iter().flat_map(|&(a, b)| a..b).collect();
+                    assert_eq!(actual, changed, "offset={offset} len={len} mode={mode}");
+                    assert!(dirty.windows(2).all(|w| w[0].1 < w[1].0));
+                    assert_eq!(title, expected_title);
+                    assert_eq!(host, expected_host);
+                    assert_eq!(old, expected_old);
+                }
+            }
+        }
     }
 
     #[test]
