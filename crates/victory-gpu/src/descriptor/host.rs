@@ -1133,7 +1133,8 @@ impl HostHeap {
         }
         self.keep_with_view(index, kept.flatten(), view);
         if ok {
-            self.set_stride_count(index, view_stride(view), view_count(view));
+            let (stride, count) = view_buffer_metadata(view);
+            self.set_stride_count(index, stride, count);
         } else {
             self.set_stride(index, 0);
         }
@@ -1393,7 +1394,8 @@ impl HostHeap {
                 self.keep_with_view(index, kept.flatten(), &view);
                 // The stride is the title view's, however and whenever the
                 // host view is made.
-                self.set_stride_count(index, view_stride(&view), view_count(&view));
+                let (stride, count) = view_buffer_metadata(&view);
+                self.set_stride_count(index, stride, count);
             }
         }
         if !self.sampler {
@@ -2521,58 +2523,46 @@ fn uav_element_size(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<u64> {
     }
 }
 
-/// Element byte stride of `view` for the runtime stride table (`0` for
-/// non-buffer views or descriptors without a known element size).
-fn view_stride(view: &View) -> u32 {
-    let bytes = match view {
-        View::Shader(_, Some(desc)) => element_size(&srv_desc(desc)),
-        View::Placed(false, resource, desc) if resource[0] == 1 => desc[..10]
-            .try_into()
-            .ok()
-            .map_or(0, |w: &[u32; 10]| element_size(&srv_desc(w))),
-        View::Unordered(_, _, Some(desc)) => uav_element_size(&uav_desc(desc)).unwrap_or(0),
-        View::Placed(true, resource, desc) if resource[0] == 1 => desc[..10]
-            .try_into()
-            .ok()
-            .and_then(|w: &[u32; 10]| uav_element_size(&uav_desc(w)))
-            .unwrap_or(0),
-        _ => 0,
-    };
-    u32::try_from(bytes).unwrap_or(0)
-}
-
-/// The elements of the title's buffer view `view` (0 for other views).
-fn view_count(view: &View) -> u32 {
+/// Element byte stride and count of a buffer view, or zeros for other
+/// descriptor kinds. Decode the descriptor once and inspect its dimension
+/// before reading the Buffer union member. In particular, texture mip/array
+/// fields must never become stride metadata for a recycled heap slot.
+fn view_buffer_metadata(view: &View) -> (u32, u32) {
     let srv = |w: &[u32; 10]| {
         let desc = srv_desc(w);
-        if desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
-            // SAFETY: a buffer view's union member.
-            Some(unsafe { desc.Anonymous.Buffer }.NumElements)
-        } else {
-            None
+        if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+            return (0, 0);
         }
+        // SAFETY: the dimension names the Buffer member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        (
+            u32::try_from(element_size(&desc)).unwrap_or(0),
+            buffer.NumElements,
+        )
     };
     let uav = |w: &[u32; 10]| {
         let desc = uav_desc(w);
-        if desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
-            // SAFETY: a buffer view's union member.
-            Some(unsafe { desc.Anonymous.Buffer }.NumElements)
-        } else {
-            None
+        if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+            return (0, 0);
         }
+        // SAFETY: the dimension names the Buffer member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        (
+            u32::try_from(uav_element_size(&desc).unwrap_or(0)).unwrap_or(0),
+            buffer.NumElements,
+        )
     };
     match view {
         View::Shader(_, Some(desc)) => srv(desc),
-        View::Placed(false, resource, desc) if resource[0] == 1 => {
-            desc[..10].try_into().ok().and_then(srv)
-        }
         View::Unordered(_, _, Some(desc)) => uav(desc),
-        View::Placed(true, resource, desc) if resource[0] == 1 => {
-            desc[..10].try_into().ok().and_then(uav)
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().map_or((0, 0), srv)
         }
-        _ => None,
+        View::Placed(true, resource, desc) if resource[0] == 1 => {
+            desc[..10].try_into().ok().map_or((0, 0), uav)
+        }
+        _ => (0, 0),
     }
-    .unwrap_or(0)
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -3608,6 +3598,28 @@ void main() {
                 .unwrap();
             (root, pso)
         }
+    }
+
+    #[test]
+    fn buffer_metadata_does_not_interpret_texture_union_as_buffer() {
+        // UAV: format, dimension, first element (u64), count, stride,
+        // counter offset (u64), flags, padding.
+        let typed = View::Unordered(0, 0, Some([12, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
+        assert_eq!(view_buffer_metadata(&typed), (8, 64));
+        let structured =
+            View::Unordered(0, 0, Some([0, 1, 0, 0, 17, 32, 0, 0, 0, 0]));
+        assert_eq!(view_buffer_metadata(&structured), (32, 17));
+        let raw = View::Unordered(0, 0, Some([39, 1, 0, 0, 23, 0, 0, 0, 1, 0]));
+        assert_eq!(view_buffer_metadata(&raw), (4, 23));
+        let texture =
+            View::Unordered(0, 0, Some([28, 8, 1, 2, 3, 64, 0, 0, 0, 0]));
+        assert_eq!(view_buffer_metadata(&texture), (0, 0));
+        // SRV buffer union follows the component mapping and padding.
+        let srv = View::Shader(0, Some([57, 1, 5768, 0, 0, 0, 19, 0, 0, 0]));
+        assert_eq!(view_buffer_metadata(&srv), (2, 19));
+        let srv_texture = View::Shader(0, Some([28, 4, 5768, 0, 1, 2, 3, 64, 0, 0]));
+        assert_eq!(view_buffer_metadata(&srv_texture), (0, 0));
+        assert_eq!(view_buffer_metadata(&View::Shader(0, None)), (0, 0));
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
