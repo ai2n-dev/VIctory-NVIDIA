@@ -25,6 +25,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
 use crate::host::Host;
+use crate::shadow::merge_byte_ranges;
 use crate::watch::PAGE;
 
 /// Wave64 / 64-thread-per-page 64 KiB hashing compute shader (`cs_5_1`).
@@ -350,25 +351,6 @@ fn group_readback_runs(
         }
     }
     (groups, pieces)
-}
-
-/// Merges overlapping or adjacent `[from, to)` ranges in place.
-fn merge_byte_ranges(ranges: &mut Vec<(usize, usize)>) {
-    if ranges.len() <= 1 {
-        return;
-    }
-    ranges.sort_unstable();
-    let mut out = 0usize;
-    for i in 1..ranges.len() {
-        let (a, b) = ranges[i];
-        if a <= ranges[out].1 {
-            ranges[out].1 = ranges[out].1.max(b);
-        } else {
-            out += 1;
-            ranges[out] = (a, b);
-        }
-    }
-    ranges.truncate(out + 1);
 }
 
 /// Optional extra pages to hash between upload rehash runs. Never apply this

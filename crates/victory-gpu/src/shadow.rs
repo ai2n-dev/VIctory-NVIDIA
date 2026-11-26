@@ -95,7 +95,7 @@ impl UnchangedPages {
         if *unchanged {
             return false;
         }
-        if current != before {
+        if !page_equal(current, before) {
             return true;
         }
         // A later range can touch bytes a partial comparison missed. At
@@ -108,6 +108,105 @@ impl UnchangedPages {
     fn clear(&mut self) {
         self.pages.clear();
     }
+}
+
+/// Merges overlapping or adjacent byte ranges without covering gaps.
+pub(crate) fn merge_byte_ranges(ranges: &mut Vec<(usize, usize)>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_unstable();
+    let mut out = 0;
+    for i in 1..ranges.len() {
+        let (start, end) = ranges[i];
+        if start <= ranges[out].1 {
+            ranges[out].1 = ranges[out].1.max(end);
+        } else {
+            out += 1;
+            ranges[out] = (start, end);
+        }
+    }
+    ranges.truncate(out + 1);
+}
+
+/// Completes declarations covered by one merged range of this submission.
+fn complete_copy_back(pending: &mut Vec<(usize, usize)>, start: usize, end: usize) {
+    pending.retain(|&(from, to)| !(start <= from && to <= end));
+}
+
+/// Compare CPU-readable mappings after the submission fence. Full pages can
+/// use SIMD. Small partial comparisons use the standard slice implementation.
+fn page_equal(a: &[u8], b: &[u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if a.len() == PAGE && b.len() == PAGE {
+        type Compare = unsafe fn(&[u8], &[u8]) -> bool;
+        static COMPARE: std::sync::OnceLock<Compare> = std::sync::OnceLock::new();
+        let compare = COMPARE.get_or_init(|| {
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+            {
+                equal_avx512
+            } else if std::arch::is_x86_feature_detected!("avx2") {
+                equal_avx2
+            } else {
+                |a, b| a == b
+            }
+        });
+        // SAFETY: dispatch checks ISA support. Both slices cover the page.
+        return unsafe { compare(a, b) };
+    }
+    a == b
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn equal_avx2(a: &[u8], b: &[u8]) -> bool {
+    use std::arch::x86_64::*;
+    debug_assert_eq!((a.len(), b.len()), (PAGE, PAGE));
+    a.as_chunks::<32>().0.iter().zip(b.as_chunks::<32>().0).all(|(x, y)| {
+        // SAFETY: both chunks are exactly 32 bytes and the loads are unaligned.
+        let (x, y) = unsafe {
+            (_mm256_loadu_si256(x.as_ptr().cast()), _mm256_loadu_si256(y.as_ptr().cast()))
+        };
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) == -1
+    })
+}
+
+// Rust 1.88 does not yet provide the stable AVX-512 intrinsics. This Win64
+// leaf uses only volatile registers and reads exactly one page per input.
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".text",
+    ".globl victory_equal_page_avx512",
+    "victory_equal_page_avx512:",
+    "    lea r8, [rcx + {page}]",
+    "2:",
+    "    vmovdqu64 zmm0, [rcx]",
+    "    vpcmpeqb k1, zmm0, [rdx]",
+    "    kortestq k1, k1",
+    "    jnc 3f",
+    "    add rcx, 64",
+    "    add rdx, 64",
+    "    cmp rcx, r8",
+    "    jne 2b",
+    "    mov eax, 1",
+    "    vzeroupper",
+    "    ret",
+    "3:",
+    "    xor eax, eax",
+    "    vzeroupper",
+    "    ret",
+    page = const PAGE,
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn equal_avx512(a: &[u8], b: &[u8]) -> bool {
+    unsafe extern "system" {
+        fn victory_equal_page_avx512(a: *const u8, b: *const u8) -> u32;
+    }
+    debug_assert_eq!((a.len(), b.len()), (PAGE, PAGE));
+    // SAFETY: callers verify AVX-512F/BW and pass two readable full pages.
+    unsafe { victory_equal_page_avx512(a.as_ptr(), b.as_ptr()) != 0 }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -374,7 +473,7 @@ impl Shadow {
                 // submission's per-shadow merge has exclusive access here.
                 let staging_old =
                     unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
-                if gpu_new == staging_old {
+                if page_equal(gpu_new, staging_old) {
                     continue;
                 }
                 let title_slice = &mut title_buf[..n];
@@ -586,6 +685,11 @@ impl Shadow {
         *before = Some((start, grown));
     }
 
+    /// Sparse aliases use their backing shadow's snapshot and pending ranges.
+    pub(crate) fn copy_back_owner(self: &Arc<Self>) -> &Arc<Self> {
+        self.sparse.as_ref().and_then(|s| s.of.as_ref()).unwrap_or(self)
+    }
+
     /// After the submission ran: copies the bytes its shaders wrote back
     /// into title memory (unmapped pages left alone), and only those: the
     /// title's threads write the same buffers while the GPU runs (its
@@ -683,7 +787,7 @@ impl Shadow {
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        complete_copy_back(&mut pending, address, address + len);
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -2186,7 +2290,7 @@ impl Shadow {
                 let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
-                if host == old {
+                if page_equal(host, old) {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
@@ -2216,7 +2320,7 @@ impl Shadow {
         });
         let written = written.into_inner();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        complete_copy_back(&mut pending, address, address + len);
         if pending.is_empty() {
             give_back_tiles(before.drain().map(|(_, buf)| buf));
         }
@@ -2632,6 +2736,51 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merged_copy_back_covers_pending_ranges_without_crossing_gaps() {
+        let mut ranges = vec![(30, 40), (0, 7), (7, 12), (2, 3), (5, 15), (32, 33)];
+        let mut pending = ranges.clone();
+        pending.push((20, 24));
+        merge_byte_ranges(&mut ranges);
+        assert_eq!(ranges, [(0, 15), (30, 40)]);
+        for (start, end) in ranges {
+            complete_copy_back(&mut pending, start, end);
+        }
+        assert_eq!(pending, [(20, 24)]);
+    }
+
+    #[test]
+    fn page_comparisons_detect_mismatches_at_unaligned_vector_edges() {
+        let a = vec![0x91; PAGE + 1];
+        let mut b = vec![0x91; PAGE + 3];
+        let a = &a[1..];
+        let b = &mut b[3..];
+        let check = |b: &[u8]| {
+            let expected = a == b;
+            assert_eq!(page_equal(a, b), expected);
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    // SAFETY: the CPU supports AVX2 and both slices cover a page.
+                    assert_eq!(unsafe { equal_avx2(a, b) }, expected);
+                }
+                if std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512bw")
+                {
+                    // SAFETY: the CPU supports AVX-512BW and both slices cover a page.
+                    assert_eq!(unsafe { equal_avx512(a, b) }, expected);
+                }
+            }
+        };
+        check(b);
+        for i in [0, 31, 32, 63, 64, PAGE - 1] {
+            b[i] ^= 0xff;
+            check(b);
+            b[i] ^= 0xff;
+        }
+        assert!(!page_equal(&a[..5], &b[..4]));
+    }
+
     #[test]
     fn batched_snapshots_match_serial_for_partial_chunks() {
         let source: Vec<Vec<u8>> = (0..137usize)

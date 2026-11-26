@@ -2480,33 +2480,29 @@ impl Host {
         } else {
             // Group by Shadow pointer so distinct shadows run in parallel
             // across CPU cores without lock contention on `before`/`pending`.
-            let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
-                Vec::new();
+            let mut groups: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<_>)> = Vec::new();
             let mut indices = std::collections::HashMap::<_, usize>::new();
-            for item in back {
-                let key = std::sync::Arc::as_ptr(&item.0);
-                if let Some(&index) = indices.get(&key) {
-                    groups[index].push(item);
-                } else {
-                    indices.insert(key, groups.len());
-                    groups.push(vec![item]);
-                }
-            }
-            if groups.len() <= 1 {
-                for (shadow, address, len) in &groups[0] {
-                    let written = shadow.copy_back(*address, *len);
-                    copy_back(1, written as u64);
-                }
-            } else {
-                in_parallel(&groups, 8, |chunk| {
-                    for g in chunk {
-                        for (shadow, address, len) in g {
-                            let written = shadow.copy_back(*address, *len);
-                            copy_back(1, written as u64);
-                        }
-                    }
+            for (shadow, address, len) in back {
+                // Sparse aliases share one snapshot and pending queue.
+                let owner = shadow.copy_back_owner();
+                let index = *indices.entry(std::sync::Arc::as_ptr(owner)).or_insert_with(|| {
+                    groups.push((owner.clone(), Vec::new()));
+                    groups.len() - 1
                 });
+                groups[index].1.push((address, address + len));
             }
+            for (_, ranges) in &mut groups {
+                crate::shadow::merge_byte_ranges(ranges);
+            }
+            in_parallel(&groups, 8, |chunk| {
+                let mut written = 0;
+                for (shadow, ranges) in chunk {
+                    for &(start, end) in ranges {
+                        written += shadow.copy_back(start, end - start) as u64;
+                    }
+                }
+                copy_back(1, written);
+            });
         }
         for list in runs {
             for back in &list.deferred().texture_backs {
