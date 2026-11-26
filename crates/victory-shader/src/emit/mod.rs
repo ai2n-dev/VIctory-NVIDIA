@@ -1119,6 +1119,46 @@ mod tests {
     }
 
     #[test]
+    fn ray_query_shader_validates() {
+        let mut s = super::shader::Shader::new(false);
+        s.threads = Some([64, 1, 1]);
+        let b = s.entry;
+        // RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH
+        let rq = s.ray_query(b, 1 | 4);
+        let flags = s.m.i32(0);
+        let mask = s.m.i32(0xff);
+        let zero = s.m.f32(0.0f32.to_bits());
+        let one = s.m.f32(1.0f32.to_bits());
+        let far = s.m.f32(1000.0f32.to_bits());
+        s.trace_ray_inline(
+            b,
+            rq,
+            flags,
+            mask,
+            [zero, zero, zero],
+            zero,
+            [zero, zero, one],
+            far,
+        );
+        let (lp, done) = (s.m.new_block(), s.m.new_block());
+        s.m.terminate(b, super::bitcode::Term::Br(lp));
+        let more = s.ray_query_proceed(lp, rq);
+        s.m.terminate(lp, super::bitcode::Term::CondBr(more, lp, done));
+        let _status = s.ray_query_committed_status(done, rq);
+        let _t = s.ray_query_committed_t(done, rq);
+        s.m.terminate(done, super::bitcode::Term::Ret);
+        let mut dxil = s.finish();
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut dxil).unwrap();
+            return;
+        }
+        assert!(!dxil.is_empty());
+    }
+
+    #[test]
     #[cfg(windows)]
     fn constant_color_validates() {
         let mut c = constant_color();
