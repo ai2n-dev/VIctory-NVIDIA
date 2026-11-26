@@ -93,6 +93,17 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     start_memory_log();
+    virtual_alloc(base, size, kind, flags, protect, victory_gpu::title_memory_committed)
+}
+
+fn virtual_alloc(
+    base: *mut c_void,
+    size: usize,
+    kind: u32,
+    flags: u64,
+    protect: u32,
+    on_commit: impl FnOnce(usize, usize),
+) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -159,7 +170,9 @@ pub extern "system" fn XMemVirtualAlloc(
         physical().reservations.push((at as usize, size));
     }
     if !constrained && kind & MEM_COMMIT != 0 && !at.is_null() {
-        victory_gpu::title_memory_committed(at as usize, size);
+        // Windows rounds a fixed commit's address down to a page. The
+        // caller's last byte can be in the next 64 KiB watch block.
+        on_commit(base as usize, size);
     }
     if base.is_null() {
         tracing::debug!(
@@ -1288,6 +1301,29 @@ fn log_memory(peak: &mut usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixed commit that begins in one watch block and ends in the next
+    /// tells the GPU side of both (the caller's address, not the page
+    /// Windows rounds it down to).
+    #[test]
+    fn commit_notification_covers_both_blocks_of_an_unaligned_request() {
+        let reservation = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE, 0, PAGE_NOACCESS);
+        assert!(!reservation.is_null());
+        let first = reservation as usize;
+        let boundary = first + PAGE;
+        let mut notified = None;
+        let at = virtual_alloc((boundary - 1) as _, 2, MEM_COMMIT, 0, PAGE_READWRITE, |start, size| {
+            notified = Some(start..start + size);
+        });
+        assert!(!at.is_null());
+        assert!((at as usize) < boundary - 1);
+        assert_eq!(query((boundary - 1) as _).host.State, MEM_COMMIT);
+        assert_eq!(query(boundary as _).host.State, MEM_COMMIT);
+        // SAFETY: this test owns the entire reservation.
+        assert_ne!(unsafe { VirtualFree(reservation, 0, MEM_RELEASE) }, 0);
+        let range = notified.expect("a successful commit notifies the GPU watch");
+        assert_eq!(range.start / PAGE..range.end.div_ceil(PAGE), first / PAGE..first / PAGE + 2);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
