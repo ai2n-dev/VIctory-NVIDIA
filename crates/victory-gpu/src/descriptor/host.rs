@@ -1888,7 +1888,7 @@ impl HostHeap {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         }
-        let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view) else {
+        let Some((shader_view @ View::Shader(tex_res, _), _held)) = placed_texture(&view) else {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         };
@@ -2329,7 +2329,7 @@ impl HostHeap {
                     self.set_unmapped_null(index, &view);
                     return Some(slot);
                 }
-                if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
+                if let Some((shader_view @ View::Shader(tex_res, _), _held)) = placed_texture(&view)
                     && let Some(host_tex) =
                         crate::resource::host_resource(tex_res as crate::object::This)
                 {
@@ -3050,7 +3050,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
+            if let Some((view, _held)) = placed_texture(view) {
                 return make(&view, at);
             }
             const BUFFER: u32 = 1;
@@ -3139,7 +3139,7 @@ fn largest_mip(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
 
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+pub(crate) fn placed_texture(view: &View) -> Option<(View, crate::resource::HeldTexture)> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
         return None;
@@ -3151,7 +3151,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     #[cfg(feature = "diagnostics")]
     crate::texture::flips::view(address, resource, *desc);
     let texture = crate::resource::texture_at(address, resource, largest_mip(resource, desc))?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    Some((View::Shader(texture.get() as usize, desc[..10].try_into().ok()), texture))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

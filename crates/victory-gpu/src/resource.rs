@@ -870,9 +870,9 @@ pub(crate) const SHARED_EXPONENT: u32 = 67;
 /// The written texture at `address` that a view described by `d` reads, the
 /// last written of several.
 #[cfg(windows)]
-fn target_at(address: u64, d: &ResourceDesc) -> Option<This> {
+fn target_at(address: u64, d: &ResourceDesc) -> Option<HeldTexture> {
     let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    targets
+    let target = targets
         .get(&address)?
         .iter()
         .map(|&r| r as This)
@@ -888,7 +888,10 @@ fn target_at(address: u64, d: &ResourceDesc) -> Option<This> {
                 .host
                 .as_ref()
                 .map_or(0, |h| h.written.load(std::sync::atomic::Ordering::Relaxed))
-        })
+        })?;
+    // Drop removes the entry under this same lock. Do not resurrect an
+    // object whose final Release already changed its count to zero.
+    object::add_ref_alive(target).then(|| HeldTexture(target))
 }
 
 /// Every texture the host GPU writes, by title address (diagnostics).
@@ -1706,6 +1709,13 @@ pub(crate) fn placed_epoch() -> u64 {
 pub(crate) struct HeldTexture(This);
 
 #[cfg(windows)]
+impl HeldTexture {
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
 impl Drop for HeldTexture {
     fn drop(&mut self) {
         resource_release(self.0);
@@ -1750,7 +1760,7 @@ pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option<HeldTexture> {
     if address == 0 {
         return None;
     }
@@ -1771,7 +1781,8 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     {
         let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(r, _)) = map.get(&(address, *desc)) {
-            return Some(r as This);
+            object::add_ref(r as This);
+            return Some(HeldTexture(r as This));
         }
     }
     let size = match texture_layout(&d) {
@@ -1806,15 +1817,17 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14], largest: u32) -> Option
     }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(r, _)) = map.get(&(address, *desc)) {
+        object::add_ref(r as This);
         drop(map);
         resource_release(out);
-        return Some(r as This);
+        return Some(HeldTexture(r as This));
     }
     PLACED_LIVE.lock().unwrap_or_else(|e| e.into_inner()).insert(out as usize);
     PLACED_LONGEST.fetch_max(end - address, std::sync::atomic::Ordering::AcqRel);
     map.insert((address, *desc), (out as usize, end));
     crate::memstat::PLACED_COUNT.store(map.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    Some(out)
+    object::add_ref(out);
+    Some(HeldTexture(out))
 }
 
 /// What is done about textures whose title memory changes
