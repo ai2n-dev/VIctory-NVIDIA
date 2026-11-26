@@ -1214,11 +1214,13 @@ fn verify_test_execution_log(
         lines.iter().enumerate().any(|(idx, line)| {
             line.starts_with(&prefix)
                 && (line.ends_with("... ok")
-                    || line.ends_with("ok")
+                    || line.ends_with(" ok")
                     || lines
                         .get(idx + 1..)
-                        .and_then(|rest| rest.iter().find(|l| !l.is_empty()))
-                        .is_some_and(|next| *next == "ok"))
+                        .into_iter()
+                        .flatten()
+                        .take_while(|l| !l.starts_with("test ") && !l.starts_with("test result:"))
+                        .any(|next| *next == "ok"))
         })
     };
     anyhow::ensure!(
@@ -1864,5 +1866,26 @@ mod tests {
         assert!(check_no_live_holder(&paths).is_err());
         drop(guard);
         assert!(check_no_live_holder(&paths).is_ok());
+    }
+
+    #[test]
+    fn verify_test_execution_log_handles_multiline_nocapture_stdout() {
+        let log = "\
+running 1 test
+test host::tests::physical_adapter_details_match_dxgi_luid ... [gpu-gate adapter] NVIDIA GeForce RTX 5070 Ti Laptop GPU
+physical adapter report: AdapterReport { name: \"NVIDIA GeForce RTX 5070 Ti Laptop GPU\" }
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 197 filtered out; finished in 0.24s
+";
+        assert!(
+            verify_test_execution_log(
+                log,
+                "host::tests::physical_adapter_details_match_dxgi_luid",
+                "NVIDIA",
+                "device_init:NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+            )
+            .is_ok()
+        );
     }
 }
