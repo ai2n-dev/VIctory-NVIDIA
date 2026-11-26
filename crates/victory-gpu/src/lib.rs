@@ -64,6 +64,8 @@ mod readout;
 #[cfg(windows)]
 mod rects;
 pub mod resource;
+#[cfg(windows)]
+mod residency;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
