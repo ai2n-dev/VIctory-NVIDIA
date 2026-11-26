@@ -116,6 +116,37 @@ fn reserve_card_bytes(used: &AtomicU64, size: u64, limit: u64) -> bool {
     .is_ok()
 }
 
+fn card_ceiling(budget: u64) -> u64 {
+    (u128::from(budget) * 75 / 100) as u64
+}
+
+/// With `VICTORY_RESERVE_CARD_VRAM=1`, optional GPU upload heaps leave room
+/// for card buffers. Ordinary upload heaps preserve the same data in RAM.
+pub(crate) fn gpu_upload_ceiling(budget: u64, non_local_budget: u64) -> u64 {
+    static RESERVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let reserve = non_local_budget != 0
+        && enabled()
+        && *RESERVE.get_or_init(|| {
+            std::env::var_os("VICTORY_RESERVE_CARD_VRAM").is_some_and(|v| v == "1")
+        });
+    let (card_limit, active_card_bytes) = if reserve {
+        (limits().1, CARD_BYTES[0].load(Ordering::Relaxed))
+    } else {
+        (0, 0)
+    };
+    gpu_upload_limit(budget, card_limit, active_card_bytes)
+}
+
+fn gpu_upload_limit(budget: u64, card_limit: u64, active_card_bytes: u64) -> u64 {
+    let baseline = (u128::from(budget) * 85 / 100) as u64;
+    let remaining = card_limit.min(budget / 6).saturating_sub(active_card_bytes);
+    if remaining == 0 {
+        baseline
+    } else {
+        card_ceiling(budget).saturating_sub(remaining)
+    }
+}
+
 /// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
 static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
 
@@ -139,7 +170,7 @@ fn limits() -> (u64, u64) {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(default)
-                << 20
+                .saturating_mul(1 << 20)
         };
         (
             mb("VICTORY_CARD_BUFFERS_MIN_MB", 4).max(1 << 20),
@@ -181,11 +212,14 @@ unsafe impl Sync for CardState {}
 impl Drop for CardState {
     fn drop(&mut self) {
         CARD_BYTES[0].fetch_sub(self.size, Ordering::Relaxed);
-        let hashes = self.hashes.get_mut().ok().and_then(Option::take);
+        let hashes = self.hashes.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        let mut held = self.size;
         if hashes.is_some() {
             CARD_BYTES[1].fetch_sub(hash_table_bytes(self.size), Ordering::Relaxed);
+            held += hash_table_bytes(self.size);
         }
-        crate::host::retire((self.staging.clone(), self.vram.clone(), hashes));
+        // The video memory stays with the retire queue until the GPU is done.
+        crate::host::retire_bytes((self.staging.clone(), self.vram.clone(), hashes), held);
     }
 }
 
@@ -205,11 +239,15 @@ impl CardState {
         }
         if let Some([(used, budget), _]) = crate::host::video_memory()
             && budget > 0
-            && used.saturating_add(size) > budget * 75 / 100
+            && used.saturating_add(size) > card_ceiling(budget)
         {
+            crate::memstat::add(&crate::memstat::CARD_REFUSED[0], size);
+            crate::memstat::add(&crate::memstat::CARD_REFUSED[1], 1);
             return None;
         }
         if !reserve_card_bytes(&CARD_BYTES[0], size, max_bytes) {
+            crate::memstat::add(&crate::memstat::CARD_REFUSED[2], size);
+            crate::memstat::add(&crate::memstat::CARD_REFUSED[3], 1);
             return None;
         }
         Self::new_unchecked(host, staging, size, true)
@@ -1116,6 +1154,22 @@ fn drop_barriers(barriers: impl IntoIterator<Item = D3D12_RESOURCE_BARRIER>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_upload_budget_leaves_room_for_unallocated_card_buffers() {
+        const GIB: u64 = 1 << 30;
+        let budget = 12 * GIB;
+        let target = 2 * GIB;
+        assert_eq!(gpu_upload_limit(budget, target, 0), 7 * GIB);
+        assert_eq!(gpu_upload_limit(budget, target, GIB), 8 * GIB);
+        assert_eq!(gpu_upload_limit(budget, target, target), budget * 85 / 100);
+        assert_eq!(gpu_upload_limit(budget, 0, 0), budget * 85 / 100);
+
+        let budget = 6 * GIB;
+        assert_eq!(gpu_upload_limit(budget, target, 0), 7 * GIB / 2);
+        assert_eq!(gpu_upload_limit(0, target, 0), 0);
+        assert!(gpu_upload_limit(u64::MAX, u64::MAX, 0) < u64::MAX);
+    }
 
     #[test]
     fn card_reservations_respect_limit_and_overflow() {

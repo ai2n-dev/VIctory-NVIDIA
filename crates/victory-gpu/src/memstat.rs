@@ -24,6 +24,8 @@ pub(crate) static PLACED_COUNT: AtomicU64 = AtomicU64::new(0);
 /// that were let go but wait for the GPU ([`crate::host::retire_bytes`]).
 pub(crate) static RETIRED_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RETIRED_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Bytes and attempts declined by the DXGI budget and by the card-buffer cap.
+pub(crate) static CARD_REFUSED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 pub(crate) fn add(counter: &AtomicU64, bytes: u64) {
     counter.fetch_add(bytes, Relaxed);
@@ -128,6 +130,14 @@ pub fn report() -> String {
         }
         let _ = write!(line, ", {} lists", LISTS.load(Relaxed));
         let _ = write!(line, ", retired {} MiB ({})", mib(RETIRED_BYTES.load(Relaxed)), RETIRED_COUNT.load(Relaxed));
+        let [budget_bytes, budget_count, cap_bytes, cap_count] =
+            CARD_REFUSED.each_ref().map(|counter| counter.load(Relaxed));
+        let _ = write!(
+            line,
+            ", card buffers refused since start: DXGI {} MiB ({budget_count}), cap {} MiB ({cap_count})",
+            mib(budget_bytes),
+            mib(cap_bytes),
+        );
     }
     #[cfg(windows)]
     {

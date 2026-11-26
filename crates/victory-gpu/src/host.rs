@@ -75,20 +75,11 @@ fn async_submit() -> bool {
 #[cfg(test)]
 thread_local! {
     static ASYNC_IN_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static STRICT_IN_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
 fn async_submit() -> bool {
     ASYNC_IN_TESTS.with(std::cell::Cell::get)
-}
-
-fn strict_keep() -> bool {
-    #[cfg(test)]
-    if let Some(strict) = STRICT_IN_TESTS.with(std::cell::Cell::get) {
-        return strict;
-    }
-    KeepPolicy::current().strict
 }
 
 /// Microseconds spent bringing buffer copies up to date while the
@@ -222,13 +213,8 @@ pub(crate) fn retire<T: 'static>(object: T) {
 /// is kept waiting for the GPU shows in the memory report and in the
 /// pressure that shortens the wait ([`KeepPolicy`]).
 pub(crate) fn retire_bytes<T: 'static>(object: T, bytes: u64) {
-    if BURYING.get() && !strict_keep() {
-        // Let go of by an object that waited its whole time in the queue
-        // (a texture's host copy owns the texture and its memory): nothing
-        // else holds it, so what it owned has waited as long.
-        drop(object);
-        return;
-    }
+    // An object's destructor can retire resources with a later GPU use
+    // than the object itself. Every retirement takes its own snapshot.
     let submission = STARTED.load(Ordering::Acquire);
     let frame = crate::queue::presented();
     crate::memstat::add(&crate::memstat::RETIRED_BYTES, bytes);
@@ -240,28 +226,6 @@ pub(crate) fn retire_bytes<T: 'static>(object: T, bytes: u64) {
         bytes,
         object: Box::new(object),
     });
-}
-
-thread_local! {
-    /// The thread is dropping objects that waited in the queue.
-    static BURYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Drops objects that waited their time in the queue. What they let go of
-/// ([`retire`] from their `Drop`) is dropped with them, not queued again:
-/// a title texture's host copy was kept for 8 s, and then its resource and
-/// memory slot for 8 s more, as the host copy's drop retired them.
-/// `VICTORY_KEEP_STRICT=1` queues them again, as before.
-fn drop_waited(done: Vec<Retired>) {
-    struct Burying;
-    impl Drop for Burying {
-        fn drop(&mut self) {
-            BURYING.set(false);
-        }
-    }
-    BURYING.set(true);
-    let _reset = Burying;
-    drop(done);
 }
 
 /// The longest wait `VICTORY_KEEP_SECS` can ask for (larger values, and values
@@ -365,7 +329,7 @@ fn bury(finished: u64) {
         let policy = KeepPolicy::current();
         let mut n = expired(&retired, finished, now, policy.time);
         // Pressure is asked only when it would free the next object.
-        if !strict_keep()
+        if !policy.strict
             && retired.get(n).is_some_and(|r| waits_for_time_only(r, finished, now, policy.time))
             && video_memory_pressure()
         {
@@ -377,7 +341,7 @@ fn bury(finished: u64) {
         crate::memstat::sub(&crate::memstat::RETIRED_BYTES, r.bytes);
         crate::memstat::sub(&crate::memstat::RETIRED_COUNT, 1);
     }
-    drop_waited(done);
+    drop(done);
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -736,7 +700,7 @@ impl Host {
             Ok(()) => {
                 crate::cardmeter::signalled(&self.fence, fence_val);
                 crate::preflight::record_last_op(format_args!("fence_wait:{fence_val}"));
-                wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val);
+                wait_for_value(&self.fence, Some(HANDLE(self.event.as_raw_handle())), fence_val);
             }
             Err(e) => tracing::warn!(error = %e, "{warn_msg}"),
         }
@@ -821,7 +785,7 @@ impl Drop for WarpSerial {
 /// cannot be armed is polled instead of being taken for reached (it was, and
 /// the resources of the submission were released under the running GPU). A
 /// wait of ten seconds and more is logged every ten seconds.
-fn wait_for_value(fence: &ID3D12Fence, event: HANDLE, value: u64) {
+fn wait_for_value(fence: &ID3D12Fence, event: Option<HANDLE>, value: u64) {
     // SAFETY: plain fence and device queries; the event is the caller's.
     unsafe {
         if fence.GetCompletedValue() >= value {
@@ -832,10 +796,14 @@ fn wait_for_value(fence: &ID3D12Fence, event: HANDLE, value: u64) {
             fence.GetDevice(&mut device).is_ok()
                 && device.is_some_and(|device| device.GetDeviceRemovedReason().is_err())
         };
-        let armed = fence.SetEventOnCompletion(value, event);
-        if let Err(e) = &armed {
-            tracing::warn!(error = %e, value, "fence event not armed: polling the fence");
-        }
+        // SetEventOnCompletion with a null event is itself a blocking wait.
+        let armed = event.is_some_and(|event| match fence.SetEventOnCompletion(value, event) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, value, "fence event not armed: polling the fence");
+                false
+            }
+        });
         let timeout_ms = crate::preflight::effective_fence_timeout_ms(
             std::env::var("VICTORY_FENCE_TIMEOUT_MS").ok().as_deref(),
             cfg!(test),
@@ -854,7 +822,7 @@ fn wait_for_value(fence: &ID3D12Fence, event: HANDLE, value: u64) {
                     "fence wait timed out after {limit} ms (target={value}, completed={completed})"
                 ));
             }
-            if armed.is_err() || WaitForSingleObject(event, 1000) == WAIT_FAILED {
+            if !armed || event.is_none_or(|event| WaitForSingleObject(event, 1000) == WAIT_FAILED) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             let tens = began.elapsed().as_secs() / 10;
@@ -1276,35 +1244,6 @@ mod tests {
         assert_eq!(expired(&queue, 9, all_frames, Duration::ZERO), 3);
     }
 
-    /// What an object lets go of while it is dropped after its wait is
-    /// dropped with it, but queued like any other when something else drops
-    /// the object.
-    #[test]
-    fn what_a_waited_object_owned_is_not_queued_again() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-        struct Marker(Arc<AtomicBool>);
-        impl Drop for Marker {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        struct Owner(Option<Marker>);
-        impl Drop for Owner {
-            fn drop(&mut self) {
-                retire_bytes(self.0.take(), 0);
-            }
-        }
-        let gone = Arc::new(AtomicBool::new(false));
-        drop_waited(vec![retired_object(Owner(Some(Marker(gone.clone()))))]);
-        assert!(gone.load(Ordering::SeqCst), "dropped with its owner");
-        assert!(!BURYING.get());
-
-        let queued = Arc::new(AtomicBool::new(false));
-        drop(Owner(Some(Marker(queued.clone()))));
-        assert!(!queued.load(Ordering::SeqCst), "any other drop queues it");
-    }
-
     fn retired_object<T: 'static>(object: T) -> Retired {
         Retired {
             submission: 0,
@@ -1520,16 +1459,10 @@ mod tests {
     }
 
     #[test]
-    fn strict_keep_policy_queues_nested_drops_and_tracks_retired_bytes() {
+    fn retirement_queues_nested_drops_and_tracks_retired_bytes() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
 
-        struct StrictReset;
-        impl Drop for StrictReset {
-            fn drop(&mut self) {
-                STRICT_IN_TESTS.with(|s| s.set(None));
-            }
-        }
         struct Marker(Arc<AtomicBool>);
         impl Drop for Marker {
             fn drop(&mut self) {
@@ -1543,19 +1476,17 @@ mod tests {
             }
         }
 
-        let strict_dropped = Arc::new(AtomicBool::new(false));
-        let _reset_strict = StrictReset;
-        STRICT_IN_TESTS.with(|s| s.set(Some(true)));
+        let dropped = Arc::new(AtomicBool::new(false));
 
         let before_count = crate::memstat::RETIRED_COUNT.load(Ordering::Relaxed);
         let before_bytes = crate::memstat::RETIRED_BYTES.load(Ordering::Relaxed);
-        drop_waited(vec![retired_object(Owner(
-            Some(Marker(strict_dropped.clone())),
+        drop(retired_object(Owner(
+            Some(Marker(dropped.clone())),
             4096,
-        ))]);
+        )));
         assert!(
-            !strict_dropped.load(Ordering::SeqCst),
-            "strict mode must queue nested retired drops instead of dropping inline"
+            !dropped.load(Ordering::SeqCst),
+            "a nested retirement must take its own GPU completion snapshot"
         );
         assert!(crate::memstat::RETIRED_COUNT.load(Ordering::Relaxed) > before_count);
         assert!(crate::memstat::RETIRED_BYTES.load(Ordering::Relaxed) >= before_bytes + 4096);
@@ -1669,13 +1600,21 @@ impl HostList {
             host.wait_fence(value);
             return;
         }
-        // SAFETY: a private event, closed here.
-        unsafe {
-            if let Ok(event) = CreateEventW(None, false, false, None) {
-                wait_for_value(&self.fence, event, value);
-                let _ = windows::Win32::Foundation::CloseHandle(event);
+        // SAFETY: CreateEventW returns a newly owned handle on success.
+        let event = unsafe {
+            match CreateEventW(None, false, false, None) {
+                Ok(event) => Some(OwnedHandle::from_raw_handle(event.0)),
+                Err(error) => {
+                    tracing::warn!(%error, value, "cannot create list fence event: polling the fence");
+                    None
+                }
             }
-        }
+        };
+        wait_for_value(
+            &self.fence,
+            event.as_ref().map(|event| HANDLE(event.as_raw_handle())),
+            value,
+        );
     }
 }
 
@@ -2128,7 +2067,7 @@ impl Host {
             return;
         }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), target);
+        wait_for_value(&self.fence, Some(HANDLE(self.event.as_raw_handle())), target);
         self.reap_completed();
     }
 
@@ -2162,7 +2101,7 @@ impl Host {
         if unsafe { self.fence.GetCompletedValue() } < target {
             let waited = std::time::Instant::now();
             // The fence and event are ours; the caller holds `submitted`.
-            wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), target);
+            wait_for_value(&self.fence, Some(HANDLE(self.event.as_raw_handle())), target);
             submission_us(1, waited.elapsed().as_micros() as u64);
         }
         self.reap_completed();
@@ -4520,8 +4459,9 @@ impl Host {
             ..Default::default()
         };
         let use_gpu_upload = self.gpu_upload
-            && video_memory().is_none_or(|[(used, budget), _]| {
-                budget == 0 || used.saturating_add(size) < budget * 85 / 100
+            && video_memory().is_none_or(|[(used, budget), (_, non_local_budget)]| {
+                budget == 0
+                    || used.saturating_add(size) < crate::card::gpu_upload_ceiling(budget, non_local_budget)
             });
         let try_make = |heap_type: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| {
             let heap = D3D12_HEAP_PROPERTIES {
