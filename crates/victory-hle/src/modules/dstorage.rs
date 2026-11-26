@@ -900,9 +900,15 @@ fn execute(request: &Request, intermediate: &mut Vec<u8>) -> Result<(), HRESULT>
         source.as_ref()
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, source, out, tables)
+        Some(tables) => {
+            #[cfg(windows)]
+            if let Some(res) = victory_gpu::bcpack::try_decode(bc, source, out, tables) {
+                return res.map(|()| out.len()).map_err(|why| fail(INVALID_DATA, why));
+            }
+            bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+        }
         None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(

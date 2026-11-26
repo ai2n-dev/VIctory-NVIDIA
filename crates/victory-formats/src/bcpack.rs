@@ -249,6 +249,213 @@ impl Tables {
     }
 }
 
+/// Packed rANS model entry matching the HLSL `ModelData` structured buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuModelData {
+    /// Low 16 bits: bucket start (`base`); high 16 bits: bucket frequency.
+    pub bf: [u32; 10],
+    /// Bits 0..15: `rf`, bits 16..20: `rs`, bit 21: `rn`.
+    pub rfrsn: [u32; 10],
+}
+
+/// Constant lookup tables packed for the GPU BCPack compute decoders.
+pub struct GpuTables {
+    pub models: Vec<GpuModelData>,
+    pub bcn_pairs: Vec<u32>,
+    pub bcn_quads: Vec<u32>,
+    pub bcn_dict: Vec<u32>,
+    pub bc7_controls: Vec<u32>,
+    pub bc7_dict: Vec<u32>,
+    pub bc6_dict: Vec<u32>,
+}
+
+fn div_params(freq: u32, limit: u32) -> (u32, u32, u32) {
+    if limit <= freq {
+        return (0, 0, 0);
+    }
+    if freq.is_power_of_two() {
+        return (1 << 15, freq.trailing_zeros(), 0);
+    }
+    let max_rs = 31 - freq.leading_zeros();
+    for rs in [max_rs, max_rs.saturating_sub(1)] {
+        let num = 1u64 << (15 + rs);
+        let base = (num / u64::from(freq)) as u32;
+        for rn in [0u32, 1] {
+            for delta in 0..=3u32 {
+                let rf = base.saturating_add(delta);
+                if rf > 0xFFFF {
+                    continue;
+                }
+                let ok = (0..limit).all(|d| {
+                    ((u64::from(d + rn) * u64::from(rf)) >> (15 + rs)) == u64::from(d / freq)
+                });
+                if ok {
+                    return (rf, rs, rn);
+                }
+            }
+        }
+    }
+    // Exact fallback with rs = 0 when freq is small enough, else panic in debug.
+    unreachable!("no exact 16-bit rANS multiplier for freq={freq}, limit={limit}");
+}
+
+fn pack_pair_table(rank: &[u8; 64], out: &mut [u32]) {
+    for (dst, &v) in out.iter_mut().zip(rank.iter()) {
+        *dst = u32::from(v & 7) | (u32::from((v >> 4) & 7) << 8);
+    }
+}
+
+fn pack_quad_table(rank: &[u8; 256], out: &mut [u32]) {
+    for (dst, &v) in out.iter_mut().zip(rank.iter()) {
+        *dst = u32::from(v & 3)
+            | (u32::from((v >> 2) & 3) << 8)
+            | (u32::from((v >> 4) & 3) << 16)
+            | (u32::from((v >> 6) & 3) << 24);
+    }
+}
+
+fn pack_plain_dict(src: &[Plain], bc3_reorder: bool, bc1_shift: bool, out: &mut [u32]) {
+    for (k, st) in src.iter().take(DICTIONARY).enumerate() {
+        let base = k * 6;
+        let ep = if bc3_reorder {
+            [
+                st.ep[6], st.ep[7], st.ep[0], st.ep[1], st.ep[2], st.ep[3], st.ep[4], st.ep[5],
+            ]
+        } else if bc1_shift {
+            [
+                0, 0, st.ep[0], st.ep[1], st.ep[2], st.ep[3], st.ep[4], st.ep[5],
+            ]
+        } else {
+            st.ep
+        };
+        out[base] = u32::from(ep[0])
+            | (u32::from(ep[1]) << 8)
+            | (u32::from(ep[2]) << 16)
+            | (u32::from(ep[3]) << 24);
+        out[base + 1] = u32::from(ep[4])
+            | (u32::from(ep[5]) << 8)
+            | (u32::from(ep[6]) << 16)
+            | (u32::from(ep[7]) << 24);
+        let ix_shift = if bc1_shift { 16 } else { 0 };
+        for p in 0..32 {
+            let idx = if bc1_shift {
+                if p >= 16 { st.ix[p - 16] } else { 0 }
+            } else {
+                st.ix[p]
+            };
+            let _ = ix_shift;
+            out[base + 2 + (p >> 3)] |= u32::from(idx & 0xF) << ((p & 7) * 4);
+        }
+    }
+}
+
+impl Tables {
+    /// Packs the parsed BCPack tables for the GPU compute shaders.
+    pub fn gpu_tables(&self) -> GpuTables {
+        let mut models = Vec::with_capacity(144);
+        for m in 0..144usize {
+            let mut md = GpuModelData::default();
+            if m < MODELS {
+                let used = m / 16 + 2;
+                for k in 0..10 {
+                    if k < used {
+                        let base = self.start[m][k];
+                        let freq = self.freq[m][k];
+                        let limit = freq << k.saturating_sub(1);
+                        let (rf, rs, rn) = div_params(freq, limit);
+                        md.bf[k] = (base & 0xFFFF) | ((freq & 0xFFFF) << 16);
+                        md.rfrsn[k] = (rf & 0xFFFF) | ((rs & 31) << 16) | ((rn & 1) << 21);
+                    } else {
+                        md.bf[k] = 0xFFFF_FFFF;
+                    }
+                }
+            }
+            models.push(md);
+        }
+
+        let mut bcn_pairs = vec![0u32; 3 * 64];
+        pack_pair_table(&self.rank3a, &mut bcn_pairs[0..64]);
+        pack_pair_table(&self.rank4, &mut bcn_pairs[64..128]);
+        pack_pair_table(&self.rank5, &mut bcn_pairs[128..192]);
+
+        let mut bcn_quads = vec![0u32; 512];
+        pack_quad_table(&self.rank3c, &mut bcn_quads[0..256]);
+        pack_quad_table(&self.rank1, &mut bcn_quads[256..512]);
+
+        let mut bcn_dict = vec![0u32; 4 * DICTIONARY * 6];
+        let stride = DICTIONARY * 6;
+        pack_plain_dict(&self.bc3, true, false, &mut bcn_dict[0..stride]);
+        pack_plain_dict(&self.bc4, false, false, &mut bcn_dict[stride..2 * stride]);
+        pack_plain_dict(
+            &self.bc5,
+            false,
+            false,
+            &mut bcn_dict[2 * stride..3 * stride],
+        );
+        pack_plain_dict(
+            &self.bc1,
+            false,
+            true,
+            &mut bcn_dict[3 * stride..4 * stride],
+        );
+
+        let mut bc7_controls = vec![0u32; 512];
+        for (dst, &c) in bc7_controls.iter_mut().zip(self.ctrl7.iter()) {
+            if c != 0 {
+                let mode = u32::from(c & 7);
+                let rot = rotation(c) as u32;
+                let sel = u32::from((c >> 5) & 1);
+                let part = u32::from((c >> 8) & 63);
+                *dst = 0x8000_0000 | mode | (part << 8) | (rot << 16) | (sel << 24);
+            }
+        }
+
+        let mut bc7_dict = vec![0u32; DICTIONARY * 11];
+        for (k, (ep, ix)) in self.bc7.iter().take(DICTIONARY).enumerate() {
+            let base = k * 11;
+            bc7_dict[base] = u32::from((ep.ctrl & 0xFF) >> 6);
+            for row in 0..3 {
+                for col in 0..8 {
+                    let idx = row * 8 + col;
+                    let byte = u32::from((ep.rows[row][col] >> 8) & 0xFF);
+                    bc7_dict[base + 1 + (idx >> 2)] |= byte << ((idx & 3) * 8);
+                }
+            }
+            for set in 0..2 {
+                let sh = 4u8.saturating_sub(ix.bits[set]);
+                for p in 0..16 {
+                    let idx = set * 16 + p;
+                    let val = u32::from(((ix.ix[set][p] as u16) << sh) & 0xF);
+                    bc7_dict[base + 7 + (idx >> 3)] |= val << ((idx & 7) * 4);
+                }
+            }
+        }
+
+        let mut bc6_dict = vec![0u32; DICTIONARY * 15];
+        for (k, (ep, ix)) in self.bc6.iter().take(DICTIONARY).enumerate() {
+            let base = k * 15;
+            for (j, &val) in ep.e.as_flattened().iter().enumerate() {
+                bc6_dict[base + (j >> 1)] |= u32::from(val) << ((j & 1) * 16);
+            }
+            bc6_dict[base + 6] = u32::from(ix.mode);
+            for (p, &val) in ix.ix.iter().enumerate() {
+                bc6_dict[base + 7 + (p >> 1)] |= u32::from(val as u16) << ((p & 1) * 16);
+            }
+        }
+
+        GpuTables {
+            models,
+            bcn_pairs,
+            bcn_quads,
+            bcn_dict,
+            bc7_controls,
+            bc7_dict,
+            bc6_dict,
+        }
+    }
+}
+
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
@@ -1695,5 +1902,38 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    #[test]
+    fn gpu_tables_match_reference_rans_across_all_models_and_slots() {
+        let t = Tables::builtin().unwrap();
+        let gpu = t.gpu_tables();
+        assert_eq!(gpu.models.len(), 144);
+        for m in 0..MODELS as u8 {
+            let md = gpu.models[usize::from(m)];
+            let nseg = m / 16 + 2;
+            for slot in 1..1u32 << 16 {
+                let mut lo = 0usize;
+                let mut hi = usize::from(nseg);
+                for step in 0..4 {
+                    let mid = (lo + hi) >> 1;
+                    if (step == 0 || mid > lo) && slot >= (md.bf[mid] & 0xFFFF) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let base_s = md.bf[lo] & 0xFFFF;
+                let rf_s = md.rfrsn[lo] & 0xFFFF;
+                let rs_s = (md.rfrsn[lo] >> 16) & 31;
+                let rn_s = (md.rfrsn[lo] >> 21) & 1;
+                let base_x = (1u32 << lo) >> 1;
+                let dist = slot.wrapping_sub(base_s).wrapping_add(rn_s) & 0xFFFF;
+                let steps = ((dist * rf_s) >> 15) >> rs_s;
+                let sym = (base_x + steps) as u8;
+                let (want_sym, _) = reference_decode(&t, m, (1u32 << 24) | slot);
+                assert_eq!(sym, want_sym, "model={m} slot={slot} seg={lo}");
+            }
+        }
     }
 }

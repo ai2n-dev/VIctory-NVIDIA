@@ -61,6 +61,8 @@ mod primitive;
 #[cfg(windows)]
 mod port_cbv;
 pub mod query;
+#[cfg(windows)]
+pub mod bcpack;
 pub mod queue;
 mod readout;
 #[cfg(windows)]
