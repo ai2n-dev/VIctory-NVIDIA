@@ -696,6 +696,12 @@ impl State {
         if crate::host::host().is_none() {
             return;
         }
+        // D3D12 permits at most eight simultaneous render targets. An invalid
+        // title call must not replace the current valid binding snapshot.
+        if handles.len() > 8 {
+            once!(count = handles.len(), "too many render targets");
+            return;
+        }
         let mut targets = self.fixed.views.take().map_or_else(Vec::new, |(views, _)| views);
         targets.clear();
         targets.reserve(handles.len());
@@ -722,6 +728,9 @@ impl State {
         };
         self.targets.clear();
         self.fixed.candidate_views.clear();
+        // Valid snapshots have at most eight RTVs. Keep the resolved resources
+        // alongside their keys, without a heap allocation or another lookup.
+        let mut resolved = [None; 8];
         for record in &targets {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
@@ -729,6 +738,7 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            resolved[self.fixed.candidate_views.rtvs.len()] = Some(texture);
             self.fixed.candidate_views.rtvs.push(BoundTargetKey {
                 title_resource: record.resource as usize,
                 host_resource: texture.as_raw() as usize,
@@ -736,8 +746,11 @@ impl State {
             });
         }
         self.depth = 0;
+        let resolved_depth = depth.and_then(|record| {
+            crate::resource::host_resource(record.resource)
+        });
         if let Some(record) = depth
-            && let Some(texture) = crate::resource::host_resource(record.resource)
+            && let Some(texture) = resolved_depth
         {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
@@ -760,30 +773,26 @@ impl State {
         let rtvs = &mut self.fixed.rtv_scratch;
         rtvs.clear();
         rtvs.reserve(self.fixed.candidate_views.rtvs.len());
-        for (&key, record) in self
+        for (&key, texture) in self
             .fixed
             .candidate_views
             .rtvs
             .iter()
-            .zip(targets.iter().filter(|r| crate::resource::host_resource(r.resource).is_some()))
+            .zip(resolved.into_iter().flatten())
         {
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
-                continue;
-            };
             let desc = key
                 .view_words
                 .and_then(crate::descriptor::RtvRecord::words_as);
             rtvs.push(host.rtv(texture, desc.as_ref()));
         }
-        let dsv = depth.and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+        let dsv = resolved_depth.map(|texture| {
             let desc = self
                 .fixed
                 .candidate_views
                 .dsv
                 .and_then(|key| key.view_words)
                 .and_then(crate::descriptor::RtvRecord::words_as);
-            Some(host.dsv(texture, desc.as_ref()))
+            host.dsv(texture, desc.as_ref())
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -2607,6 +2616,15 @@ mod group_limit_tests {
         let mut diff_dsv = first.clone();
         diff_dsv.dsv = None;
         assert!(!diff_dsv.matches(Some(&first)));
+
+        // The number and order of RTVs are part of the binding, even when
+        // their underlying resources are already known to the list.
+        let mut more = first.clone();
+        more.rtvs.push(dsv0);
+        assert!(!more.matches(Some(&first)));
+        let ordered = more.clone();
+        more.rtvs.swap(0, 1);
+        assert!(!more.matches(Some(&ordered)));
     }
 
     #[test]
