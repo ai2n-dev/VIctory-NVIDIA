@@ -1,7 +1,7 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content, translator sources,
+//! resource ABI and translation settings. Rebuilding unrelated components
+//! preserves cache hits. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -36,45 +36,67 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// Stable cache identity: the source fingerprint, encoding ABI and settings.
+/// The legacy diagnostic override is retained for explicitly matched old
+/// executables only. Normal builds never hash the whole EXE.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        // Diagnostics (`VICTORY_SHADER_BUILD_OF=<executable>`): the entries
-        // of another build, for a build whose translation is the same (a
-        // change elsewhere), which then need not be made again.
-        let other = std::env::var_os("VICTORY_SHADER_BUILD_OF")
-            .filter(|_| cfg!(feature = "diagnostics"))
-            .map(std::path::PathBuf::from);
-        if let Some(other) = &other {
-            tracing::warn!(of = %other.display(), "shader cache entries of another build are used");
-        }
-        let exe = other.map_or_else(std::env::current_exe, Ok).and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-            tracing::warn!(
-                limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
-            );
-        }
-        match exe {
-            Ok(mut bytes) => {
+        let rays = victory_shader::emit::rays();
+        if let Some(other) = std::env::var_os("VICTORY_SHADER_BUILD_OF")
+            .filter(|_| cfg!(feature = "diagnostics"))
+        {
+            let other = PathBuf::from(other);
+            if let Ok(mut bytes) = std::fs::read(&other) {
+                tracing::warn!(of = %other.display(), "explicit legacy shader cache override; translation must match");
                 bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.push(victory_shader::emit::rays().into());
-                *blake3::hash(&bytes).as_bytes()
+                bytes.push(rays.into());
+                return *blake3::hash(&bytes).as_bytes();
             }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
+            tracing::warn!(of = %other.display(), "legacy shader cache override unreadable; using source identity");
+        }
+        // Effective values for target, wave mode, heap clamp, optimisation
+        // passes and raw CBVs still join key() below. Diagnostic patches
+        // remain scoped to the matching containers in host_shader().
+        let mut settings = Vec::new();
+        for name in victory_shader::TRANSLATOR_SWITCHES.split(',') {
+            if name.is_empty() || matches!(name,
+                "VICTORY_SHADER_LOOP_LIMIT" | "VICTORY_RAYS" | "VICTORY_WAVE64_MODE"
+                | "VICTORY_SHADER_OPT" | "VICTORY_PORT_CBV" | "VICTORY_SHADER_PATCH"
+                | "VICTORY_WHY")
+            {
+                continue;
+            }
+            if let Some(value) = std::env::var_os(name) {
+                settings.push((name, value));
             }
         }
+        source_identity(victory_shader::TRANSLATOR_SOURCE_HASH, limit, rays, &settings)
     })
+}
+
+fn source_identity(
+    source: &str,
+    limit: u32,
+    rays: bool,
+    settings: &[(&str, std::ffi::OsString)],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"VIctory-NVIDIA shader source identity v1");
+    h.update(MAGIC);
+    let mut field = |bytes: &[u8]| {
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    field(source.as_bytes());
+    field(&limit.to_le_bytes());
+    field(&[rays.into()]);
+    for (name, value) in settings {
+        field(name.as_bytes());
+        field(value.as_encoded_bytes());
+    }
+    *h.finalize().as_bytes()
 }
 
 /// The translation of a console shader container for a host that runs
@@ -393,6 +415,37 @@ mod tests {
     }
 
     #[test]
+    fn source_identity_survives_unrelated_executable_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path().join("shaders")).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let first = source_identity("translator-a", 100, false, &[]);
+        assert_eq!(cached(&cache, &first, b"synthetic", translate), Ok(shader()));
+        // Change executable bytes without changing any translation input.
+        let exe = dir.path().join("synthetic.exe");
+        std::fs::write(&exe, b"build one").unwrap();
+        std::fs::write(&exe, b"build two").unwrap();
+        let second = source_identity("translator-a", 100, false, &[]);
+        assert_eq!(first, second);
+        assert_eq!(cached(&cache, &second, b"synthetic", translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+        for changed in [
+            source_identity("translator-b", 100, false, &[]),
+            source_identity("translator-a", 101, false, &[]),
+            source_identity("translator-a", 100, true, &[]),
+            source_identity("translator-a", 100, false, &[("VICTORY_BUILT_BOUNDS", "0".into())]),
+        ] {
+            assert_ne!(first, changed);
+            assert_eq!(cached(&cache, &changed, b"synthetic", translate), Ok(shader()));
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
     fn keys_tell_hosts_wave_sizes_apart() {
         let build = [7u8; 32];
         let nvidia = Target {
@@ -427,5 +480,8 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        let mut foreign = bytes.clone();
+        foreign[..4].copy_from_slice(b"VSH1");
+        assert_eq!(decode(&foreign), None);
     }
 }

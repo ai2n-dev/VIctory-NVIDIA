@@ -6,6 +6,13 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+/// Content fingerprint of the translator, not of its containing executable.
+/// Changes to an unrelated HLE/GPU/UI component do not invalidate this.
+pub const TRANSLATOR_SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
+
+/// Literal VICTORY_* switches found in the translator's source.
+pub const TRANSLATOR_SWITCHES: &str = env!("VICTORY_SHADER_SWITCHES");
+
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
