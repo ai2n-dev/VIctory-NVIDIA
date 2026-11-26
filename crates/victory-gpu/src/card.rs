@@ -1365,7 +1365,8 @@ mod tests {
                 std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec();
             assert_eq!(differs_2, vec![0, 0, 1, 0], "only page 2 should differ");
             let written_2 = engine.finish_back(&host, plan2, &mut submitted);
-            assert_eq!(written_2, 4, "tight dirty span should write exactly 4 GPU bytes");
+            // The initial pattern already contains 0xBE at the third byte.
+            assert_eq!(written_2, 3, "copy-back counts only changed bytes");
             assert_eq!(&title[2 * PAGE + 128..2 * PAGE + 132], &gpu_bytes);
             assert_eq!(&title[2 * PAGE + 256..2 * PAGE + 260], &[0x11, 0x22, 0x33, 0x44]);
 
