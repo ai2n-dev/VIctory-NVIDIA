@@ -236,10 +236,14 @@ mod tests {
 
     #[test]
     fn readback_span_includes_last_row_padding_and_checks_overflow() {
-        let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-        f.Offset = 512;
-        f.Footprint.RowPitch = 256;
-        f.Footprint.Depth = 3;
+        let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 512,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                RowPitch: 256,
+                Depth: 3,
+                ..Default::default()
+            },
+        };
         assert_eq!(footprint_span(&f, 5), Some((1280, 3840, 4352)));
         assert_eq!(footprint_span(&f, 0), None);
         f.Offset = u64::MAX;
