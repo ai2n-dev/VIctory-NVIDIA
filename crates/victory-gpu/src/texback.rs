@@ -11,6 +11,7 @@
 //! buffer when closing, and once the list has run the texels are tiled back into
 //! the texture's title memory in the console's layout.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -66,6 +67,43 @@ pub(crate) struct Back {
     size: usize,
 }
 
+/// The padded linear range that land() passes to the layout walker.
+fn footprint_span(
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    rows: u32,
+) -> Option<(usize, usize, usize)> {
+    let pitch = footprint.Footprint.RowPitch as usize;
+    let depth = footprint.Footprint.Depth as usize;
+    if pitch == 0 || rows == 0 || depth == 0 {
+        return None;
+    }
+    let depth_pitch = pitch.checked_mul(rows as usize)?;
+    let len = depth_pitch.checked_mul(depth)?;
+    let end = usize::try_from(footprint.Offset).ok()?.checked_add(len)?;
+    Some((depth_pitch, len, end))
+}
+
+const SCRATCH_KEEP: usize = 8 << 20;
+thread_local! {
+    static TILED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_tiled_scratch<R>(
+    scratch: &mut Vec<u8>,
+    size: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> R {
+    if scratch.len() < size {
+        scratch.resize(size, 0);
+    }
+    let result = f(&mut scratch[..size]);
+    // Large, one-off allocations must not become permanent commit.
+    if scratch.capacity() > SCRATCH_KEEP {
+        *scratch = Vec::new();
+    }
+    result
+}
+
 /// Records into `list` the copy of `texture` (title resource `resource`'s
 /// host copy, already in `COPY_SOURCE` state) into a readback buffer.
 pub(crate) fn record(
@@ -78,7 +116,12 @@ pub(crate) fn record(
     // SAFETY: `texture` is a live D3D12 texture resource.
     let desc = unsafe { texture.GetDesc() };
     let mips = u32::from(desc.MipLevels.max(1));
-    let subresources = mips * u32::from(desc.DepthOrArraySize.max(1));
+    let slices = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(desc.DepthOrArraySize.max(1))
+    };
+    let subresources = mips.checked_mul(slices)?;
     let n = subresources as usize;
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
     let mut rows = vec![0u32; n];
@@ -96,7 +139,20 @@ pub(crate) fn record(
             Some(&mut total),
         )
     };
+    // Adapt cool_fox 67028e21 (GPL-3.0): GetCopyableFootprints may
+    // omit the padding after the last row from its total. Our linear
+    // slices include that padding, so the allocation must cover it.
+    if total == u64::MAX {
+        return None;
+    }
+    for (footprint, &rows) in footprints.iter().zip(&rows) {
+        let (_, _, end) = footprint_span(footprint, rows)?;
+        total = total.max(end as u64);
+    }
     let (buffer, mapped) = host.readback_buffer(total)?;
+    if mapped.is_null() {
+        return None;
+    }
     crate::host::name(&buffer, || format!("texback {size:#x}"));
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -137,39 +193,80 @@ pub(crate) static COPIED: AtomicU64 = AtomicU64::new(0);
 /// Once the list that recorded `back` has run: tiles its texels into the
 /// texture's title memory in the console's layout.
 pub(crate) fn land(back: &Back) {
-    let mut tiled = vec![0u8; back.size];
-    // Preserve title-memory bytes not covered by the copied subresources.
-    crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
     let data = back.mapped as *const u8;
     if data.is_null() {
         return;
     }
-    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
-        let f = footprint.Footprint;
-        let pitch = f.RowPitch as usize;
-        let len = pitch * rows as usize * f.Depth as usize;
-        // SAFETY: the persistently mapped readback buffer covers each footprint after GPU completion.
-        let linear =
-            unsafe { std::slice::from_raw_parts(data.add(footprint.Offset as usize), len) };
-        if let Err(e) = back
-            .layout
-            .tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize)
-        {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled")
-            });
-            return;
-        }
-    }
-    crate::watch::writing(back.at, back.size);
-    crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
+    TILED.with_borrow_mut(|scratch| {
+        with_tiled_scratch(scratch, back.size, |tiled| {
+            // copy_mapped writes every byte, including zeros for unreadable
+            // pages. The diagnostic no-copy mode must keep its old zero input.
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::mode() == 2 {
+                tiled.fill(0);
+            }
+            crate::host::copy_mapped(tiled.as_mut_ptr(), back.at as *const u8, back.size, false);
+            for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
+                let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+                let Some((depth_pitch, len, _)) = footprint_span(footprint, rows) else {
+                    return;
+                };
+                let pitch = footprint.Footprint.RowPitch as usize;
+                // SAFETY: record allocated the complete padded span and the
+                // list has completed before landing.
+                let linear =
+                    unsafe { std::slice::from_raw_parts(data.add(footprint.Offset as usize), len) };
+                if let Err(e) = back.layout.tile(tiled, mip, slice, linear, pitch, depth_pitch) {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled")
+                    });
+                    return;
+                }
+            }
+            crate::watch::writing(back.at, back.size);
+            crate::host::copy_mapped(back.at as *mut u8, tiled.as_ptr(), back.size, true);
+        });
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readback_span_includes_last_row_padding_and_checks_overflow() {
+        let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        f.Offset = 512;
+        f.Footprint.RowPitch = 256;
+        f.Footprint.Depth = 3;
+        assert_eq!(footprint_span(&f, 5), Some((1280, 3840, 4352)));
+        assert_eq!(footprint_span(&f, 0), None);
+        f.Offset = u64::MAX;
+        assert_eq!(footprint_span(&f, 5), None);
+        f.Offset = 0;
+        f.Footprint.RowPitch = u32::MAX;
+        f.Footprint.Depth = u32::MAX;
+        assert_eq!(footprint_span(&f, u32::MAX), None);
+    }
+
+    #[test]
+    fn tiled_scratch_reuses_storage_and_releases_large_allocations() {
+        let mut scratch = Vec::new();
+        with_tiled_scratch(&mut scratch, 4096, |b| b.fill(0x5a));
+        let ptr = scratch.as_ptr();
+        with_tiled_scratch(&mut scratch, 1024, |b| {
+            assert_eq!(b, &[0x5a; 1024]);
+            b.fill(0xa5);
+        });
+        assert_eq!(scratch.as_ptr(), ptr);
+        assert_eq!(scratch.len(), 4096);
+        assert_eq!(scratch[1024], 0x5a);
+        with_tiled_scratch(&mut scratch, SCRATCH_KEEP + 1, |b| {
+            assert_eq!(b.len(), SCRATCH_KEEP + 1);
+        });
+        assert_eq!(scratch.capacity(), 0);
+    }
 
     #[test]
     fn parse_kinds_parses_defaults_and_disable() {
