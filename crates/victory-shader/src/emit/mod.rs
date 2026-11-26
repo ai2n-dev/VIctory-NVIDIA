@@ -125,6 +125,7 @@ pub use sampler::StaticSampler;
 pub use shader::{
     LAUNCH_SPACE, MESH_PAYLOAD_BYTES, ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE,
 };
+pub use shader::constants_raw;
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -3712,5 +3713,102 @@ mod pr306_tests {
         let ps = emit_synthetic(&[(FourCC::OSG1, &osg1)], &native).unwrap();
         #[cfg(windows)]
         validate_if_available(&ps.dxil);
+    }
+
+    #[test]
+    fn table_and_root_constant_buffers_translate_to_raw_views() {
+        let words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (table CBV)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (table UAV)
+            0xF428_0404,
+            0xFA00_0010, // s_buffer_load_dwordx4 s[16:19], s[8:11], 0x10
+            0xF400_0500,
+            0xFA00_0004, // s_load_dword s20, s[0:1], 0x4 (root CBV)
+            0x7E02_0210, // v_mov_b32 v1, s16
+            0xE070_0000,
+            0x8003_0180, // buffer_store_dword v1, off, s[12:15], 0
+            0x7E02_0214, // v_mov_b32 v1, s20
+            0xE070_0004,
+            0x8003_0180, // buffer_store_dword v1, off, s[12:15], 0 offset:4
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::native::RootParam {
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Cbv,
+                    root: RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 2,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Cbv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let lower_with = |raw: bool| {
+            shader::CONSTANTS_RAW_HERE.set(Some(raw));
+            let out = emit_synthetic(&[], &native);
+            shader::CONSTANTS_RAW_HERE.set(None);
+            out.unwrap()
+        };
+        let legacy = lower_with(false);
+        let raw = lower_with(true);
+        assert_ne!(legacy.dxil, raw.dxil);
+        assert_eq!(legacy.root_cbvs, vec![0]);
+        assert!(legacy.root_srvs.is_empty());
+        assert!(raw.root_cbvs.is_empty());
+        assert_eq!(raw.root_srvs, vec![0]);
+        #[cfg(windows)]
+        validate_if_available(&raw.dxil);
     }
 }

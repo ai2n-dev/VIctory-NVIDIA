@@ -1660,6 +1660,36 @@ impl State {
                 };
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if crate::port_cbv::on() {
+                            if crate::port_cbv::in_place_on() {
+                                match crate::shadow::find(address, u64::from(size))
+                                    .filter(|s| s.is_direct())
+                                {
+                                    Some(shadow) => {
+                                        if host.constant_raw_at(
+                                            index,
+                                            &shadow.buffer,
+                                            shadow.gpu(address),
+                                            size,
+                                        ) {
+                                            crate::port_cbv::in_place(size);
+                                            continue;
+                                        }
+                                        crate::port_cbv::copied(false);
+                                    }
+                                    None => crate::port_cbv::copied(true),
+                                }
+                            }
+                            let Some((buffer, gpu, to)) = list.scratch_buffer(u64::from(size)) else {
+                                host.make_null_kind(index, ResourceType::Cbv, 4);
+                                continue;
+                            };
+                            list.defer_fill(to, address as *const u8, size as usize);
+                            if !host.constant_raw_at(index, &buffer, gpu, size) {
+                                host.make_null_kind(index, ResourceType::Cbv, 4);
+                            }
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null_kind(index, ResourceType::Cbv, 4);
                             continue;

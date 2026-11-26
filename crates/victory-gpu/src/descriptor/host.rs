@@ -1162,6 +1162,11 @@ impl HostHeap {
         let at = self.cpu(index);
         match kind {
             victory_shader::ResourceType::Cbv => {
+                if crate::port_cbv::on() {
+                    null_buffer_view(at);
+                    self.keep(index, None);
+                    return;
+                }
                 if let Some(host) = host() {
                     let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
                     // SAFETY: a slot of our heap; zero location makes a null CBV.
@@ -1285,6 +1290,36 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+    }
+
+    /// Opt-in (`VICTORY_PORT_CBV=1`): makes dynamic slot `index` a raw SRV
+    /// over `size` bytes at `gpu` of `buffer`.
+    pub(crate) fn constant_raw_at(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        gpu: u64,
+        size: u32,
+    ) -> bool {
+        let null_slot = self.reserved_null_slot();
+        if let Err(err) =
+            crate::preflight::validate_descriptor_slot(index, self.count + self.spare, null_slot)
+        {
+            tracing::warn!(%err, "refused out-of-bounds raw constant descriptor write");
+            return false;
+        }
+        let Some(host) = host() else { return false };
+        let Some(raw) = raw_cbv_desc(buffer, gpu, size) else {
+            return false;
+        };
+        // SAFETY: `index` is validated and `raw` lies within `buffer`.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&raw), self.cpu(index));
+        }
+        self.keep(index, Some(buffer.clone()));
+        self.set_stride(index, 0);
+        true
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -1542,10 +1577,20 @@ impl HostHeap {
     ) -> Option<ID3D12Resource> {
         let host = host()?;
         let aligned = capped.next_multiple_of(256);
-        if address.is_multiple_of(256)
+        let raw_cbv = crate::port_cbv::on();
+        let place_cbv = !raw_cbv || crate::port_cbv::in_place_on();
+        if place_cbv
+            && (raw_cbv || address.is_multiple_of(256))
             && let Some(shadow) = crate::shadow::find(address, u64::from(capped))
-            && shadow.gpu(address).is_multiple_of(256)
+            && (raw_cbv || shadow.gpu(address).is_multiple_of(256))
         {
+            let gpu = shadow.gpu(address);
+            let raw_desc = if raw_cbv {
+                raw_cbv_desc(&shadow.buffer, gpu, capped)
+            } else {
+                None
+            };
+            if !raw_cbv || raw_desc.is_some() {
             let bounce_active = self
                 .bindless
                 .lock()
@@ -1556,15 +1601,26 @@ impl HostHeap {
             {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
                 if made[index as usize] != key || bounce_active {
-                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                        BufferLocation: shadow.gpu(address),
-                        SizeInBytes: aligned,
-                    };
-                    // SAFETY: a slot of our heap; `shadow` covers the range.
-                    unsafe {
-                        host.device
-                            .CreateConstantBufferView(Some(&desc), self.cpu(index))
-                    };
+                    if let Some(raw) = raw_desc {
+                        // SAFETY: a slot of our heap; `raw` lies in `shadow.buffer`.
+                        unsafe {
+                            host.device.CreateShaderResourceView(
+                                &shadow.buffer,
+                                Some(&raw),
+                                self.cpu(index),
+                            );
+                        }
+                    } else {
+                        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                            BufferLocation: gpu,
+                            SizeInBytes: aligned,
+                        };
+                        // SAFETY: a slot of our heap; `shadow` covers the range.
+                        unsafe {
+                            host.device
+                                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+                        };
+                    }
                     made[index as usize] = key;
                     self.keep(index, Some(shadow.buffer.clone()));
                 }
@@ -1584,21 +1640,32 @@ impl HostHeap {
                 reads.push((shadow.clone(), address as usize, len));
             }
             return Some(shadow.buffer.clone());
+            }
         }
 
         let (gpu, cpu, res, was_active) = self.ensure_cbv_bounce(index, aligned)?;
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             if made[index as usize] != key || !was_active {
-                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                    BufferLocation: gpu,
-                    SizeInBytes: aligned,
-                };
-                // SAFETY: a slot of our heap; `gpu` is 256-byte aligned in `res`.
-                unsafe {
-                    host.device
-                        .CreateConstantBufferView(Some(&desc), self.cpu(index))
-                };
+                if raw_cbv
+                    && let Some(raw) = raw_cbv_desc(&res, gpu, capped)
+                {
+                    // SAFETY: a slot of our heap; `raw` lies in `res`.
+                    unsafe {
+                        host.device
+                            .CreateShaderResourceView(&res, Some(&raw), self.cpu(index));
+                    }
+                } else {
+                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                        BufferLocation: gpu,
+                        SizeInBytes: aligned,
+                    };
+                    // SAFETY: a slot of our heap; `gpu` is 256-byte aligned in `res`.
+                    unsafe {
+                        host.device
+                            .CreateConstantBufferView(Some(&desc), self.cpu(index))
+                    };
+                }
                 made[index as usize] = key;
                 self.keep(index, Some(res.clone()));
             }
@@ -2871,6 +2938,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let capped = size.min(65_536);
             let shadow = crate::shadow::find(address, u64::from(capped))?;
             let gpu = shadow.gpu(address);
+            if crate::port_cbv::on() {
+                let raw = raw_cbv_desc(&shadow.buffer, gpu, capped)?;
+                // SAFETY: a slot of our heap; `raw` lies in `shadow.buffer`.
+                unsafe { device.CreateShaderResourceView(&shadow.buffer, Some(&raw), at) };
+                return Some(Some(shadow.buffer.clone()));
+            }
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -3162,6 +3235,37 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
+/// Raw SRV covering `size` bytes (clamped to 64 KiB, 4-byte rounded) at
+/// `gpu` within `buffer` when 16-byte aligned.
+fn raw_cbv_desc(
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    size: u32,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    // SAFETY: `buffer` is a live D3D12 resource.
+    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    let offset = gpu
+        .checked_sub(base)
+        .filter(|&o| o < width && crate::port_cbv::raw_ok(o))?;
+    let capped = u64::from(size.min(65_536).next_multiple_of(256)).min(width - offset) & !3;
+    if capped == 0 {
+        return None;
+    }
+    Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: offset / 4,
+                NumElements: (capped / 4) as u32,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    })
+}
+
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {

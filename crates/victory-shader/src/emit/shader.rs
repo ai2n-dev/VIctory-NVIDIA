@@ -30,6 +30,26 @@ pub const STRIDE_SPACE: u32 = 2;
 /// (`RTAccelerationStructure` for DXR Tier 1.1 inline ray queries).
 pub const SLOT_TLAS: u8 = 252;
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override for [`constants_raw`] in isolated unit tests.
+    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Opt-in (`VICTORY_PORT_CBV=1`, off by default): lower constant buffers as raw
+/// buffer SRVs (table/heap CBVs as raw views, root CBVs as root SRVs) so the
+/// host can bind 16-byte-aligned title buffers directly without copying.
+/// Adapted from AvatarManz 3920dc26 (GPL-3.0).
+pub fn constants_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CBV").is_some_and(|v| v == "1"))
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;

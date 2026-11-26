@@ -120,6 +120,9 @@ fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
         h.update(b"clean-up passes");
         h.update(&passes.to_le_bytes());
     }
+    if victory_shader::emit::constants_raw() {
+        h.update(b"VICTORY_PORT_CBV=1");
+    }
     *h.finalize().as_bytes()
 }
 

@@ -3681,6 +3681,11 @@ impl HostList {
         self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
     }
 
+    /// Same as [`HostList::scratch`], returning the owning buffer as well.
+    pub(crate) fn scratch_buffer(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(len, 256, |buffer, _, gpu, data| (buffer.clone(), gpu, data))
+    }
+
     /// `len` bytes of upload memory at a multiple of `align` until the list
     /// is reset, handed to `f` with the buffer, the offset in it, the host GPU
     /// address and the CPU pointer.
@@ -4983,6 +4988,7 @@ impl Meter {
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
+            crate::port_cbv::log(frames);
             #[cfg(feature = "diagnostics")]
             {
                 let [waits, wait_us, bytes, copies] = crate::card::take_fetch_stats();

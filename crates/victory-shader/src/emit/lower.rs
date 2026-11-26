@@ -5313,12 +5313,6 @@ impl<'a> Lower<'a> {
                 };
                 (u_bit, stride)
             });
-        let props = match raw {
-            Some((u_bit, 0)) => (11 | u_bit, 0),
-            Some((u_bit, stride)) => (12 | u_bit, stride),
-            None => (13, 0x1_0000),
-        };
-        let h = self.handle(site, src, false, props)?;
         let constant = match addr {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
@@ -5327,7 +5321,15 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        let words = self.view_dwords(h, raw.map(|(_, s)| s), addr, constant, count);
+        let (h, view_raw) = if let Some((u_bit, stride)) = raw {
+            let props = if stride == 0 { (11 | u_bit, 0) } else { (12 | u_bit, stride) };
+            (self.handle(site, src, false, props)?, Some(stride))
+        } else if let Some(h) = self.constants_raw_handle(site, src)? {
+            (h, Some(0))
+        } else {
+            (self.handle(site, src, false, (13, 0x1_0000))?, None)
+        };
+        let words = self.view_dwords(h, view_raw, addr, constant, count);
         for (k, x) in words.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
@@ -5439,7 +5441,8 @@ impl<'a> Lower<'a> {
         let srv = self
             .used_kind(&src)
             .is_some_and(|u| u.kind == ResourceType::Srv);
-        let props = if srv { (11, 0) } else { (13, 0x1_0000) };
+        let raw = srv || self.constants_raw_root(&src);
+        let props = if raw { (11, 0) } else { (13, 0x1_0000) };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
@@ -5447,7 +5450,7 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
         let constant = a.dynamic.is_none().then_some(a.offset);
-        let words = self.view_dwords(h, srv.then_some(0), addr, constant, count);
+        let words = self.view_dwords(h, raw.then_some(0), addr, constant, count);
         for (k, x) in words.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
@@ -5951,6 +5954,52 @@ impl<'a> Lower<'a> {
         x
     }
 
+    fn constants_raw_root(&self, src: &Source) -> bool {
+        if !super::shader::constants_raw() {
+            return false;
+        }
+        let Source::Built { address, .. } = src else {
+            return false;
+        };
+        let Some(rp) = self.x.native.layout.get(address.param) else {
+            return false;
+        };
+        let kind = self
+            .x
+            .native
+            .used
+            .iter()
+            .find(|u| u.user_data == rp.user_data)
+            .map(|u| u.kind);
+        rp.root == RootType::Descriptor && matches!(kind, Some(ResourceType::Cbv) | None)
+    }
+
+    fn constants_raw_handle(&mut self, site: Site, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constants_raw() {
+            return Ok(None);
+        }
+        if matches!(src, Source::Built { .. }) {
+            return if self.constants_raw_root(src) {
+                Ok(Some(self.handle(site, src, false, (11, 0))?))
+            } else {
+                Ok(None)
+            };
+        }
+        let x = self.x;
+        let scalar = &self.scalar;
+        let through_heap = src.leaves().iter().all(|leaf| match leaf {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => scalar
+                .get(load)
+                .and_then(|a| x.native.layout.get(a.param))
+                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap)),
+            _ => false,
+        });
+        if !through_heap {
+            return Ok(None);
+        }
+        Ok(Some(self.handle(site, src, false, (11, 0))?))
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -6430,6 +6479,11 @@ impl<'a> Lower<'a> {
                 match (rp.root, kind, props.0) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
+                    }
+                    (RootType::Descriptor, Some(ResourceType::Cbv) | None, 11)
+                        if super::shader::constants_raw() =>
+                    {
+                        Ok(self.s.root_srv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         let h = self.s.root_srv_handle(rp.slot);
@@ -8382,7 +8436,11 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let raw_h = self.constants_raw_handle(site, src)?;
+            let h = match raw_h {
+                Some(h) => h,
+                None => self.handle(site, src, false, (13, 0x1_0000))?,
+            };
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -8395,14 +8453,24 @@ impl<'a> Lower<'a> {
                 return Err("a buffer result");
             };
             if let Some((width, signed, half)) = sub_load {
-                let x = self.read_subword(byte, width, signed, |l, at| Ok(l.cbuffer_dword(h, at)))?;
+                let x = self.read_subword(byte, width, signed, |l, at| {
+                    if raw_h.is_some() {
+                        Ok(l.view_dwords(h, Some(0), at, None, 1)[0])
+                    } else {
+                        Ok(l.cbuffer_dword(h, at))
+                    }
+                })?;
                 self.write_subword_result(inst, reg, x, half, guard)?;
                 return Ok(());
             }
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = if raw_h.is_some() {
+                    self.view_dwords(h, Some(0), a, None, 1)[0]
+                } else {
+                    self.cbuffer_dword(h, a)
+                };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

@@ -58,6 +58,8 @@ pub mod pipeline;
 pub mod preflight;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod port_cbv;
 pub mod query;
 pub mod queue;
 mod readout;
