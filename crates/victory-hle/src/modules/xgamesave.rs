@@ -178,14 +178,19 @@ fn parse_manifest(bytes: &[u8]) -> Option<Vec<String>> {
 }
 
 /// The container's newest committed version, if any. Removes what a crash
-/// left: unfinished versions and older ones.
+/// left: unfinished versions and older ones (what cannot be removed now is
+/// left for a later call).
 fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     let mut committed = Vec::new();
     for entry in std::fs::read_dir(dir)?.flatten() {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            // As far as it goes, like the older versions below: an
+            // unfinished version is never read.
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
             committed.push(n);
         }
@@ -1003,6 +1008,31 @@ mod tests {
         let blobs = read(&c, None).unwrap();
         let text = |(n, d): (String, Vec<u8>)| (n, String::from_utf8(d).unwrap());
         Some((display, blobs.into_iter().map(text).collect()))
+    }
+
+    /// A file of an unfinished version held by another program (a virus
+    /// scanner) keeps that version from being removed. The container is
+    /// still the newest committed version and the saves after it work.
+    #[test]
+    fn an_unfinished_version_that_cannot_be_removed_does_not_fail_the_container() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = container_dir(root.path(), "Slot");
+        assert_eq!(update(root.path(), "one", &[("a", Some("first a"))]), S_OK);
+        let unfinished = dir.join("v9.new");
+        std::fs::create_dir(&unfinished).unwrap();
+        let held_path = unfinished.join("blob");
+        std::fs::write(&held_path, b"half a save").unwrap();
+        // Opened with no sharing: nobody else can delete it while it is held.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&held_path).unwrap();
+        assert_eq!(state(root.path()), Some(("one".into(), vec![("a".into(), "first a".into())])));
+        assert_eq!(update(root.path(), "two", &[("a", Some("second a"))]), S_OK);
+        assert_eq!(state(root.path()), Some(("two".into(), vec![("a".into(), "second a".into())])));
+        assert!(held_path.exists(), "the held file is still there");
+        // Let go of: the next look at the container removes what was left.
+        drop(held);
+        assert_eq!(state(root.path()), Some(("two".into(), vec![("a".into(), "second a".into())])));
+        assert!(!unfinished.exists());
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
