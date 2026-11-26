@@ -6249,14 +6249,27 @@ impl<'a> Lower<'a> {
             let b40 = k(self, 127 + 23 - 40);
             bias = self.s.m.select(c, small, b40, bias);
         }
-        // Bits to drop: the bit length less 24, 1 to 8.
-        let mut shift = one;
-        for bit in 25..32 {
-            let at = k(self, 1 << bit);
-            let ge = self.s.m.cmp(c, pred::IUGE, q, at);
-            let add = self.s.m.select(c, ge, one, zero);
-            shift = self.s.m.bin(c, Bin::Add, shift, add);
-        }
+        // Bits to drop: the bit length less 24, clamped to 1..8.
+        // Only the high byte matters. Binary narrowing replaces seven
+        // compare/select/add triples, keeping the rounding integer-only.
+        let k24 = k(self, 24);
+        let k4 = k(self, 4);
+        let k2 = k(self, 2);
+        let k16 = k(self, 16);
+        let top = self.s.m.bin(c, Bin::LShr, q, k24);
+        let ge16 = self.s.m.cmp(c, pred::IUGE, top, k16);
+        let upper = self.s.m.bin(c, Bin::LShr, top, k4);
+        let top = self.s.m.select(c, ge16, upper, top);
+        let mut shift = self.s.m.select(c, ge16, k4, zero);
+        let ge4 = self.s.m.cmp(c, pred::IUGE, top, k4);
+        let upper = self.s.m.bin(c, Bin::LShr, top, k2);
+        let top = self.s.m.select(c, ge4, upper, top);
+        let add = self.s.m.select(c, ge4, k2, zero);
+        shift = self.s.m.bin(c, Bin::Add, shift, add);
+        let ge2 = self.s.m.cmp(c, pred::IUGE, top, k2);
+        let add = self.s.m.select(c, ge2, one, zero);
+        shift = self.s.m.bin(c, Bin::Add, shift, add);
+        let shift = self.s.m.bin(c, Bin::Add, shift, one);
         let mant = self.s.m.bin(c, Bin::LShr, q, shift);
         let below = self.s.m.bin(c, Bin::Sub, shift, one);
         let half = self.s.m.bin(c, Bin::LShr, q, below);
@@ -6271,7 +6284,6 @@ impl<'a> Lower<'a> {
         let up = self.s.m.bin(c, Bin::And, half, tie);
         let mant = self.s.m.bin(c, Bin::Add, mant, up);
         // Rounding up to 2^24 moves to the next exponent.
-        let k24 = k(self, 24);
         let carry = self.s.m.bin(c, Bin::LShr, mant, k24);
         let mant = self.s.m.bin(c, Bin::LShr, mant, carry);
         let e = self.s.m.bin(c, Bin::Add, bias, shift);
