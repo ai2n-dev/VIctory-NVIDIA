@@ -71,6 +71,15 @@ pub(crate) struct HostHeap {
 /// The dword of the stride table the element counts start at.
 const COUNTS_AT: u32 = victory_shader::emit::OWN_SLOTS;
 
+/// The shader count lookup clamps its index to OWN_SLOTS - 1, even for
+/// a smaller heap. Both planes must cover that range: root SRVs have no
+/// hardware bounds check. Padding is zero and never written by the CPU.
+const STRIDE_TABLE_BYTES: u64 = 2 * COUNTS_AT as u64 * 4;
+
+fn stride_metadata_len(heap_slots: u32) -> u32 {
+    heap_slots.min(COUNTS_AT)
+}
+
 struct StrideTable {
     _resource: ID3D12Resource,
     ptr: usize,
@@ -82,7 +91,8 @@ impl StrideTable {
     /// The element counts follow the strides, from [`COUNTS_AT`] dwords on
     /// (where shaders, which know no heap's size, look for them).
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = ((u64::from(COUNTS_AT) + u64::from(len)) * 4).max(4);
+        let len = stride_metadata_len(len);
+        let bytes = STRIDE_TABLE_BYTES;
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -1262,8 +1272,8 @@ impl HostHeap {
         if let Some(t) = &self.strides
             && index < t.len
         {
-            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
-            // `COUNTS_AT + t.len` dwords.
+            // SAFETY: both planes have COUNTS_AT dwords and index < t.len
+            // <= COUNTS_AT, so the writes cannot overlap or exceed them.
             unsafe {
                 *(t.ptr as *mut u32).add(index as usize) = stride;
                 *(t.ptr as *mut u32).add((COUNTS_AT + index) as usize) = count;
@@ -3377,6 +3387,24 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
+
+    #[test]
+    fn stride_metadata_planes_cover_every_shader_count_index() {
+        let last = COUNTS_AT - 1;
+        for heap_slots in [0, 16, CAPPED_ROOM, COUNTS_AT, u32::MAX] {
+            let len = stride_metadata_len(heap_slots);
+            assert_eq!(len, heap_slots.min(COUNTS_AT));
+            assert!(u64::from(len) * 4 <= u64::from(COUNTS_AT) * 4);
+            // The last complete count dword must fit even for tiny heaps.
+            assert_eq!((u64::from(COUNTS_AT) + u64::from(last) + 1) * 4, STRIDE_TABLE_BYTES);
+            if len > 0 {
+                let last_stride = u64::from(len - 1) * 4;
+                let last_count = u64::from(COUNTS_AT + len - 1) * 4;
+                assert!(last_stride < u64::from(COUNTS_AT) * 4);
+                assert!(last_count + 4 <= STRIDE_TABLE_BYTES);
+            }
+        }
+    }
 
     #[test]
     fn configurable_capped_layout_preserves_bounds_for_every_reserve() {
