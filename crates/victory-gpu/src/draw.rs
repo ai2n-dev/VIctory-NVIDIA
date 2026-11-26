@@ -176,13 +176,13 @@ pub(crate) struct State {
     fresh_records: Vec<[u32; 3]>,
     /// Of them, large ones by table: the records it was made from and the
     /// first dynamic slot. A shader that reads less of one takes the same.
-    large_tables: std::collections::HashMap<u64, Vec<LargeTable>>,
+    large_tables: std::collections::HashMap<(u64, u64), Vec<LargeTable>>,
     /// What [`State::tables`] made for the stage being bound: root slot, byte
     /// offset of its fresh table. Kept to reuse its storage across draws.
     made: Vec<(u8, u32)>,
-    /// The dynamic slots the list holds: title heap, first, count; given
+    /// The dynamic slots the list holds: title heap, host heap ID, first, count; given
     /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Whether the last [`State::bind`] left a used unordered access view
     /// with nothing behind it (a null view).
     null_uav: bool,
@@ -190,8 +190,8 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        for &(heap, owner, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, owner, first, n);
         }
     }
 }
@@ -335,6 +335,7 @@ impl Slots {
 /// A table made afresh: what it was made from (the `n` records at `at` in
 /// [`State::fresh_records`]) and its first dynamic slot.
 struct Fresh {
+    owner: u64,
     table: u64,
     n: u32,
     at: usize,
@@ -1593,7 +1594,8 @@ impl State {
                 Vec::new()
             };
             let needed = ((last - table) / 32 + 1) as usize;
-            let same = self.large_tables.get(&table).and_then(|made| {
+            let owner = host.identity();
+            let same = self.large_tables.get(&(owner, table)).and_then(|made| {
                 made.iter()
                     .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
                     .map(|&(_, first)| first)
@@ -1614,7 +1616,8 @@ impl State {
             // The table and what its entries hold (record words).
             let key = table_hash(table, n);
             let same = self.fresh_tables.get(&key).filter(|f| {
-                f.table == table
+                f.owner == owner
+                    && f.table == table
                     && f.n == n
                     && self.fresh_records[f.at..f.at + n as usize]
                         .iter()
@@ -1650,12 +1653,12 @@ impl State {
             };
             let at = self.fresh_records.len();
             self.fresh_records.extend((0..n).map(|k| record(table, k)));
-            self.fresh_tables.insert(key, Fresh { table, n, at, first });
+            self.fresh_tables.insert(key, Fresh { owner, table, n, at, first });
             if n >= LARGE {
-                self.large_tables.entry(table).or_default().push((records, first));
+                self.large_tables.entry((owner, table)).or_default().push((records, first));
             }
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, owner, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays). Walk the sorted
             // first-use index instead of searching the entire list per slot.

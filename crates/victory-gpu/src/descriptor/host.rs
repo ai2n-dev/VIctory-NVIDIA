@@ -20,7 +20,10 @@ use crate::host::{Host, host};
 /// A range of title memory a slot reads: its host copy, address and bytes.
 pub(crate) type CopyRange = (Arc<crate::shadow::Shadow>, usize, usize);
 
+static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -882,6 +885,7 @@ impl HostHeap {
             StrideTable::new(&host.device, count + extra)
         };
         let h = HostHeap {
+            id: NEXT_HEAP_ID.fetch_add(1, Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -1093,6 +1097,17 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Identity of this allocation, independent of reused guest addresses.
+    pub(crate) fn identity(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn release_owned(&self, owner: u64, first: u32, n: u32) {
+        if self.id == owner {
+            self.release(first, n);
+        }
     }
 
     fn reserved_null_slot(&self) -> Option<u32> {
@@ -3753,6 +3768,19 @@ void main() {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(first));
         assert_eq!(heap.dynamic(40), Some(first + room - 40));
+    }
+
+    #[test]
+    fn dynamic_slots_only_return_to_their_original_heap() {
+        let (Some(a), Some(b)) = (HostHeap::new(true, 4 * SAMPLERS), HostHeap::new(true, 4 * SAMPLERS)) else {
+            return;
+        };
+        assert_ne!(a.identity(), b.identity());
+        let first = b.dynamic(SAMPLER_DYNAMIC).unwrap();
+        b.release_owned(a.identity(), first, SAMPLER_DYNAMIC);
+        assert_eq!(b.dynamic(1), None);
+        b.release_owned(b.identity(), first, SAMPLER_DYNAMIC);
+        assert_eq!(b.dynamic(SAMPLER_DYNAMIC), Some(first));
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps
