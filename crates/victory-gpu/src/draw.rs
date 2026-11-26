@@ -329,6 +329,15 @@ fn table_hash(table: u64, n: u32) -> u64 {
     h ^ h >> 32
 }
 
+/// Index the first resource named at each descriptor offset, preserving the
+/// first-match semantics of a linear search even for duplicate offsets.
+fn index_table_entries(offsets: impl Iterator<Item = u32>, indices: &mut Vec<(u32, usize)>) {
+    indices.clear();
+    indices.extend(offsets.enumerate().map(|(i, offset)| (offset, i)));
+    indices.sort_unstable();
+    indices.dedup_by_key(|entry| entry.0);
+}
+
 /// The words of entry `k` of `table`.
 fn record(table: u64, k: u32) -> [u32; 3] {
     // SAFETY: a descriptor slot in title memory.
@@ -1357,15 +1366,15 @@ impl State {
                 self.table_entry(list, u, compute);
             }
         }
+        // Reuse scratch across the root tables of this draw.
+        let mut entries = Vec::new();
+        let mut indices = Vec::new();
         for slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            entries.clear();
+            entries.extend(used.iter().filter(tables).filter(|u| u.slot == slot));
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -1382,7 +1391,7 @@ impl State {
             // ran out of slots: the longest seen serves all.
             let n = if n >= LARGE { longest(heap, table, n) } else { n };
             if heap.index(last).is_none() {
-                for u in entries {
+                for &u in &entries {
                     self.table_entry(list, u, compute);
                 }
                 continue;
@@ -1397,11 +1406,7 @@ impl State {
             } else {
                 Vec::new()
             };
-            let needed = entries
-                .iter()
-                .map(|u| u.table_offset_dwords as usize / 8 + 1)
-                .max()
-                .unwrap_or(1);
+            let needed = ((last - table) / 32 + 1) as usize;
             let same = self.large_tables.get(&table).and_then(|made| {
                 made.iter()
                     .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
@@ -1447,10 +1452,12 @@ impl State {
                 // tables fall back to the title's slots.
                 if entries.iter().any(|u| u.kind == ResourceType::Cbv) {
                     once!(n, "a constant table did not fit in command-list slots; draw dropped");
+                    made.clear();
+                    self.made = made;
                     return false;
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
-                for u in entries {
+                for &u in &entries {
                     self.table_entry(list, u, compute);
                 }
                 continue;
@@ -1464,10 +1471,17 @@ impl State {
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
+            // used-resource list names (descriptor arrays). Walk the sorted
+            // first-use index instead of searching the entire list per slot.
+            index_table_entries(entries.iter().map(|u| u.table_offset_dwords / 8), &mut indices);
+            let mut named = indices.iter().peekable();
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = if named.peek().is_some_and(|(offset, _)| *offset == k) {
+                    named.next().map(|&(_, i)| entries[i])
+                } else {
+                    None
+                };
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -2283,6 +2297,25 @@ fn stencil_ref(list: &HostList, reference: u32) {
 
 #[cfg(test)]
 mod group_limit_tests {
+    #[test]
+    fn indexed_table_lookup_preserves_first_match_and_sparse_offsets() {
+        let offsets = [8, 0, 8, 100, 2, 0, 100];
+        let mut indices = Vec::new();
+        super::index_table_entries(offsets.into_iter(), &mut indices);
+        assert_eq!(indices, [(0, 1), (2, 4), (8, 0), (100, 3)]);
+        let mut named = indices.iter().peekable();
+        for k in 0..110 {
+            let actual = if named.peek().is_some_and(|(offset, _)| *offset == k) {
+                named.next().map(|&(_, i)| i)
+            } else {
+                None
+            };
+            assert_eq!(actual, offsets.iter().position(|&offset| offset == k));
+        }
+        super::index_table_entries(std::iter::empty(), &mut indices);
+        assert!(indices.is_empty());
+    }
+
     #[test]
     fn state_snapshots_reuse_storage_without_retaining_old_elements() {
         let mut snapshot = Vec::with_capacity(8);
