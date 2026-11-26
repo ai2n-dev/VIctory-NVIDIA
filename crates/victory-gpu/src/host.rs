@@ -2088,8 +2088,8 @@ impl Host {
             {
                 // SAFETY: closed list; runs immediately after the final group under the same fence.
                 let lists = [Some(after)];
-            crate::cardmeter::executing(&lists, &self.fence);
-            unsafe { self.queue.ExecuteCommandLists(&lists) };
+                crate::cardmeter::executing(&lists, &self.fence);
+                unsafe { self.queue.ExecuteCommandLists(&lists) };
                 card_after_ran = true;
             }
             *submitted += 1;

@@ -468,7 +468,9 @@ mod tests {
             queue.ExecuteCommandLists(&[Some(cmd)]);
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
             queue.Signal(&fence, 1).expect("signal");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while fence.GetCompletedValue() < 1 {
+                assert!(std::time::Instant::now() < deadline, "timestamp fence timed out");
                 std::thread::yield_now();
             }
             let (b, e) = meter.read_pair(1);
@@ -486,6 +488,26 @@ mod tests {
             assert!(r.sample(|_| panic!("already sampled")).is_none());
             // Even after collection, the slot belongs to the closed list.
             assert!(!meter.free.contains(&span.raw()));
+
+            // The same closed list may be submitted again without reset.
+            // Its original timestamp slot must remain available to the GPU.
+            let r = meter.recordings.get_mut(&key).unwrap();
+            r.state = State::Running(fence.clone());
+            let cmd: ID3D12CommandList = list.cast().unwrap();
+            queue.ExecuteCommandLists(&[Some(cmd)]);
+            queue.Signal(&fence, 3).expect("signal repeated execution");
+            r.state = State::Submitted(fence.clone(), 3);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while fence.GetCompletedValue() < 3 {
+                assert!(std::time::Instant::now() < deadline, "repeated timestamp fence timed out");
+                std::thread::yield_now();
+            }
+            let mapped = meter.mapped;
+            let (kind, b, e) = r.sample(|pair| read_pair_raw(mapped, pair)).unwrap();
+            assert_eq!(kind, Kind::Lists);
+            assert!(b > 0 && e >= b);
+            assert!(!meter.free.contains(&span.raw()));
+            // No further submission of this recording.
             meter.release(key);
             assert!(meter.free.contains(&span.raw()));
             while meter.free.front().is_some() {
