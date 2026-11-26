@@ -330,7 +330,6 @@ impl Slots {
     fn contains(&self, slot: u8) -> bool {
         (self.0[usize::from(slot / 64)] >> (slot % 64)) & 1 != 0
     }
-
 }
 
 /// A table made afresh: what it was made from (the `n` records at `at` in
@@ -2478,7 +2477,14 @@ mod group_limit_tests {
     fn table_plan_preserves_interleaved_declaration_order() {
         use super::*;
         let entry = |slot, offset, kind, root| UsedResource {
-            slot, table_offset_dwords: offset, kind, root, dwords: 4,
+            slot,
+            table_offset_dwords: offset,
+            kind,
+            root,
+            dwords: 4,
+            lower_bound: 0,
+            stride: 8,
+            user_data: 0,
         };
         let used = [
             entry(7, 24, ResourceType::Uav, RootType::Table),
