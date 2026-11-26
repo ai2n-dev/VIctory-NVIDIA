@@ -1560,6 +1560,50 @@ mod tests {
     }
 
     #[test]
+    fn paired_wave64_translation_accepts_live_cross_half_read() {
+        use super::{EmitInput, Wave64Policy, emit_pruned_with_policy};
+        use crate::native::{ComputeIo, ResourceType, RootParam, RootType, StageIo, UsedResource};
+
+        // A live read of guest lane 40 (upper half), not dead scalar code.
+        // Use the existing synthetic raw-UAV layout, and publish the value.
+        let mut native = compute(&[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xD760_0000, 0x0001_5100, // v_readlane_b32 s0, v0, 40
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0xE070_0000, 0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0
+            0xBF81_0000,
+        ], true);
+        native.layout = vec![
+            RootParam {
+                root: RootType::Constants, table_offset_dwords: 0, sgprs: 4,
+                base_register: 0, user_data: 0, slot: 0,
+            },
+            RootParam {
+                root: RootType::Table, table_offset_dwords: 0, sgprs: 1,
+                base_register: 0, user_data: 4, slot: 1,
+            },
+        ];
+        native.used = vec![UsedResource {
+            kind: ResourceType::Uav, root: RootType::Table, table_offset_dwords: 0,
+            lower_bound: 0, stride: 0, dwords: 4, user_data: 4, slot: 1,
+        }];
+        native.io = StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [64, 1, 1] });
+        let c = crate::Container { digest: [0; 16], version: (1, 0), parts: vec![] };
+        let p = crate::ir::build(&native.code, true, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let input = EmitInput { c: &c, native: &native, p: &p, st: &st, io: &io, res: &res };
+        assert!(emit_pruned_with_policy(&input, NVIDIA, None, Wave64Policy::Independent).is_err());
+        let paired = emit_pruned_with_policy(&input, NVIDIA, None, Wave64Policy::Paired)
+            .expect("live cross-half read requires paired lowering");
+        let strict = emit_pruned_with_policy(&input, NVIDIA, None, Wave64Policy::Strict)
+            .expect("strict mode selects paired lowering");
+        assert_eq!(paired.dxil, strict.dxil);
+    }
+
+    #[test]
     fn programs_reading_no_other_lanes_translate_for_any_wave_size() {
         let words = [
             0x7E02_0300, // v_mov_b32 v1, v0
