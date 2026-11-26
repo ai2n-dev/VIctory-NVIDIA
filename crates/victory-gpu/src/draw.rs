@@ -81,6 +81,13 @@ fn bind_cache_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"))
 }
 
+/// In-place indirect inputs may be produced by earlier GPU commands in the
+/// draw list itself. A separate prelude must not read those inputs early.
+/// Adapted from AvatarManz 7ab13ed4 / DoubleGhosty 2652705a (GPL-3.0).
+fn indirect_inputs_can_hoist(args_direct: bool, count_direct: bool) -> bool {
+    !args_direct && !count_direct
+}
+
 fn viewports_match(a: &[D3D12_VIEWPORT], b: &[D3D12_VIEWPORT]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|(x, y)| {
@@ -2114,6 +2121,10 @@ impl State {
         // draw opened (`crate::list`), so that nothing of ours comes between
         // the draws.
         let before = (kind != DISPATCH
+            && indirect_inputs_can_hoist(
+                args.is_direct(),
+                counter.as_ref().is_some_and(|(s, _)| s.is_direct()),
+            )
             && match crate::indirect::hoist_mode() {
                 0 | 6 => false,
                 3 => kind == MESH,
@@ -2515,6 +2526,16 @@ fn stencil_ref(list: &HostList, reference: u32) {
 
 #[cfg(test)]
 mod group_limit_tests {
+    #[test]
+    fn direct_indirect_inputs_must_be_clamped_at_their_execution_site() {
+        // Both ordinary host copies may still use the existing prelude.
+        assert!(super::indirect_inputs_can_hoist(false, false));
+        // Either direct argument data or a direct count can be written late.
+        assert!(!super::indirect_inputs_can_hoist(true, false));
+        assert!(!super::indirect_inputs_can_hoist(false, true));
+        assert!(!super::indirect_inputs_can_hoist(true, true));
+    }
+
     #[test]
     fn table_plan_preserves_interleaved_declaration_order() {
         use super::*;
