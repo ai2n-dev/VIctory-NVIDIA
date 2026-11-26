@@ -64,6 +64,8 @@ struct Meter {
     frequency: u64,
     free: VecDeque<u32>,
     recordings: HashMap<usize, Recording>,
+    /// Only the recordings executed since each fence's last successful signal.
+    unsignalled: HashMap<usize, Vec<usize>>,
 }
 
 /// A slot remains owned by the recording after a sample is collected.
@@ -193,6 +195,7 @@ impl Meter {
                 frequency,
                 free: (0..PAIRS - HEADROOM).collect(),
                 recordings: HashMap::new(),
+                unsignalled: HashMap::new(),
             })
         }
     }
@@ -297,7 +300,13 @@ pub(crate) fn executing(lists: &[Option<ID3D12CommandList>], fence: &ID3D12Fence
             if let Some((kind, begin, end)) = r.sample(|pair| read_pair_raw(mapped, pair)) {
                 account(kind, micros(begin, end, frequency));
             }
-            r.state = State::Running(fence.clone());
+            if !matches!(&r.state, State::Running(owner) if owner.as_raw() == fence.as_raw()) {
+                r.state = State::Running(fence.clone());
+                m.unsignalled
+                    .entry(fence.as_raw() as usize)
+                    .or_default()
+                    .push(list.as_raw() as usize);
+            }
         }
     }
 }
@@ -309,8 +318,11 @@ pub(crate) fn signalled(fence: &ID3D12Fence, value: u64) {
     }
     let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(m)) = meter.as_mut() else { return };
-    for r in m.recordings.values_mut() {
-        if matches!(&r.state, State::Running(owner) if owner.as_raw() == fence.as_raw()) {
+    let Some(keys) = m.unsignalled.get_mut(&(fence.as_raw() as usize)) else { return };
+    for key in keys.drain(..) {
+        if let Some(r) = m.recordings.get_mut(&key)
+            && matches!(&r.state, State::Running(owner) if owner.as_raw() == fence.as_raw())
+        {
             r.state = State::Submitted(fence.clone(), value);
         }
     }
