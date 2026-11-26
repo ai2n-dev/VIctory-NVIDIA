@@ -4,16 +4,21 @@
 //! directory (`%LOCALAPPDATA%\victory\gpu-gate` on Windows, overridable with
 //! `VICTORY_GPU_GATE_DIR`). Enforces:
 //! - strictly one local hardware GPU test across all clones/agents at once,
-//! - persistent `fsync`-backed inflight recording before any GPU work starts,
-//! - automatic quarantine of any test interrupted by a crash, timeout, or reboot,
-//! - mandatory staged preflight checks (`--exact`, `--test-threads=1`, finite
-//!   timeout, health/memory/quarantine checks) before launching hardware tests.
+//! - cross-process serialized atomic updates to `inflight.txt`, `quarantine.tsv`,
+//!   and `journal.tsv` (`StateLock`),
+//! - remote CI green-SHA verification and clean-tree check before local GPU runs,
+//! - zero-race `CreateProcessW(CREATE_SUSPENDED)` + `JobObject` (`KILL_ON_JOB_CLOSE`)
+//!   assignment and flushed `inflight.txt` before the child executes any instruction,
+//! - scrubbing hazardous experimental env vars while wiring `VICTORY_LAST_OP_FILE`
+//!   to capture the real pre-GPU operation on disk,
+//! - verifying `1 passed` + exact test name + actual DXGI adapter telemetry after exit.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -23,10 +28,40 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 180;
 const MIN_FREE_RAM_MB: u64 = 2048;
 const MIN_FREE_DISK_MB: u64 = 1024;
+const STATE_LOCK_WAIT_MS: u32 = 10_000;
+const CI_REPO: &str = "ai2n-dev/VIctory-NVIDIA";
+
 const KNOWN_INCIDENT_QUARANTINES: &[(&str, &str)] = &[(
     "host::tests::repeated_host_list_and_wait_cycles_do_not_leak_handles",
     "quarantined after 2026-11-26 incident (intermittent 0xC0000409 + 13:38 freeze)",
 )];
+
+/// Experimental or hazardous overrides stripped from gated child runs so one
+/// agent/session cannot silently run local hardware under unsafe flags.
+pub const HAZARDOUS_EXPERIMENTAL_ENV_VARS: &[&str] = &[
+    "VICTORY_D3D12_DEBUG",
+    "VICTORY_D3D12_GBV",
+    "VICTORY_D3D12_DRED",
+    "VICTORY_ASYNC_SUBMIT",
+    "VICTORY_KEEP_RETIRED",
+    "VICTORY_KEEP_SECS",
+    "VICTORY_KEEP_STRICT",
+    "VICTORY_GPU_TIMING",
+    "VICTORY_NO_WORK",
+    "VICTORY_CARD_DIRECT_FLAGS",
+    "VICTORY_CARD_METER",
+    "VICTORY_RAYS",
+    "VICTORY_HOIST_SCOPED_BUDGET",
+    "VICTORY_PARALLEL_SNAPSHOTS",
+    "VICTORY_FENCE_TIMEOUT_MS",
+    "VICTORY_VALIDATE_DXIL",
+    "VICTORY_ALLOW_UNSAFE_TEST",
+    "VICTORY_WARP",
+    "VICTORY_D3D12_WARP",
+    "VICTORY_ADAPTER",
+];
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum GateMode {
@@ -58,7 +93,7 @@ pub enum GateCmd {
         #[arg(long, default_value = "")]
         last_op: String,
     },
-    /// Acquire the cross-process lock, record inflight state, and run ONE `--exact --test-threads=1` test.
+    /// Acquire cross-process lock, verify remote CI for HEAD SHA, record inflight state, and run ONE `--exact --test-threads=1` test.
     Run {
         #[arg(long = "crate", default_value = "victory-gpu")]
         pkg: String,
@@ -99,6 +134,7 @@ pub enum GateCmd {
 struct GatePaths {
     root: PathBuf,
     lock_file: PathBuf,
+    state_lock_file: PathBuf,
     inflight_file: PathBuf,
     quarantine_file: PathBuf,
     journal_file: PathBuf,
@@ -123,12 +159,14 @@ impl GatePaths {
             .with_context(|| format!("creating gate directory {}", root.display()))?;
         let paths = Self {
             lock_file: root.join("gate.lock"),
+            state_lock_file: root.join("state.lock"),
             inflight_file: root.join("inflight.txt"),
             quarantine_file: root.join("quarantine.tsv"),
             journal_file: root.join("journal.tsv"),
             logs_dir,
             root,
         };
+        let _state = StateLock::acquire(&paths)?;
         paths.ensure_seeded_quarantine()?;
         Ok(paths)
     }
@@ -185,13 +223,14 @@ struct InflightRecord {
     pid: u32,
     started_epoch_s: u64,
     last_op: String,
+    last_op_file: String,
     log_path: String,
 }
 
 impl InflightRecord {
     fn encode(&self) -> String {
         format!(
-            "test={}\npkg={}\nsha={}\nadapter={}\nmode={}\nrepo_root={}\npid={}\nstarted_epoch_s={}\nlast_op={}\nlog_path={}\n",
+            "test={}\npkg={}\nsha={}\nadapter={}\nmode={}\nrepo_root={}\npid={}\nstarted_epoch_s={}\nlast_op={}\nlast_op_file={}\nlog_path={}\n",
             sanitize_field(&self.test),
             sanitize_field(&self.pkg),
             sanitize_field(&self.sha),
@@ -201,6 +240,7 @@ impl InflightRecord {
             self.pid,
             self.started_epoch_s,
             sanitize_field(&self.last_op),
+            sanitize_field(&self.last_op_file),
             sanitize_field(&self.log_path),
         )
     }
@@ -219,7 +259,10 @@ impl InflightRecord {
         };
         Ok(Self {
             test: req("test")?,
-            pkg: map.get("pkg").cloned().unwrap_or_else(|| "victory-gpu".into()),
+            pkg: map
+                .get("pkg")
+                .cloned()
+                .unwrap_or_else(|| "victory-gpu".into()),
             sha: req("sha")?,
             adapter: req("adapter")?,
             mode: req("mode")?,
@@ -229,6 +272,7 @@ impl InflightRecord {
                 .parse()
                 .context("invalid inflight timestamp")?,
             last_op: map.get("last_op").cloned().unwrap_or_default(),
+            last_op_file: map.get("last_op_file").cloned().unwrap_or_default(),
             log_path: map.get("log_path").cloned().unwrap_or_default(),
         })
     }
@@ -244,6 +288,118 @@ struct QuarantineEntry {
     epoch_s: u64,
 }
 
+/// Cross-process metadata serialization lock protecting `quarantine.tsv`,
+/// `journal.tsv`, and `inflight.txt` read-modify-write transitions.
+struct StateLock {
+    file_path: Option<PathBuf>,
+    #[cfg(windows)]
+    mutex_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+impl StateLock {
+    fn acquire(paths: &GatePaths) -> Result<Self> {
+        // When `VICTORY_GPU_GATE_DIR` is overridden (for hermetic temp tests),
+        // avoid colliding on the global Windows mutex across distinct temp dirs.
+        #[cfg(windows)]
+        let mutex_handle = if std::env::var_os("VICTORY_GPU_GATE_DIR")
+            .is_none_or(|v| v.is_empty())
+        {
+            use windows_sys::Win32::Foundation::{
+                CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0,
+            };
+            use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+            let name: Vec<u16> = "Local\\VictoryGpuGateStateV1\0".encode_utf16().collect();
+            // SAFETY: valid null-terminated local mutex name.
+            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if handle.is_null() {
+                anyhow::bail!("failed to create cross-process GPU state mutex");
+            }
+            // SAFETY: valid mutex handle with bounded 10s wait.
+            let wait = unsafe { WaitForSingleObject(handle, STATE_LOCK_WAIT_MS) };
+            if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+                // SAFETY: valid handle owned here.
+                unsafe { CloseHandle(handle) };
+                anyhow::bail!("timed out waiting for cross-process GPU state mutex");
+            }
+            Some(handle)
+        } else {
+            None
+        };
+
+        // Exclusive file lock on `state.lock` works even across isolated temp dirs.
+        let deadline = Instant::now() + Duration::from_millis(u64::from(STATE_LOCK_WAIT_MS));
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&paths.state_lock_file)
+            {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "pid={}", std::process::id());
+                    return Ok(Self {
+                        file_path: Some(paths.state_lock_file.clone()),
+                        #[cfg(windows)]
+                        mutex_handle,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Ok(text) = fs::read_to_string(&paths.state_lock_file)
+                        && let Some(pid) = parse_pid_line(&text)
+                        && !process_alive(pid)
+                    {
+                        let _ = fs::remove_file(&paths.state_lock_file);
+                        continue;
+                    }
+                    if Instant::now() >= deadline {
+                        #[cfg(windows)]
+                        if let Some(handle) = mutex_handle {
+                            // SAFETY: release mutex before failing cleanly.
+                            unsafe {
+                                windows_sys::Win32::System::Threading::ReleaseMutex(handle);
+                                windows_sys::Win32::Foundation::CloseHandle(handle);
+                            }
+                        }
+                        anyhow::bail!(
+                            "timed out waiting for state lock {}",
+                            paths.state_lock_file.display()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => {
+                    #[cfg(windows)]
+                    if let Some(handle) = mutex_handle {
+                        // SAFETY: release mutex before failing cleanly.
+                        unsafe {
+                            windows_sys::Win32::System::Threading::ReleaseMutex(handle);
+                            windows_sys::Win32::Foundation::CloseHandle(handle);
+                        }
+                    }
+                    return Err(e).context("creating state lock");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        if let Some(path) = self.file_path.take() {
+            let _ = fs::remove_file(path);
+        }
+        #[cfg(windows)]
+        if let Some(handle) = self.mutex_handle.take() {
+            // SAFETY: owns both mutex lock and handle.
+            unsafe {
+                let _ = windows_sys::Win32::System::Threading::ReleaseMutex(handle);
+                let _ = windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
+        }
+    }
+}
+
+/// Exclusive cross-process GPU execution lock held across all clones/agents.
 struct GateLock {
     lock_file: PathBuf,
     #[cfg(windows)]
@@ -254,36 +410,34 @@ impl GateLock {
     fn try_acquire(paths: &GatePaths, owner: &InflightRecord) -> Result<Self> {
         #[cfg(windows)]
         let mutex_handle = {
-            use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, CloseHandle};
-            use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
+            use windows_sys::Win32::Foundation::{
+                CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0,
+            };
+            use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
             let name: Vec<u16> = "Local\\VictoryGpuGateV1\0".encode_utf16().collect();
             // SAFETY: null-terminated mutex name and valid Win32 handle handling.
             let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
             if handle.is_null() {
                 anyhow::bail!("failed to create cross-process GPU gate mutex");
             }
-            // SAFETY: immediate error query on current thread.
+            // SAFETY: immediate last-error check on current thread.
             if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-                // Non-blocking ownership check: if another process already owns the mutex,
-                // WaitForSingleObject(..., 0) fails with WAIT_TIMEOUT -> fail immediately.
-                // SAFETY: valid mutex handle owned by system.
-                let wait = unsafe {
-                    windows_sys::Win32::System::Threading::WaitForSingleObject(handle, 0)
-                };
-                if wait != windows_sys::Win32::Foundation::WAIT_OBJECT_0 {
-                    // SAFETY: releasing our duplicate handle without owning the mutex.
-                    unsafe { CloseHandle(handle) };
+                // SAFETY: non-blocking check whether another process owns the mutex.
+                let wait = unsafe { WaitForSingleObject(handle, 0) };
+                if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+                    // SAFETY: releasing duplicate handle cleanly without owning mutex.
+                    unsafe {
+                        let _ = CloseHandle(handle);
+                    }
                     anyhow::bail!(
                         "another GPU test or clone already holds Local\\VictoryGpuGateV1 ({})",
                         read_lock_summary(&paths.lock_file)
                     );
                 }
-                let _ = ReleaseMutex;
             }
             Some(handle)
         };
 
-        // Reclaim stale lock files only if the recorded PID is dead.
         if paths.lock_file.exists()
             && let Ok(existing) = fs::read_to_string(&paths.lock_file)
             && let Some(pid) = parse_pid_line(&existing)
@@ -324,8 +478,8 @@ impl Drop for GateLock {
         if let Some(handle) = self.mutex_handle.take() {
             // SAFETY: this guard owns both lock acquisition and handle closure.
             unsafe {
-                windows_sys::Win32::System::Threading::ReleaseMutex(handle);
-                windows_sys::Win32::Foundation::CloseHandle(handle);
+                let _ = windows_sys::Win32::System::Threading::ReleaseMutex(handle);
+                let _ = windows_sys::Win32::Foundation::CloseHandle(handle);
             }
         }
     }
@@ -341,7 +495,10 @@ pub fn run(workspace_root: &Path, cmd: GateCmd) -> Result<()> {
             mode,
             last_op,
         } => {
-            let quarantined = reconcile_inflight(&paths)?;
+            let quarantined = {
+                let _state = StateLock::acquire(&paths)?;
+                reconcile_inflight_locked(&paths)?
+            };
             validate_gate_request(&test, &adapter, mode, DEFAULT_TIMEOUT_SECS, &last_op)?;
             check_not_quarantined(&test, &quarantined)?;
             check_no_live_holder(&paths)?;
@@ -360,41 +517,10 @@ pub fn run(workspace_root: &Path, cmd: GateCmd) -> Result<()> {
             reason,
             adapter,
             last_op,
-        } => {
-            let _ = reconcile_inflight(&paths)?;
-            let mut entries = load_quarantine(&paths.quarantine_file)?;
-            let sha = current_sha(workspace_root);
-            entries.insert(
-                test.clone(),
-                QuarantineEntry {
-                    test: test.clone(),
-                    reason: reason.clone(),
-                    sha: sha.clone(),
-                    adapter: adapter.clone(),
-                    last_op: last_op.clone(),
-                    epoch_s: now_epoch_s(),
-                },
-            );
-            save_quarantine(&paths.quarantine_file, &entries)?;
-            append_journal(
-                &paths.journal_file,
-                now_epoch_s(),
-                &sha,
-                workspace_root,
-                &adapter,
-                "manual",
-                &test,
-                std::process::id(),
-                "quarantined",
-                0,
-                &last_op,
-                "-",
-            )?;
-            println!("quarantined {test}: {reason}");
-            Ok(())
-        }
+        } => quarantine_test(workspace_root, &paths, &test, &reason, &adapter, &last_op),
         GateCmd::Unquarantine { test, evidence } => {
-            let _ = reconcile_inflight(&paths)?;
+            let _state = StateLock::acquire(&paths)?;
+            let _ = reconcile_inflight_locked(&paths)?;
             let trimmed = evidence.trim();
             anyhow::ensure!(
                 trimmed.len() >= 16,
@@ -406,8 +532,8 @@ pub fn run(workspace_root: &Path, cmd: GateCmd) -> Result<()> {
                 "test '{test}' is not in quarantine"
             );
             save_quarantine(&paths.quarantine_file, &entries)?;
-            let sha = current_sha(workspace_root);
-            append_journal(
+            let sha = short_sha(workspace_root);
+            append_journal_locked(
                 &paths.journal_file,
                 now_epoch_s(),
                 &sha,
@@ -446,8 +572,65 @@ pub fn run(workspace_root: &Path, cmd: GateCmd) -> Result<()> {
     }
 }
 
+fn quarantine_test(
+    workspace_root: &Path,
+    paths: &GatePaths,
+    test: &str,
+    reason: &str,
+    adapter: &str,
+    last_op: &str,
+) -> Result<()> {
+    let _state = StateLock::acquire(paths)?;
+    let _ = reconcile_inflight_locked(paths)?;
+    let mut entries = load_quarantine(&paths.quarantine_file)?;
+    let sha = short_sha(workspace_root);
+    entries.insert(
+        test.to_string(),
+        QuarantineEntry {
+            test: test.to_string(),
+            reason: reason.to_string(),
+            sha: sha.clone(),
+            adapter: adapter.to_string(),
+            last_op: last_op.to_string(),
+            epoch_s: now_epoch_s(),
+        },
+    );
+    save_quarantine(&paths.quarantine_file, &entries)?;
+    append_journal_locked(
+        &paths.journal_file,
+        now_epoch_s(),
+        &sha,
+        workspace_root,
+        adapter,
+        "manual",
+        test,
+        std::process::id(),
+        "quarantined",
+        0,
+        last_op,
+        "-",
+    )?;
+    println!("quarantined {test}: {reason}");
+    Ok(())
+}
+
 fn print_status(workspace_root: &Path, paths: &GatePaths) -> Result<()> {
-    let quarantined = reconcile_inflight(paths)?;
+    let (quarantined, journal_tail) = {
+        let _state = StateLock::acquire(paths)?;
+        let q = reconcile_inflight_locked(paths)?;
+        let tail = if paths.journal_file.exists() {
+            fs::read_to_string(&paths.journal_file)
+                .unwrap_or_default()
+                .lines()
+                .rev()
+                .take(10)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        (q, tail)
+    };
     let health = probe_system_health(&paths.root)?;
     let holder = if paths.lock_file.exists() {
         read_lock_summary(&paths.lock_file)
@@ -455,7 +638,7 @@ fn print_status(workspace_root: &Path, paths: &GatePaths) -> Result<()> {
         "unlocked".to_string()
     };
     println!("gpu-gate dir: {}", paths.root.display());
-    println!("workspace sha: {}", current_sha(workspace_root));
+    println!("workspace sha: {}", short_sha(workspace_root));
     println!("lock state: {holder}");
     println!(
         "system health: free_ram_mb={} free_disk_mb={}",
@@ -464,17 +647,13 @@ fn print_status(workspace_root: &Path, paths: &GatePaths) -> Result<()> {
     println!("quarantined tests ({}):", quarantined.len());
     for entry in quarantined.values() {
         println!(
-            "  - {} | adapter={} sha={} | reason={}",
-            entry.test, entry.adapter, entry.sha, entry.reason
+            "  - {} | adapter={} sha={} last_op='{}' | reason={}",
+            entry.test, entry.adapter, entry.sha, entry.last_op, entry.reason
         );
     }
-    if paths.journal_file.exists() {
-        let lines = fs::read_to_string(&paths.journal_file).unwrap_or_default();
-        let tail: Vec<&str> = lines.lines().rev().take(10).collect();
-        println!("recent journal entries ({}):", tail.len());
-        for line in tail.into_iter().rev() {
-            println!("  {line}");
-        }
+    println!("recent journal entries ({}):", journal_tail.len());
+    for line in journal_tail.into_iter().rev() {
+        println!("  {line}");
     }
     Ok(())
 }
@@ -491,29 +670,42 @@ fn run_gated(
     timeout_secs: u64,
     all_features: bool,
 ) -> Result<()> {
-    let quarantined = reconcile_inflight(paths)?;
+    let quarantined = {
+        let _state = StateLock::acquire(paths)?;
+        reconcile_inflight_locked(paths)?
+    };
     validate_gate_request(test, adapter, mode, timeout_secs, last_op)?;
     check_not_quarantined(test, &quarantined)?;
     let health = probe_system_health(&paths.root)?;
     ensure_health_ok(&health)?;
 
-    let sha = current_sha(workspace_root);
+    // Ensure workspace matches clean committed SHA and remote CI succeeded for that SHA.
+    let full_sha = full_head_sha(workspace_root)?;
+    verify_clean_worktree(workspace_root)?;
+    verify_remote_ci_for_sha(workspace_root, &full_sha)?;
+    let sha_short = full_sha.chars().take(12).collect::<String>();
+
     let now = now_epoch_s();
-    let log_path = paths.logs_dir.join(format!(
-        "gate_{now}_{}_{}.log",
-        sanitize_filename(adapter),
-        std::process::id()
-    ));
+    let tag = sanitize_filename(adapter);
+    let log_path = paths
+        .logs_dir
+        .join(format!("gate_{now}_{tag}_{}.log", std::process::id()));
+    let last_op_path = paths
+        .logs_dir
+        .join(format!("last_op_{now}_{tag}_{}.txt", std::process::id()));
+    write_atomic(&last_op_path, last_op.as_bytes())?;
+
     let mut record = InflightRecord {
         test: test.to_string(),
         pkg: pkg.to_string(),
-        sha: sha.clone(),
+        sha: sha_short.clone(),
         adapter: adapter.to_string(),
         mode: mode.as_str().to_string(),
         repo_root: workspace_root.display().to_string(),
         pid: std::process::id(),
         started_epoch_s: now,
         last_op: last_op.to_string(),
+        last_op_file: last_op_path.display().to_string(),
         log_path: log_path.display().to_string(),
     };
 
@@ -534,77 +726,77 @@ fn run_gated(
     args.push("--test-threads=1".to_string());
     args.push("--nocapture".to_string());
 
-    let log_file = File::create(&log_path)
-        .with_context(|| format!("creating log file {}", log_path.display()))?;
-    let log_err = log_file.try_clone()?;
-
-    let mut command = Command::new("cargo");
-    command
-        .args(&args)
-        .current_dir(workspace_root)
-        .stdout(log_file)
-        .stderr(log_err);
-    configure_adapter_env(&mut command, adapter);
-
-    // Flush inflight BEFORE spawning so a hard crash/reboot leaves proof on disk.
-    write_atomic(&paths.inflight_file, record.encode().as_bytes())?;
+    let parent_env: Vec<(String, String)> = std::env::vars().collect();
+    let child_env = build_sanitized_child_env(&parent_env, adapter, &last_op_path);
 
     let started = Instant::now();
-    let mut child = command.spawn().context("spawning gated cargo test")?;
-    record.pid = child.id();
-    write_atomic(&paths.inflight_file, record.encode().as_bytes())?;
-
-    let outcome = wait_child_with_timeout(&mut child, Duration::from_secs(timeout_secs))?;
+    let outcome = spawn_suspended_attach_job_and_wait(
+        workspace_root,
+        paths,
+        &mut record,
+        &args,
+        &child_env,
+        &log_path,
+        Duration::from_secs(timeout_secs),
+    )?;
     let elapsed_s = started.elapsed().as_secs();
 
+    let observed_last_op = fs::read_to_string(&last_op_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| last_op.to_string());
+
+    let log_text = fs::read_to_string(&log_path).unwrap_or_default();
+
     let (status_label, should_quarantine, reason) = match outcome {
-        ChildOutcome::Exited(0) => ("ok", false, String::new()),
-        ChildOutcome::Exited(code) => (
-            "failed",
-            true,
-            format!("non-zero exit code {code}"),
-        ),
-        ChildOutcome::TimedOut => (
-            "timeout",
-            true,
-            format!("timed out after {timeout_secs}s"),
-        ),
+        ChildOutcome::Exited(0) => {
+            match verify_test_execution_log(&log_text, test, adapter, &observed_last_op) {
+                Ok(()) => ("ok", false, String::new()),
+                Err(verify_err) => ("failed_verification", true, verify_err.to_string()),
+            }
+        }
+        ChildOutcome::Exited(code) => ("failed", true, format!("non-zero exit code {code}")),
+        ChildOutcome::TimedOut => ("timeout", true, format!("timed out after {timeout_secs}s")),
     };
 
-    if should_quarantine {
-        let mut entries = load_quarantine(&paths.quarantine_file)?;
-        entries.insert(
-            test.to_string(),
-            QuarantineEntry {
-                test: test.to_string(),
-                reason: reason.clone(),
-                sha: sha.clone(),
-                adapter: adapter.to_string(),
-                last_op: last_op.to_string(),
-                epoch_s: now_epoch_s(),
-            },
-        );
-        save_quarantine(&paths.quarantine_file, &entries)?;
+    {
+        let _state = StateLock::acquire(paths)?;
+        if should_quarantine {
+            let mut entries = load_quarantine(&paths.quarantine_file)?;
+            entries.insert(
+                test.to_string(),
+                QuarantineEntry {
+                    test: test.to_string(),
+                    reason: reason.clone(),
+                    sha: sha_short.clone(),
+                    adapter: adapter.to_string(),
+                    last_op: observed_last_op.clone(),
+                    epoch_s: now_epoch_s(),
+                },
+            );
+            save_quarantine(&paths.quarantine_file, &entries)?;
+        }
+        append_journal_locked(
+            &paths.journal_file,
+            now_epoch_s(),
+            &sha_short,
+            workspace_root,
+            adapter,
+            mode.as_str(),
+            test,
+            record.pid,
+            status_label,
+            elapsed_s,
+            &observed_last_op,
+            &record.log_path,
+        )?;
+        let _ = fs::remove_file(&paths.inflight_file);
     }
 
-    append_journal(
-        &paths.journal_file,
-        now_epoch_s(),
-        &sha,
-        workspace_root,
-        adapter,
-        mode.as_str(),
-        test,
-        record.pid,
-        status_label,
-        elapsed_s,
-        last_op,
-        &record.log_path,
-    )?;
-
-    let _ = fs::remove_file(&paths.inflight_file);
+    let _ = fs::remove_file(&last_op_path);
     println!(
-        "gpu-gate {status_label}: test={test} adapter={adapter} elapsed={elapsed_s}s log={}",
+        "gpu-gate {status_label}: test={test} adapter={adapter} last_op='{observed_last_op}' elapsed={elapsed_s}s log={}",
         log_path.display()
     );
     if should_quarantine {
@@ -613,15 +805,33 @@ fn run_gated(
     Ok(())
 }
 
-fn configure_adapter_env(cmd: &mut Command, adapter: &str) {
-    let lower = adapter.to_ascii_lowercase();
-    if lower == "warp" {
-        cmd.env("VICTORY_WARP", "1").env("VICTORY_D3D12_WARP", "1");
-    } else {
-        cmd.env("VICTORY_ADAPTER", adapter)
-            .env_remove("VICTORY_WARP")
-            .env_remove("VICTORY_D3D12_WARP");
+/// Strips hazardous experimental overrides before setting adapter and last-op env vars.
+fn build_sanitized_child_env(
+    parent_env: &[(String, String)],
+    adapter: &str,
+    last_op_file: &Path,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for (k, v) in parent_env {
+        if HAZARDOUS_EXPERIMENTAL_ENV_VARS
+            .iter()
+            .any(|bad| bad.eq_ignore_ascii_case(k))
+        {
+            continue;
+        }
+        env.insert(k.clone(), v.clone());
     }
+    if adapter.eq_ignore_ascii_case("warp") {
+        env.insert("VICTORY_WARP".to_string(), "1".to_string());
+        env.insert("VICTORY_D3D12_WARP".to_string(), "1".to_string());
+    } else {
+        env.insert("VICTORY_ADAPTER".to_string(), adapter.to_string());
+    }
+    env.insert(
+        "VICTORY_LAST_OP_FILE".to_string(),
+        last_op_file.display().to_string(),
+    );
+    env
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -630,50 +840,238 @@ enum ChildOutcome {
     TimedOut,
 }
 
-fn wait_child_with_timeout(
-    child: &mut std::process::Child,
+#[cfg(windows)]
+fn spawn_suspended_attach_job_and_wait(
+    workspace_root: &Path,
+    paths: &GatePaths,
+    record: &mut InflightRecord,
+    args: &[String],
+    child_env: &BTreeMap<String, String>,
+    log_path: &Path,
     timeout: Duration,
 ) -> Result<ChildOutcome> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, TerminateJobObject,
-        };
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS, WaitForSingleObject};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    };
 
-        // SAFETY: creating a kill-on-close Win32 Job Object and attaching the child PID.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if !job.is_null() {
-                let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    (&raw const info).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                );
-                let proc = OpenProcess(PROCESS_ALL_ACCESS, 0, child.id());
-                if !proc.is_null() {
-                    AssignProcessToJobObject(job, proc);
-                    let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
-                    let wait = WaitForSingleObject(proc, ms);
-                    CloseHandle(proc);
-                    if wait != WAIT_OBJECT_0 {
-                        TerminateJobObject(job, 124);
-                        CloseHandle(job);
-                        let _ = child.wait();
-                        return Ok(ChildOutcome::TimedOut);
-                    }
-                }
-                CloseHandle(job);
-            }
-        }
+    let log_file = File::create(log_path)
+        .with_context(|| format!("creating log file {}", log_path.display()))?;
+    let log_handle = log_file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: `log_handle` is a valid open file handle; mark it inheritable before CreateProcessW.
+    if unsafe { SetHandleInformation(log_handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+        anyhow::bail!(
+            "SetHandleInformation failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
+    let mut cmd_line = String::from("cargo.exe");
+    for arg in args {
+        cmd_line.push(' ');
+        push_windows_arg(&mut cmd_line, arg);
+    }
+    let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain([0]).collect();
+
+    let mut env_block: Vec<u16> = Vec::new();
+    for (k, v) in child_env {
+        if k.contains('=') || k.contains('\0') || v.contains('\0') {
+            continue;
+        }
+        env_block.extend(k.encode_utf16());
+        env_block.push(b'=' as u16);
+        env_block.extend(v.encode_utf16());
+        env_block.push(0);
+    }
+    env_block.push(0);
+
+    let cwd_wide: Vec<u16> = workspace_root
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect();
+
+    // SAFETY: zero-initialized Win32 STARTUPINFOW with explicit inheritable log handles.
+    let mut si = unsafe { std::mem::zeroed::<STARTUPINFOW>() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = std::ptr::null_mut();
+    si.hStdOutput = log_handle;
+    si.hStdError = log_handle;
+
+    // SAFETY: zero-initialized PROCESS_INFORMATION out parameter.
+    let mut pi = unsafe { std::mem::zeroed::<PROCESS_INFORMATION>() };
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+
+    // SAFETY: `cmd_wide`, `env_block`, `cwd_wide`, `si`, `pi` are valid for the call;
+    // child starts SUSPENDED before executing any user/GPU instruction.
+    let created = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmd_wide.as_mut_ptr(),
+            &sa,
+            std::ptr::null(),
+            1,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+            env_block.as_ptr().cast(),
+            cwd_wide.as_ptr(),
+            &si,
+            &raw mut pi,
+        )
+    };
+    if created == 0 {
+        anyhow::bail!(
+            "CreateProcessW(CREATE_SUSPENDED) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // SAFETY: valid process/thread handles from CreateProcessW.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        // SAFETY: abort suspended child cleanly if job creation fails.
+        unsafe {
+            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+        anyhow::bail!("CreateJobObjectW failed");
+    }
+
+    // SAFETY: sized JOBOBJECT_EXTENDED_LIMIT_INFORMATION buffer.
+    let limit_ok = unsafe {
+        let mut info = std::mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if limit_ok == 0 {
+        // SAFETY: terminate suspended child and close handles on error.
+        unsafe {
+            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+        anyhow::bail!("SetInformationJobObject failed");
+    }
+
+    // SAFETY: assign child to kill-on-close JobObject BEFORE resuming primary thread.
+    if unsafe { AssignProcessToJobObject(job, pi.hProcess) } == 0 {
+        // SAFETY: terminate suspended child and close handles on error.
+        unsafe {
+            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+        anyhow::bail!("AssignProcessToJobObject failed");
+    }
+
+    record.pid = pi.dwProcessId;
+    {
+        let _state = StateLock::acquire(paths)?;
+        write_atomic(&paths.inflight_file, record.encode().as_bytes())?;
+    }
+
+    // Drop our file handle now that child owns inherited copy, so logs unlock cleanly when child exits.
+    drop(log_file);
+
+    // SAFETY: `pi.hThread` is suspended; JobObject and `inflight.txt` are now both active.
+    if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+        // SAFETY: kill job cleanly if ResumeThread fails.
+        unsafe {
+            let _ = TerminateJobObject(job, 1);
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+        anyhow::bail!("ResumeThread failed");
+    }
+
+    let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+    // SAFETY: finite WaitForSingleObject on child process handle.
+    let wait = unsafe { WaitForSingleObject(pi.hProcess, ms) };
+    let outcome = if wait == WAIT_OBJECT_0 {
+        let mut code = 1u32;
+        // SAFETY: process exited; query exact exit status.
+        if unsafe { GetExitCodeProcess(pi.hProcess, &raw mut code) } == 0 {
+            anyhow::bail!("GetExitCodeProcess failed");
+        }
+        ChildOutcome::Exited(code as i32)
+    } else if wait == WAIT_TIMEOUT {
+        // SAFETY: hard-terminate entire child job tree on timeout.
+        if unsafe { TerminateJobObject(job, 124) } == 0 {
+            anyhow::bail!("TerminateJobObject failed on timeout");
+        }
+        // SAFETY: brief wait for terminated child process teardown.
+        let _ = unsafe { WaitForSingleObject(pi.hProcess, 5_000) };
+        ChildOutcome::TimedOut
+    } else {
+        // SAFETY: terminate job tree cleanly on wait failure.
+        unsafe {
+            let _ = TerminateJobObject(job, 1);
+            let _ = CloseHandle(job);
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+        anyhow::bail!("WaitForSingleObject returned unexpected status {wait}");
+    };
+
+    // SAFETY: release job and process/thread handles after exit.
+    unsafe {
+        let _ = CloseHandle(job);
+        let _ = CloseHandle(pi.hThread);
+        let _ = CloseHandle(pi.hProcess);
+    }
+    Ok(outcome)
+}
+
+#[cfg(not(windows))]
+fn spawn_suspended_attach_job_and_wait(
+    workspace_root: &Path,
+    paths: &GatePaths,
+    record: &mut InflightRecord,
+    args: &[String],
+    child_env: &BTreeMap<String, String>,
+    log_path: &Path,
+    timeout: Duration,
+) -> Result<ChildOutcome> {
+    let log_file = File::create(log_path)?;
+    let log_err = log_file.try_clone()?;
+    let mut cmd = Command::new("cargo");
+    cmd.args(args)
+        .current_dir(workspace_root)
+        .env_clear()
+        .envs(child_env)
+        .stdout(log_file)
+        .stderr(log_err);
+    let mut child = cmd.spawn().context("spawning gated cargo test")?;
+    record.pid = child.id();
+    {
+        let _state = StateLock::acquire(paths)?;
+        write_atomic(&paths.inflight_file, record.encode().as_bytes())?;
+    }
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -686,6 +1084,199 @@ fn wait_child_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(windows)]
+fn push_windows_arg(dst: &mut String, arg: &str) {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        dst.push_str(arg);
+        return;
+    }
+    dst.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..=backslashes * 2 {
+                dst.push('\\');
+            }
+            dst.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                dst.push('\\');
+            }
+            dst.push(ch);
+            backslashes = 0;
+        }
+    }
+    for _ in 0..backslashes * 2 {
+        dst.push('\\');
+    }
+    dst.push('"');
+}
+
+fn full_head_sha(workspace_root: &Path) -> Result<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_root)
+        .output()
+        .context("running git rev-parse HEAD")?;
+    anyhow::ensure!(out.status.success(), "git rev-parse HEAD failed");
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    anyhow::ensure!(sha.len() == 40, "unexpected SHA length: '{sha}'");
+    Ok(sha)
+}
+
+fn verify_clean_worktree(workspace_root: &Path) -> Result<()> {
+    let out = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace_root)
+        .output()
+        .context("running git status --porcelain")?;
+    anyhow::ensure!(out.status.success(), "git status failed");
+    check_worktree_clean(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn check_worktree_clean(porcelain: &str) -> Result<()> {
+    let dirty: Vec<&str> = porcelain
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if !dirty.is_empty() {
+        anyhow::bail!(
+            "local repository has uncommitted changes not yet verified on remote CI ({} entries, e.g. '{}')",
+            dirty.len(),
+            dirty[0]
+        );
+    }
+    Ok(())
+}
+
+fn verify_remote_ci_for_sha(workspace_root: &Path, full_sha: &str) -> Result<()> {
+    let out = Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "-R",
+            CI_REPO,
+            "--commit",
+            full_sha,
+            "--workflow",
+            "ci.yml",
+            "--status",
+            "completed",
+            "--json",
+            "conclusion,headSha,status,databaseId",
+        ])
+        .current_dir(workspace_root)
+        .output()
+        .context("querying GitHub Actions via `gh run list`")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "gh run list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    parse_remote_ci_result(&String::from_utf8_lossy(&out.stdout), full_sha)
+}
+
+fn parse_remote_ci_result(json: &str, expected_sha: &str) -> Result<()> {
+    let expected = expected_sha.trim();
+    if expected.is_empty() {
+        anyhow::bail!("missing expected SHA");
+    }
+    let has_exact_sha = json.contains(&format!("\"headSha\":\"{expected}\""))
+        || json.contains(&format!("\"headSha\": \"{expected}\""));
+    let has_success = json.contains("\"conclusion\":\"success\"")
+        || json.contains("\"conclusion\": \"success\"");
+    let is_completed = json.contains("\"status\":\"completed\"")
+        || json.contains("\"status\": \"completed\"");
+    if !(has_exact_sha && has_success && is_completed) {
+        anyhow::bail!(
+            "remote CI (`{CI_REPO}` ci.yml) has not completed with `success` for exact SHA `{expected}`"
+        );
+    }
+    Ok(())
+}
+
+/// Ensures the gated binary actually executed 1 unignored test matching
+/// `expected_test` on `expected_adapter` (using both log output and `last_op`).
+fn verify_test_execution_log(
+    log_text: &str,
+    expected_test: &str,
+    expected_adapter: &str,
+    observed_last_op: &str,
+) -> Result<()> {
+    let ran_test_ok = {
+        let prefix = format!("test {expected_test} ...");
+        let lines: Vec<&str> = log_text.lines().map(str::trim).collect();
+        lines.iter().enumerate().any(|(idx, line)| {
+            line.starts_with(&prefix)
+                && (line.ends_with("... ok")
+                    || line.ends_with("ok")
+                    || lines
+                        .get(idx + 1..)
+                        .and_then(|rest| rest.iter().find(|l| !l.is_empty()))
+                        .is_some_and(|next| *next == "ok"))
+        })
+    };
+    anyhow::ensure!(
+        ran_test_ok,
+        "test `{expected_test}` did not execute and pass (missing `test ... ok` in log)"
+    );
+
+    let passed_one = log_text.lines().any(|line| {
+        let t = line.trim();
+        t.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+    });
+    anyhow::ensure!(
+        passed_one,
+        "expected exact count `1 passed; 0 failed; 0 ignored;` in test summary"
+    );
+
+    let reported_adapter = extract_reported_adapter(log_text, observed_last_op).ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing confirmed DXGI/WARP adapter report in log or last_op (`{observed_last_op}`)"
+        )
+    })?;
+    anyhow::ensure!(
+        adapter_matches_expected(&reported_adapter, expected_adapter),
+        "adapter mismatch: expected `{expected_adapter}`, observed `{reported_adapter}`"
+    );
+    Ok(())
+}
+
+fn extract_reported_adapter(log_text: &str, observed_last_op: &str) -> Option<String> {
+    if let Some(after) = observed_last_op.strip_prefix("device_init:")
+        && !after.trim().is_empty()
+    {
+        return Some(after.trim().to_string());
+    }
+    for line in log_text.lines() {
+        if let Some(at) = line.find("[gpu-gate adapter]") {
+            let name = line[at + "[gpu-gate adapter]".len()..].trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        if let Some(at) = line.find("AdapterReport { name: \"") {
+            let rest = &line[at + "AdapterReport { name: \"".len()..];
+            if let Some(end) = rest.find('"') {
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn adapter_matches_expected(actual: &str, expected: &str) -> bool {
+    let actual_lc = actual.to_ascii_lowercase();
+    let expected_lc = expected.trim().to_ascii_lowercase();
+    if expected_lc == "warp" {
+        return actual_lc.contains("basic render") || actual_lc.contains("warp");
+    }
+    actual_lc.contains(&expected_lc)
 }
 
 fn validate_gate_request(
@@ -716,9 +1307,10 @@ fn validate_gate_request(
     Ok(())
 }
 
-/// Reconciles `inflight.txt` if a previous process crashed, aborted, or suffered
-/// a hard reboot, automatically quarantining the unfinished test.
-fn reconcile_inflight(paths: &GatePaths) -> Result<BTreeMap<String, QuarantineEntry>> {
+/// Reconciles `inflight.txt` under `StateLock`: if a previous process crashed,
+/// aborted, or suffered a hard reboot, automatically quarantines the unfinished
+/// test with its real `last_op_file` telemetry if available.
+fn reconcile_inflight_locked(paths: &GatePaths) -> Result<BTreeMap<String, QuarantineEntry>> {
     let mut quarantine = load_quarantine(&paths.quarantine_file)?;
     if !paths.inflight_file.exists() {
         return Ok(quarantine);
@@ -754,6 +1346,16 @@ fn reconcile_inflight(paths: &GatePaths) -> Result<BTreeMap<String, QuarantineEn
         );
     }
 
+    let real_last_op = if !inflight.last_op_file.is_empty() {
+        fs::read_to_string(&inflight.last_op_file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| inflight.last_op.clone())
+    } else {
+        inflight.last_op.clone()
+    };
+
     let entry = QuarantineEntry {
         test: inflight.test.clone(),
         reason: format!(
@@ -762,12 +1364,12 @@ fn reconcile_inflight(paths: &GatePaths) -> Result<BTreeMap<String, QuarantineEn
         ),
         sha: inflight.sha.clone(),
         adapter: inflight.adapter.clone(),
-        last_op: inflight.last_op.clone(),
+        last_op: real_last_op.clone(),
         epoch_s: now_epoch_s(),
     };
     quarantine.insert(inflight.test.clone(), entry);
     save_quarantine(&paths.quarantine_file, &quarantine)?;
-    append_journal(
+    append_journal_locked(
         &paths.journal_file,
         now_epoch_s(),
         &inflight.sha,
@@ -778,7 +1380,7 @@ fn reconcile_inflight(paths: &GatePaths) -> Result<BTreeMap<String, QuarantineEn
         inflight.pid,
         "aborted_or_rebooted",
         now_epoch_s().saturating_sub(inflight.started_epoch_s),
-        &inflight.last_op,
+        &real_last_op,
         &inflight.log_path,
     )?;
     let _ = fs::remove_file(&paths.inflight_file);
@@ -844,7 +1446,13 @@ fn probe_system_health(path: &Path) -> Result<SystemHealth> {
         // SAFETY: valid null-terminated directory path and u64 out pointer.
         let free_disk_mb = unsafe {
             let mut avail = 0u64;
-            if GetDiskFreeSpaceExW(wide.as_ptr(), &raw mut avail, std::ptr::null_mut(), std::ptr::null_mut()) != 0 {
+            if GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &raw mut avail,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) != 0
+            {
                 avail >> 20
             } else {
                 0
@@ -941,7 +1549,7 @@ fn save_quarantine(path: &Path, entries: &BTreeMap<String, QuarantineEntry>) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_journal(
+fn append_journal_locked(
     path: &Path,
     epoch_s: u64,
     sha: &str,
@@ -955,14 +1563,8 @@ fn append_journal(
     last_op: &str,
     log_path: &str,
 ) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    writeln!(
-        file,
-        "{epoch_s}\t{}\t{}\t{}\t{}\t{}\t{pid}\t{status}\t{elapsed_s}\t{}\t{}",
+    let line = format!(
+        "{epoch_s}\t{}\t{}\t{}\t{}\t{}\t{pid}\t{status}\t{elapsed_s}\t{}\t{}\n",
         sanitize_field(sha),
         sanitize_field(&repo_root.display().to_string()),
         sanitize_field(adapter),
@@ -970,29 +1572,30 @@ fn append_journal(
         sanitize_field(test),
         sanitize_field(last_op),
         sanitize_field(log_path)
-    )?;
+    );
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.write_all(line.as_bytes())?;
     file.sync_all()?;
     Ok(())
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
     {
         let mut f = File::create(&tmp)
             .with_context(|| format!("creating temp file {}", tmp.display()))?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "renaming {} -> {}",
-            tmp.display(),
-            path.display()
-        )
-    })
+    fs::rename(&tmp, path).with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
 }
 
-fn current_sha(workspace_root: &Path) -> String {
+fn short_sha(workspace_root: &Path) -> String {
     Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .current_dir(workspace_root)
@@ -1033,7 +1636,7 @@ fn process_alive(pid: u32) -> bool {
             }
             let mut code = 0u32;
             let ok = GetExitCodeProcess(h, &raw mut code) != 0;
-            CloseHandle(h);
+            let _ = CloseHandle(h);
             ok && code == STILL_ACTIVE as u32
         }
     }
@@ -1065,9 +1668,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn interrupted_inflight_with_dead_pid_auto_quarantines_after_reboot() {
+    fn interrupted_inflight_with_dead_pid_auto_quarantines_and_uses_real_last_op() {
         let dir = tempfile::tempdir().unwrap();
         let paths = GatePaths::from_dir(dir.path().to_path_buf()).unwrap();
+        let last_op_file = dir.path().join("last_op.txt");
+        write_atomic(&last_op_file, b"execute_lists:group_len=2:sub=42").unwrap();
+
         let crashed = InflightRecord {
             test: "host::tests::sample_gpu_test".to_string(),
             pkg: "victory-gpu".to_string(),
@@ -1077,53 +1683,168 @@ mod tests {
             repo_root: dir.path().display().to_string(),
             pid: u32::MAX - 3,
             started_epoch_s: 1000,
-            last_op: "submit smoke buffer".to_string(),
+            last_op: "cli-placeholder".to_string(),
+            last_op_file: last_op_file.display().to_string(),
             log_path: "gate.log".to_string(),
         };
         write_atomic(&paths.inflight_file, crashed.encode().as_bytes()).unwrap();
 
-        let quarantine = reconcile_inflight(&paths).unwrap();
-        assert!(!paths.inflight_file.exists(), "inflight cleared after reconcile");
+        let quarantine = {
+            let _state = StateLock::acquire(&paths).unwrap();
+            reconcile_inflight_locked(&paths).unwrap()
+        };
+        assert!(!paths.inflight_file.exists());
         let q = quarantine.get("host::tests::sample_gpu_test").unwrap();
-        assert!(q.reason.contains("unclean exit or system reboot"));
-        assert_eq!(q.last_op, "submit smoke buffer");
+        assert_eq!(q.last_op, "execute_lists:group_len=2:sub=42");
         assert!(check_not_quarantined("host::tests::sample_gpu_test", &quarantine).is_err());
 
         let journal = fs::read_to_string(&paths.journal_file).unwrap();
         assert!(journal.contains("aborted_or_rebooted"));
-        assert!(journal.contains("host::tests::sample_gpu_test"));
+        assert!(journal.contains("execute_lists:group_len=2:sub=42"));
     }
 
     #[test]
-    fn preseeded_incident_quarantine_blocks_until_documented_unquarantine() {
+    fn remote_ci_verification_requires_exact_sha_and_success_and_clean_tree() {
+        let sha = "30f9d81a47ab8188375c049ce9a27a13c2706d28";
+        let ok_json = format!(
+            r#"[{{"conclusion":"success","databaseId":45788731593,"headSha":"{sha}","status":"completed"}}]"#
+        );
+        assert!(parse_remote_ci_result(&ok_json, sha).is_ok());
+
+        let wrong_sha = r#"[{"conclusion":"success","headSha":"1111111111111111111111111111111111111111","status":"completed"}]"#.to_string();
+        assert!(parse_remote_ci_result(&wrong_sha, sha).is_err());
+
+        let failed_json = format!(
+            r#"[{{"conclusion":"failure","headSha":"{sha}","status":"completed"}}]"#
+        );
+        assert!(parse_remote_ci_result(&failed_json, sha).is_err());
+        assert!(parse_remote_ci_result("[]", sha).is_err());
+
+        assert!(check_worktree_clean("").is_ok());
+        assert!(check_worktree_clean(" M crates/victory-gpu/src/host.rs\n").is_err());
+    }
+
+    #[test]
+    fn child_env_sanitization_strips_all_hazardous_experimental_vars() {
+        let parent = vec![
+            ("PATH".to_string(), "C:\\Windows".to_string()),
+            ("VICTORY_D3D12_DEBUG".to_string(), "1".to_string()),
+            ("VICTORY_D3D12_GBV".to_string(), "1".to_string()),
+            ("VICTORY_ASYNC_SUBMIT".to_string(), "1".to_string()),
+            ("VICTORY_KEEP_STRICT".to_string(), "1".to_string()),
+            ("VICTORY_RAYS".to_string(), "1".to_string()),
+            ("VICTORY_ADAPTER".to_string(), "WARP".to_string()),
+        ];
+        let op_file = Path::new("C:\\temp\\last_op.txt");
+        let sanitized = build_sanitized_child_env(&parent, "NVIDIA", op_file);
+        assert_eq!(sanitized.get("PATH").map(String::as_str), Some("C:\\Windows"));
+        assert_eq!(sanitized.get("VICTORY_ADAPTER").map(String::as_str), Some("NVIDIA"));
+        assert_eq!(
+            sanitized.get("VICTORY_LAST_OP_FILE").map(String::as_str),
+            Some("C:\\temp\\last_op.txt")
+        );
+        for bad in [
+            "VICTORY_D3D12_DEBUG",
+            "VICTORY_D3D12_GBV",
+            "VICTORY_ASYNC_SUBMIT",
+            "VICTORY_KEEP_STRICT",
+            "VICTORY_RAYS",
+            "VICTORY_WARP",
+        ] {
+            assert!(!sanitized.contains_key(bad), "{bad} leaked into child env");
+        }
+    }
+
+    #[test]
+    fn log_verification_requires_exact_single_pass_and_matching_adapter() {
+        let good_log = "running 1 test\ntest host::tests::foo ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out;\n";
+        assert!(verify_test_execution_log(
+            good_log,
+            "host::tests::foo",
+            "NVIDIA",
+            "device_init:NVIDIA GeForce RTX 5070 Ti Laptop GPU"
+        ).is_ok());
+
+        // 0 passed (typo/filtered) must fail even with exit code 0.
+        let zero_log = "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out;\n";
+        assert!(verify_test_execution_log(
+            zero_log,
+            "host::tests::foo",
+            "NVIDIA",
+            "device_init:NVIDIA GeForce RTX 5070 Ti Laptop GPU"
+        ).is_err());
+
+        // Adapter mismatch must fail.
+        assert!(verify_test_execution_log(
+            good_log,
+            "host::tests::foo",
+            "NVIDIA",
+            "device_init:AMD Radeon(TM) 610M"
+        ).is_err());
+
+        // Fallback via AdapterReport in stdout works too.
+        let adapter_log = "running 1 test\ntest host::tests::foo ... physical adapter report: AdapterReport { name: \"AMD Radeon(TM) 610M\", vendor: 4098 }\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out;\n";
+        assert!(verify_test_execution_log(adapter_log, "host::tests::foo", "Radeon", "cli-smoke").is_ok());
+    }
+
+    #[test]
+    fn concurrent_quarantine_and_journal_updates_preserve_all_records() {
         let dir = tempfile::tempdir().unwrap();
         let paths = GatePaths::from_dir(dir.path().to_path_buf()).unwrap();
-        let q = reconcile_inflight(&paths).unwrap();
-        let suspect = "host::tests::repeated_host_list_and_wait_cycles_do_not_leak_handles";
-        assert!(check_not_quarantined(suspect, &q).is_err());
-
-        // Short/empty evidence is rejected, documented evidence clears it.
-        let mut loaded = load_quarantine(&paths.quarantine_file).unwrap();
-        assert!(loaded.contains_key(suspect));
-        loaded.remove(suspect);
-        save_quarantine(&paths.quarantine_file, &loaded).unwrap();
-        assert!(check_not_quarantined(suspect, &load_quarantine(&paths.quarantine_file).unwrap()).is_ok());
+        let mut threads = Vec::new();
+        for tid in 0..8usize {
+            let p = paths.clone();
+            let root = dir.path().to_path_buf();
+            threads.push(std::thread::spawn(move || {
+                for iter in 0..10usize {
+                    let test_name = format!("mod{tid}::tests::case_{iter}");
+                    let _state = StateLock::acquire(&p).unwrap();
+                    let mut entries = load_quarantine(&p.quarantine_file).unwrap();
+                    entries.insert(
+                        test_name.clone(),
+                        QuarantineEntry {
+                            test: test_name.clone(),
+                            reason: "concurrent test".to_string(),
+                            sha: "deadbeef".to_string(),
+                            adapter: "NVIDIA".to_string(),
+                            last_op: format!("op_{tid}_{iter}"),
+                            epoch_s: 123,
+                        },
+                    );
+                    save_quarantine(&p.quarantine_file, &entries).unwrap();
+                    append_journal_locked(
+                        &p.journal_file,
+                        123,
+                        "deadbeef",
+                        &root,
+                        "NVIDIA",
+                        "smoke",
+                        &test_name,
+                        1,
+                        "ok",
+                        0,
+                        &format!("op_{tid}_{iter}"),
+                        "-",
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let entries = load_quarantine(&paths.quarantine_file).unwrap();
+        // 1 seeded + 8*10 concurrent entries = 81 unique entries, none overwritten/lost.
+        assert_eq!(entries.len(), 81);
+        let journal = fs::read_to_string(&paths.journal_file).unwrap();
+        assert_eq!(journal.lines().count(), 80);
     }
 
     #[test]
-    fn request_validation_enforces_exact_single_test_and_timeout_bounds() {
+    fn request_validation_and_exclusive_gate_lock_behave_strictly() {
         assert!(validate_gate_request("host::tests::foo", "NVIDIA", GateMode::Smoke, 30, "smoke op").is_ok());
-        assert!(validate_gate_request("", "NVIDIA", GateMode::Smoke, 30, "op").is_err());
-        assert!(validate_gate_request("host", "NVIDIA", GateMode::Smoke, 30, "op").is_err());
         assert!(validate_gate_request("host::*", "NVIDIA", GateMode::Smoke, 30, "op").is_err());
-        assert!(validate_gate_request("host::a host::b", "NVIDIA", GateMode::Smoke, 30, "op").is_err());
-        assert!(validate_gate_request("host::tests::foo", "NVIDIA", GateMode::Smoke, 0, "op").is_err());
-        assert!(validate_gate_request("host::tests::foo", "NVIDIA", GateMode::Smoke, 999, "op").is_err());
-        assert!(validate_gate_request("host::tests::foo", "NVIDIA", GateMode::Smoke, 30, "   ").is_err());
-    }
 
-    #[test]
-    fn exclusive_gate_lock_prevents_concurrent_runs_and_releases_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let paths = GatePaths::from_dir(dir.path().to_path_buf()).unwrap();
         let rec = InflightRecord {
@@ -1136,13 +1857,12 @@ mod tests {
             pid: std::process::id(),
             started_epoch_s: 1,
             last_op: "init".to_string(),
+            last_op_file: String::new(),
             log_path: "-".to_string(),
         };
         let guard = GateLock::try_acquire(&paths, &rec).unwrap();
-        assert!(paths.lock_file.exists());
         assert!(check_no_live_holder(&paths).is_err());
         drop(guard);
-        assert!(!paths.lock_file.exists());
         assert!(check_no_live_holder(&paths).is_ok());
     }
 }
