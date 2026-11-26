@@ -579,11 +579,7 @@ fn create() -> windows::core::Result<Host> {
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
         let host = Host::from_device(device, messages)?;
-        if std::env::var_os("VICTORY_LAST_OP_FILE").is_some_and(|v| !v.is_empty()) {
-            let report = probe_device(&host.device);
-            crate::preflight::record_last_op(format_args!("device_init:{}", report.name));
-            eprintln!("[gpu-gate adapter] {}", report.name);
-        }
+        report_gate_adapter(&host.device);
         tracing::info!("host D3D12 device ready");
         Ok(host)
     }
@@ -733,8 +729,17 @@ impl Host {
         // SAFETY: `adapter` is a verified software WARP adapter.
         unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
         let mut host = Host::from_device(device?, None).ok()?;
+        report_gate_adapter(&host.device);
         host.warp_serial = Some(serial);
         Some(host)
+    }
+}
+
+fn report_gate_adapter(device: &ID3D12Device) {
+    if std::env::var_os("VICTORY_LAST_OP_FILE").is_some_and(|v| !v.is_empty()) {
+        let report = probe_device(device);
+        crate::preflight::record_last_op(format_args!("device_init:{}", report.name));
+        eprintln!("[gpu-gate adapter] {}", report.name);
     }
 }
 
