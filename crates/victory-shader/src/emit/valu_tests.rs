@@ -603,6 +603,13 @@ fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
         // A zero factor gives a zero product, whatever the other one is.
         ([0, f(f32::INFINITY), f(1.5), 0], f(1.5)),
         ([f(f32::NAN), 0, f(-2.0), 0], f(-2.0)),
+        // Both signs of a subnormal factor flush before the zero rule.
+        ([1, f(f32::INFINITY), f(1.5), 0], f(1.5)),
+        ([f(f32::INFINITY), 0x8000_0001, f(-2.0), 0], f(-2.0)),
+        // The addend is flushed too.
+        ([0, f(1.0), 1, 0], 0),
+        // Do not flush the smallest normal factor.
+        ([0x0080_0000, f(1.0), 0, 0], 0x0080_0000),
     ];
     let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
     run_cases(&shader, &inputs, |backend, i, _, got| {

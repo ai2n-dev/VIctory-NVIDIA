@@ -423,8 +423,12 @@ impl Lower<'_> {
     }
 
     /// `a × b + addend` fused, with `0 × anything = 0` as in D3D9
-    /// (`v_fma_legacy_f32`).
+    /// (`v_fma_legacy_f32`). RDNA2 flushes the three input denormals
+    /// before applying the zero-factor rule.
     fn fma_legacy(&mut self, a: V, b: V, addend: V) -> V {
+        // Adapted from fxceless/victory-fork f6a09d3b; the fused operation
+        // and the signed-zero-preserving FTZ helper already exist here.
+        let (a, b, addend) = (self.ftz(a), self.ftz(b), self.ftz(addend));
         let c = self.cur;
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
