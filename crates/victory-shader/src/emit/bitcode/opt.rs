@@ -665,6 +665,11 @@ impl Module {
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
+            // Preserve resource size queries at their original use sites.
+            // Belobug 4eb6cfdf (GPL-3.0): sharing getDimensions across
+            // blocks crashes the RDNA4 driver compiler on some compute PSOs.
+            // Other pure calls remain eligible for common-subexpression reuse.
+            Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.getDimensions" => return None,
             Op::Call(f, args) => Key::Call(*f, args.clone()),
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
@@ -1444,6 +1449,38 @@ mod tests {
         assert_eq!(body(&m, then), 2);
         assert_eq!(body(&m, other), 2);
         assert_eq!(body(&m, join), 2);
+        m.write();
+    }
+
+    #[test]
+    fn dimensions_remain_local_but_other_pure_calls_still_reuse() {
+        let Diamond {
+            k: Kit { mut m, b, writes, .. },
+            x,
+            y,
+            then,
+            other,
+            ..
+        } = diamond();
+        let ty = m.int(32);
+        let fty = m.func_ty(ty, vec![ty, ty]);
+        m.ptr(fty);
+        let dims = m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+        let pure = m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+        let top = m.call(b, dims, vec![x, y]);
+        let shared = m.call(b, pure, vec![x, y]);
+        m.call(b, writes, vec![top, shared]);
+        let again = m.call(then, dims, vec![x, y]);
+        let duplicate = m.call(then, pure, vec![x, y]);
+        m.call(then, writes, vec![again, duplicate]);
+        let sibling = m.call(other, dims, vec![x, y]);
+        m.call(other, writes, vec![sibling, sibling]);
+
+        m.optimise(REUSE);
+        assert_eq!(stores(&m, then), [[again, shared]]);
+        assert_eq!(stores(&m, other), [[sibling, sibling]]);
+        assert_eq!(body(&m, then), 2);
+        assert_eq!(body(&m, other), 2);
         m.write();
     }
 
