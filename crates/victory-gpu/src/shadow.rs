@@ -209,6 +209,95 @@ unsafe fn equal_avx512(a: &[u8], b: &[u8]) -> bool {
     unsafe { victory_equal_page_avx512(a.as_ptr(), b.as_ptr()) != 0 }
 }
 
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    ".text",
+    ".globl victory_skip_equal3_avx512",
+    "victory_skip_equal3_avx512:",
+    "    xor eax, eax",
+    "    shl r9, 6",
+    "    test r9, r9",
+    "    jz 3f",
+    "2:",
+    "    vmovdqu64 zmm0, [rcx + rax]",
+    "    vpcmpeqb k1, zmm0, [rdx + rax]",
+    "    vpcmpeqb k2, zmm0, [r8 + rax]",
+    "    kandq k1, k1, k2",
+    "    kortestq k1, k1",
+    "    jnc 3f",
+    "    add rax, 64",
+    "    cmp rax, r9",
+    "    jb 2b",
+    "3:",
+    "    vzeroupper",
+    "    ret",
+);
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn skip_equal3_avx512(a: &[u8], b: &[u8], c: &[u8]) -> usize {
+    unsafe extern "system" {
+        fn victory_skip_equal3_avx512(a: *const u8, b: *const u8, c: *const u8, n64: usize) -> usize;
+    }
+    let n64 = a.len().min(b.len()).min(c.len()) / 64;
+    // SAFETY: caller verified AVX-512F/BW and all three slices cover `n64 * 64` bytes.
+    unsafe { victory_skip_equal3_avx512(a.as_ptr(), b.as_ptr(), c.as_ptr(), n64) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn skip_equal3_avx2(a: &[u8], b: &[u8], c: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len()).min(c.len()) & !31;
+    let mut i = 0;
+    while i < n {
+        // SAFETY: `i + 32 <= n` for all three slices.
+        let (va, vb, vc) = unsafe {
+            (
+                _mm256_loadu_si256(a.as_ptr().add(i).cast()),
+                _mm256_loadu_si256(b.as_ptr().add(i).cast()),
+                _mm256_loadu_si256(c.as_ptr().add(i).cast()),
+            )
+        };
+        let eq = _mm256_and_si256(_mm256_cmpeq_epi8(va, vb), _mm256_cmpeq_epi8(va, vc));
+        if _mm256_movemask_epi8(eq) != -1 {
+            break;
+        }
+        i += 32;
+    }
+    i
+}
+
+fn skip_equal3_scalar(a: &[u8], b: &[u8], c: &[u8]) -> usize {
+    let n = a.len().min(b.len()).min(c.len()) & !7;
+    let mut i = 0;
+    while i < n && a[i..i + 8] == b[i..i + 8] && a[i..i + 8] == c[i..i + 8] {
+        i += 8;
+    }
+    i
+}
+
+/// Returns a byte prefix where `a`, `b`, and `c` are identical.
+fn skip_equal3(a: &[u8], b: &[u8], c: &[u8]) -> usize {
+    type Skip = unsafe fn(&[u8], &[u8], &[u8]) -> usize;
+    static SKIP: std::sync::OnceLock<Skip> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+            {
+                return skip_equal3_avx512;
+            }
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return skip_equal3_avx2;
+            }
+        }
+        skip_equal3_scalar
+    });
+    // SAFETY: runtime ISA dispatch ensures the selected function is supported.
+    unsafe { skip(a, b, c) }
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -2383,12 +2472,19 @@ fn merge_gpu_writes(
 ) {
     let n = title.len().min(host.len()).min(old.len());
     dirty.clear();
-    let mut i = 0;
+    let mut i = if n >= 32 {
+        skip_equal3(&title[..n], &host[..n], &old[..n])
+    } else {
+        0
+    };
     while i + 8 <= n {
         let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
         let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
         if hw == ow {
-            host[i..i + 8].copy_from_slice(&title[i..i + 8]);
+            let tw = &title[i..i + 8];
+            if host[i..i + 8] != *tw {
+                host[i..i + 8].copy_from_slice(tw);
+            }
         } else {
             for k in i..i + 8 {
                 let h = host[k];
@@ -2400,6 +2496,9 @@ fn merge_gpu_writes(
             }
         }
         i += 8;
+        if n - i >= 64 {
+            i += skip_equal3(&title[i..n], &host[i..n], &old[i..n]);
+        }
     }
     for k in i..n {
         let h = host[k];
@@ -2466,7 +2565,11 @@ fn merge_gpu_writes_card(
     let n = title.len().min(staging_old.len()).min(gpu_new.len());
     dirty.clear();
     let mut cpu_modified = false;
-    let mut i = 0;
+    let mut i = if n >= 32 {
+        skip_equal3(&title[..n], &staging_old[..n], &gpu_new[..n])
+    } else {
+        0
+    };
     while i + 8 <= n {
         let gw = u64::from_ne_bytes(gpu_new[i..i + 8].try_into().unwrap());
         let ow = u64::from_ne_bytes(staging_old[i..i + 8].try_into().unwrap());
@@ -2493,6 +2596,9 @@ fn merge_gpu_writes_card(
             }
         }
         i += 8;
+        if n - i >= 64 {
+            i += skip_equal3(&title[i..n], &staging_old[i..n], &gpu_new[i..n]);
+        }
     }
     for k in i..n {
         let g = gpu_new[k];
@@ -2855,6 +2961,62 @@ mod tests {
             b[i] ^= 0xff;
         }
         assert!(!page_equal(&a[..5], &b[..4]));
+    }
+
+    #[test]
+    fn simd_skip_equal3_and_card_merge_match_at_dirty_boundaries() {
+        let a = vec![0x3Cu8; 512];
+        let mut b = a.clone();
+        let c = a.clone();
+        assert_eq!(skip_equal3_scalar(&a, &b, &c), 512);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: CPU supports AVX2.
+                assert_eq!(unsafe { skip_equal3_avx2(&a, &b, &c) }, 512);
+            }
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+            {
+                // SAFETY: CPU supports AVX-512BW.
+                assert_eq!(unsafe { skip_equal3_avx512(&a, &b, &c) }, 512);
+            }
+        }
+        b[199] ^= 1;
+        assert_eq!(skip_equal3_scalar(&a, &b, &c), 192);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: CPU supports AVX2.
+                assert_eq!(unsafe { skip_equal3_avx2(&a, &b, &c) }, 192);
+            }
+            if std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+            {
+                // SAFETY: CPU supports AVX-512BW.
+                assert_eq!(unsafe { skip_equal3_avx512(&a, &b, &c) }, 192);
+            }
+        }
+        // Card merge across multiple 64-byte blocks with both GPU and CPU writes.
+        let old = vec![0x11u8; 300];
+        let mut title = old.clone();
+        let mut staging = old.clone();
+        let mut gpu = old.clone();
+        gpu[70..75].copy_from_slice(&[1, 2, 3, 4, 5]);
+        title[210..213].copy_from_slice(&[9, 8, 7]);
+        let mut dirty = Vec::new();
+        assert!(merge_gpu_writes_card(&mut title, &mut staging, &gpu, &mut dirty));
+        assert_eq!(dirty, vec![(70, 75)]);
+        assert_eq!(&title[70..75], &[1, 2, 3, 4, 5]);
+        assert_eq!(&staging[70..75], &[1, 2, 3, 4, 5]);
+        assert_eq!(&staging[210..213], &[9, 8, 7]);
+        // Standard merge preserves dirty spans around unchanged SIMD stretches.
+        let mut m_title = old.clone();
+        let mut m_host = old.clone();
+        m_host[140..144].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        merge_gpu_writes(&mut m_title, &mut m_host, &old, &mut dirty);
+        assert_eq!(dirty, vec![(140, 144)]);
+        assert_eq!(&m_title[140..144], &[0xAA, 0xBB, 0xCC, 0xDD]);
     }
 
     #[test]
