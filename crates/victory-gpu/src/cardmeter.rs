@@ -20,6 +20,7 @@ use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+use windows::core::Interface;
 
 /// What a timed list is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,7 @@ impl Span {
 }
 
 struct Meter {
+    device: usize,
     heap: ID3D12QueryHeap,
     back: ID3D12Resource,
     /// The read-back buffer's bytes, mapped permanently.
@@ -155,6 +157,7 @@ impl Meter {
                 "the card's time is measured by kind of list (VICTORY_CARD_METER=0: disabled)"
             );
             Some(Meter {
+                device: device.as_raw() as usize,
                 heap,
                 back,
                 mapped: mapped as usize,
@@ -217,15 +220,28 @@ fn read_pair_raw(mapped: usize, pair: u32) -> (u64, u64) {
     }
 }
 
+fn list_device(list: &ID3D12GraphicsCommandList) -> Option<usize> {
+    let mut dev: Option<ID3D12Device> = None;
+    // SAFETY: `list` is a live D3D12 command list.
+    unsafe { list.GetDevice(&mut dev).ok()? };
+    Some(dev?.as_raw() as usize)
+}
+
 /// Begins timing a list of `kind`: records the opening timestamp query.
 pub(crate) fn begin(list: &ID3D12GraphicsCommandList, kind: Kind) -> Span {
     if !on() {
         return Span::NONE;
     }
+    let Some(dev) = list_device(list) else {
+        return Span::NONE;
+    };
     let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(m) = meter.get_or_insert_with(make) else {
         return Span::NONE;
     };
+    if m.device != dev {
+        return Span::NONE;
+    }
     m.begin_list(list, kind)
 }
 
