@@ -451,6 +451,7 @@ impl Shadow {
         let mut written = 0usize;
         let mut title_buf = pooled(PAGE);
         title_buf.resize(PAGE, 0);
+        let mut dirty = Vec::new();
         let mut synced_pages: Vec<usize> = Vec::new();
         let mut min_addr = usize::MAX;
         let mut max_addr = 0usize;
@@ -483,20 +484,9 @@ impl Shadow {
                     staging_old.copy_from_slice(gpu_new);
                     continue;
                 }
-                let (dirty_span, cpu_modified) =
-                    merge_gpu_writes_card(title_slice, staging_old, gpu_new);
-                if let Some((dirty_start, dirty_end)) = dirty_span {
-                    let dirty_len = dirty_end - dirty_start;
-                    if mode != 1 {
-                        crate::watch::writing(title_addr + dirty_start, dirty_len);
-                    }
-                    crate::host::write_mapped(
-                        (title_addr + dirty_start) as *mut u8,
-                        title_slice[dirty_start..].as_ptr(),
-                        dirty_len,
-                    );
-                    written += dirty_len;
-                }
+                let cpu_modified =
+                    merge_gpu_writes_card(title_slice, staging_old, gpu_new, &mut dirty);
+                written += write_dirty_runs(title_addr, title_slice, &dirty, mode != 1);
                 if cpu_modified {
                     // Concurrent CPU write on the same page: upload merged
                     // `staging` back to VRAM before the next submission.
@@ -725,6 +715,7 @@ impl Shadow {
             // overlapping ranges can skip it for the rest of the submission.
             let mode = self.watched.load(Ordering::Relaxed);
             let mut title: Option<Vec<u8>> = None;
+            let mut dirty = Vec::new();
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -743,20 +734,8 @@ impl Shadow {
                     if crate::host::read_into((start + at) as *const u8, title_slice) {
                         // Title memory with the GPU's bytes put in; the copy
                         // takes the title's bytes in turn.
-                        if let Some((dirty_start, dirty_end)) =
-                            merge_gpu_writes(title_slice, host, old)
-                        {
-                            let dirty_len = dirty_end - dirty_start;
-                            if mode != 1 {
-                                crate::watch::writing(start + at + dirty_start, dirty_len);
-                            }
-                            crate::host::write_mapped(
-                                (start + at + dirty_start) as *mut u8,
-                                title_slice[dirty_start..].as_ptr(),
-                                dirty_len,
-                            );
-                            written += dirty_len;
-                        }
+                        merge_gpu_writes(title_slice, host, old, &mut dirty);
+                        written += write_dirty_runs(start + at, title_slice, &dirty, mode != 1);
                         synced.push((start + at) / PAGE);
                     }
                 }
@@ -2281,6 +2260,8 @@ impl Shadow {
         let written = std::sync::atomic::AtomicUsize::new(0);
         crate::host::in_parallel(&work, 8, |chunk| {
             let mut title: Option<Vec<u8>> = None;
+            let mut dirty = Vec::new();
+            let mut bytes_written = 0;
             for &(at, data, n, old) in chunk {
                 // SAFETY: the tile's mapping and its snapshot (kept under the
                 // lock held above); this tile is this thread's alone.
@@ -2303,20 +2284,13 @@ impl Shadow {
                 if !crate::host::read_into(at as *const u8, &mut buf[..n]) {
                     continue;
                 }
-                if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
-                    let dirty_len = dirty_end - dirty_start;
-                    crate::watch::writing(at + dirty_start, dirty_len);
-                    crate::host::write_mapped(
-                        (at + dirty_start) as *mut u8,
-                        buf[dirty_start..].as_ptr(),
-                        dirty_len,
-                    );
-                    written.fetch_add(dirty_len, Ordering::Relaxed);
-                }
+                merge_gpu_writes_mut(&mut buf[..n], host, old, &mut dirty);
+                bytes_written += write_dirty_runs(at, &buf[..n], &dirty, true);
             }
             if let Some(buf) = title {
                 give_back(buf);
             }
+            written.fetch_add(bytes_written, Ordering::Relaxed);
         });
         let written = written.into_inner();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -2333,14 +2307,49 @@ fn sparse_tile_base(data: usize, address: usize) -> usize {
     data - address % PAGE
 }
 
-/// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
-/// `title`, and returns the tight `[first, last)` byte span where `title` was
-/// modified (or `None` if nothing changed). Scans 8 bytes at a time so
-/// unchanged 64-bit words skip per-byte branching.
-fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
+/// Appends a changed byte to the previous run when the two are adjacent.
+fn push_dirty_byte(dirty: &mut Vec<(usize, usize)>, at: usize) {
+    if let Some((_, end)) = dirty.last_mut()
+        && *end == at
+    {
+        *end += 1;
+    } else {
+        dirty.push((at, at + 1));
+    }
+}
+
+/// Writes only the changed runs. A CPU store between them can occur after
+/// the read of title memory and must survive landing the GPU writes.
+fn write_dirty_runs(
+    address: usize,
+    bytes: &[u8],
+    dirty: &[(usize, usize)],
+    open_guards: bool,
+) -> usize {
+    if open_guards
+        && let (Some(&(first, _)), Some(&(_, last))) = (dirty.first(), dirty.last())
+    {
+        crate::watch::writing(address + first, last - first);
+    }
+    let mut written = 0;
+    for &(start, end) in dirty {
+        let run = &bytes[start..end];
+        crate::host::write_mapped((address + start) as *mut u8, run.as_ptr(), run.len());
+        written += run.len();
+    }
+    written
+}
+
+/// Merges GPU changes into the title snapshot and records the changed runs.
+/// Unchanged 64-bit words skip per-byte branching.
+fn merge_gpu_writes(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &[u8],
+    dirty: &mut Vec<(usize, usize)>,
+) {
     let n = title.len().min(host.len()).min(old.len());
-    let mut first = usize::MAX;
-    let mut last = 0usize;
+    dirty.clear();
     let mut i = 0;
     while i + 8 <= n {
         let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
@@ -2352,8 +2361,7 @@ fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(us
                 let h = host[k];
                 if h != old[k] && title[k] != h {
                     title[k] = h;
-                    first = first.min(k);
-                    last = k + 1;
+                    push_dirty_byte(dirty, k);
                 }
                 host[k] = title[k];
             }
@@ -2364,12 +2372,10 @@ fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(us
         let h = host[k];
         if h != old[k] && title[k] != h {
             title[k] = h;
-            first = first.min(k);
-            last = k + 1;
+            push_dirty_byte(dirty, k);
         }
         host[k] = title[k];
     }
-    (first < last).then_some((first, last))
 }
 
 /// Same as [`merge_gpu_writes`], also updating `old` to match `title`.
@@ -2377,10 +2383,10 @@ fn merge_gpu_writes_mut(
     title: &mut [u8],
     host: &mut [u8],
     old: &mut [u8],
-) -> Option<(usize, usize)> {
+    dirty: &mut Vec<(usize, usize)>,
+) {
     let n = title.len().min(host.len()).min(old.len());
-    let mut first = usize::MAX;
-    let mut last = 0usize;
+    dirty.clear();
     let mut i = 0;
     while i + 8 <= n {
         let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
@@ -2394,8 +2400,7 @@ fn merge_gpu_writes_mut(
                 let h = host[k];
                 if h != old[k] && title[k] != h {
                     title[k] = h;
-                    first = first.min(k);
-                    last = k + 1;
+                    push_dirty_byte(dirty, k);
                 }
                 let t = title[k];
                 host[k] = t;
@@ -2408,28 +2413,25 @@ fn merge_gpu_writes_mut(
         let h = host[k];
         if h != old[k] && title[k] != h {
             title[k] = h;
-            first = first.min(k);
-            last = k + 1;
+            push_dirty_byte(dirty, k);
         }
         let t = title[k];
         host[k] = t;
         old[k] = t;
     }
-    (first < last).then_some((first, last))
 }
 
 /// Merges GPU-modified bytes (`gpu_new != staging_old`) into `title` and syncs
-/// `staging_old` to the merged bytes. Returns `(dirty_span_for_title, cpu_modified)`
-/// where `cpu_modified` is true if any byte unchanged by the GPU differed in `title`
-/// (a concurrent title CPU write that must be uploaded back to VRAM).
+/// `staging_old` to the merged bytes. Returns whether a title CPU write must
+/// be uploaded to VRAM.
 fn merge_gpu_writes_card(
     title: &mut [u8],
     staging_old: &mut [u8],
     gpu_new: &[u8],
-) -> (Option<(usize, usize)>, bool) {
+    dirty: &mut Vec<(usize, usize)>,
+) -> bool {
     let n = title.len().min(staging_old.len()).min(gpu_new.len());
-    let mut first = usize::MAX;
-    let mut last = 0usize;
+    dirty.clear();
     let mut cpu_modified = false;
     let mut i = 0;
     while i + 8 <= n {
@@ -2448,8 +2450,7 @@ fn merge_gpu_writes_card(
                 if g != o {
                     if title[k] != g {
                         title[k] = g;
-                        first = first.min(k);
-                        last = k + 1;
+                        push_dirty_byte(dirty, k);
                     }
                     staging_old[k] = g;
                 } else if title[k] != o {
@@ -2466,8 +2467,7 @@ fn merge_gpu_writes_card(
         if g != o {
             if title[k] != g {
                 title[k] = g;
-                first = first.min(k);
-                last = k + 1;
+                push_dirty_byte(dirty, k);
             }
             staging_old[k] = g;
         } else if title[k] != o {
@@ -2475,7 +2475,7 @@ fn merge_gpu_writes_card(
             cpu_modified = true;
         }
     }
-    ((first < last).then_some((first, last)), cpu_modified)
+    cpu_modified
 }
 
 struct Entry {
@@ -2736,6 +2736,49 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copy_back_dirty_runs_preserve_late_cpu_writes_between_gpu_changes() {
+        let before = [0; 19];
+        let mut gpu = before;
+        gpu[6..10].fill(1);
+        gpu[17] = 2;
+        gpu[18] = 3;
+        let mut title = before;
+        title[3] = 8;
+        title[18] = 3;
+        let mut landed = title;
+        landed[12] = 9; // CPU store after the title snapshot.
+        let expected = [(6, 10), (17, 18)];
+        let mut dirty = vec![(0, 19)];
+
+        let mut mirror = gpu;
+        let mut merged = title;
+        merge_gpu_writes(&mut merged, &mut mirror, &before, &mut dirty);
+        assert_eq!(dirty, expected);
+        assert_eq!(merged, mirror);
+
+        let mut sparse_before = before;
+        mirror = gpu;
+        merged = title;
+        merge_gpu_writes_mut(&mut merged, &mut mirror, &mut sparse_before, &mut dirty);
+        assert_eq!(dirty, expected);
+        assert_eq!(sparse_before, merged);
+        assert_eq!(mirror, merged);
+
+        let mut staging = before;
+        merged = title;
+        assert!(merge_gpu_writes_card(&mut merged, &mut staging, &gpu, &mut dirty));
+        assert_eq!(dirty, expected);
+        assert_eq!(staging, merged);
+
+        for (start, end) in dirty {
+            landed[start..end].copy_from_slice(&merged[start..end]);
+        }
+        assert_eq!(landed[12], 9);
+        landed[12] = title[12];
+        assert_eq!(landed, merged);
+    }
+
     #[test]
     fn merged_copy_back_covers_pending_ranges_without_crossing_gaps() {
         let mut ranges = vec![(30, 40), (0, 7), (7, 12), (2, 3), (5, 15), (32, 33)];
