@@ -684,9 +684,14 @@ impl Host {
         let fence_val = *submitted;
         // SAFETY: caller holds `self.submitted`; `cmd` is closed; fence & event are ours.
         unsafe {
-            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+            let lists = [Some(cmd)];
+            crate::cardmeter::executing(&lists, &self.fence);
+            self.queue.ExecuteCommandLists(&lists);
             match self.queue.Signal(&self.fence, fence_val) {
-                Ok(()) => wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val),
+                Ok(()) => {
+                    crate::cardmeter::signalled(&self.fence, fence_val);
+                    wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val);
+                }
                 Err(e) => tracing::warn!(error = %e, "card GPU wait failed"),
             }
         }
@@ -1373,6 +1378,7 @@ const STAMPS: u32 = 16384;
 impl Drop for HostList {
     fn drop(&mut self) {
         self.wait_for_last_submission();
+        crate::cardmeter::release(&self.list);
         crate::memstat::sub(&crate::memstat::LISTS, 1);
         self.release_kept();
     }
@@ -2050,11 +2056,15 @@ impl Host {
             && runs.iter().all(|list| list.deferred().texture_backs.is_empty());
         if let Some(first) = first {
             // SAFETY: a closed list.
-            unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
+            let lists = [Some(first)];
+            crate::cardmeter::executing(&lists, &self.fence);
+            unsafe { self.queue.ExecuteCommandLists(&lists) };
         }
         if let Some(card_before) = card_before {
             // SAFETY: a closed list.
-            unsafe { self.queue.ExecuteCommandLists(&[Some(card_before)]) };
+            let lists = [Some(card_before)];
+            crate::cardmeter::executing(&lists, &self.fence);
+            unsafe { self.queue.ExecuteCommandLists(&lists) };
         }
         let mut async_signalled = false;
         let mut card_after_ran = false;
@@ -2068,6 +2078,7 @@ impl Host {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists.
+            crate::cardmeter::executing(group, &self.fence);
             unsafe { self.queue.ExecuteCommandLists(group) };
             if !each && i + 1 < groups.len() {
                 continue;
@@ -2076,7 +2087,9 @@ impl Host {
                 && let Some(after) = card_after.take()
             {
                 // SAFETY: closed list; runs immediately after the final group under the same fence.
-                unsafe { self.queue.ExecuteCommandLists(&[Some(after)]) };
+                let lists = [Some(after)];
+            crate::cardmeter::executing(&lists, &self.fence);
+            unsafe { self.queue.ExecuteCommandLists(&lists) };
                 card_after_ran = true;
             }
             *submitted += 1;
@@ -2085,6 +2098,7 @@ impl Host {
                 // SAFETY: the fence is ours.
                 match unsafe { self.queue.Signal(&self.fence, fence_val) } {
                     Ok(()) => {
+                        crate::cardmeter::signalled(&self.fence, fence_val);
                         for list in runs {
                             list.last_fence.store(fence_val, Ordering::Release);
                         }
@@ -2098,7 +2112,10 @@ impl Host {
             }
             // SAFETY: the fence is ours.
             match unsafe { self.queue.Signal(&self.fence, fence_val) } {
-                Ok(()) => wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val),
+                Ok(()) => {
+                    crate::cardmeter::signalled(&self.fence, fence_val);
+                    wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val);
+                }
                 Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
             }
             #[cfg(feature = "diagnostics")]

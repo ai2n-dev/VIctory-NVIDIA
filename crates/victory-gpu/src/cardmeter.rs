@@ -6,16 +6,15 @@
 //! post-submission hash compare (`record_after`).
 //!
 //! Here each list gets one timestamp where it begins and one where it ends,
-//! resolved into one persistent read-back buffer by the list itself. A pair is
-//! read a second and a half after it was recorded, when every flight of that
-//! time has long landed, and its length goes to the frame log's totals by
-//! kind. So the frame log's card columns reflect the frames of a moment ago:
-//! accurate for the usual frame, rather than placing one long frame.
+//! resolved into one persistent read-back buffer by the list itself. Slots
+//! belong to a recording until reset/drop, not until the first execution:
+//! a closed command list can be submitted again. Read only after the actual
+//! submission fence completes. No extra GPU wait is introduced.
 //!
 //! On by default in diagnostics builds; `VICTORY_CARD_METER=0` or `1` says
 //! otherwise. Two queries and a resolve per list.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -37,8 +36,6 @@ pub(crate) enum Kind {
 const PAIRS: u32 = 8192;
 /// Minimum headroom kept free in the ring before dropping new pairs.
 const HEADROOM: u32 = 64;
-/// A pair is read this long after it was recorded.
-const AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// A pair being recorded: its place in the ring, or none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,12 +62,44 @@ struct Meter {
     mapped: usize,
     /// Ticks per second of the queue's timestamp clock.
     frequency: u64,
-    next: u32,
-    /// Pairs recorded and not read yet: slot, kind, when recorded.
-    pending: VecDeque<(u32, Kind, std::time::Instant)>,
-    /// What each slot held when last read: an unwritten slot retains its old
-    /// pair and is not counted twice.
-    seen: Vec<(u64, u64)>,
+    free: VecDeque<u32>,
+    recordings: HashMap<usize, Recording>,
+}
+
+/// A slot remains owned by the recording after a sample is collected.
+struct Recording {
+    pair: u32,
+    kind: Kind,
+    state: State,
+}
+
+enum State {
+    Recorded,
+    Running(ID3D12Fence),
+    Submitted(ID3D12Fence, u64),
+    Sampled,
+}
+
+impl Recording {
+    fn sample(&mut self, read: impl FnOnce(u32) -> (u64, u64)) -> Option<(Kind, u64, u64)> {
+        let State::Submitted(fence, value) = &self.state else { return None };
+        // SAFETY: a live fence retained by this recording.
+        let completed = unsafe { fence.GetCompletedValue() };
+        if completed == u64::MAX {
+            self.state = State::Sampled;
+            return None;
+        }
+        if completed < *value {
+            return None;
+        }
+        let (begin, end) = read(self.pair);
+        self.state = State::Sampled;
+        Some((self.kind, begin, end))
+    }
+
+    fn recyclable(&self) -> bool {
+        matches!(self.state, State::Recorded | State::Sampled)
+    }
 }
 
 // SAFETY: D3D12 query heap/resource are free-threaded and `mapped` is only read under `METER`.
@@ -162,27 +191,37 @@ impl Meter {
                 back,
                 mapped: mapped as usize,
                 frequency,
-                next: 0,
-                pending: VecDeque::new(),
-                seen: vec![(0, 0); PAIRS as usize],
+                free: (0..PAIRS - HEADROOM).collect(),
+                recordings: HashMap::new(),
             })
         }
     }
 
-    fn alloc_slot(&mut self, kind: Kind, at: std::time::Instant) -> Option<u32> {
-        if self.pending.len() as u32 >= PAIRS - HEADROOM {
-            return None;
+    fn release(&mut self, key: usize) {
+        if let Some(mut recording) = self.recordings.remove(&key) {
+            let mapped = self.mapped;
+            if let Some((kind, begin, end)) = recording.sample(|pair| read_pair_raw(mapped, pair)) {
+                account(kind, micros(begin, end, self.frequency));
+            }
+            // An unsignalled or incomplete submission quarantines the slot.
+            // Losing diagnostics is safer than aliasing a GPU write.
+            if recording.recyclable() {
+                self.free.push_back(recording.pair);
+            }
         }
-        let pair = self.next;
-        self.next = (self.next + 1) % PAIRS;
-        self.pending.push_back((pair, kind, at));
+    }
+
+    fn alloc_slot(&mut self, key: usize, kind: Kind) -> Option<u32> {
+        // Only called after reset of the previous recording, if any.
+        self.release(key);
+        let pair = self.free.pop_front()?;
+        self.recordings.insert(key, Recording { pair, kind, state: State::Recorded });
         Some(pair)
     }
 
     fn begin_list(&mut self, list: &ID3D12GraphicsCommandList, kind: Kind) -> Span {
-        let Some(pair) = self.alloc_slot(kind, std::time::Instant::now()) else {
-            return Span::NONE;
-        };
+        let Some(key) = list_key(list) else { return Span::NONE };
+        let Some(pair) = self.alloc_slot(key, kind) else { return Span::NONE };
         // SAFETY: an open list and our live query heap.
         unsafe { list.EndQuery(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, pair * 2) };
         Span(pair)
@@ -227,6 +266,56 @@ fn list_device(list: &ID3D12GraphicsCommandList) -> Option<usize> {
     Some(dev?.as_raw() as usize)
 }
 
+fn list_key(list: &ID3D12GraphicsCommandList) -> Option<usize> {
+    list.cast::<ID3D12CommandList>().ok().map(|l| l.as_raw() as usize)
+}
+
+/// Release after reset or destruction, never merely after execution.
+pub(crate) fn release(list: &ID3D12GraphicsCommandList) {
+    if !on() {
+        return;
+    }
+    let Some(key) = list_key(list) else { return };
+    let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(m)) = meter.as_mut() {
+        m.release(key);
+    }
+}
+
+/// Mark before ExecuteCommandLists so collection cannot race a new write.
+/// Multiple executions of one recording in a batch keep the last sample.
+pub(crate) fn executing(lists: &[Option<ID3D12CommandList>], fence: &ID3D12Fence) {
+    if !on() {
+        return;
+    }
+    let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(m)) = meter.as_mut() else { return };
+    let mapped = m.mapped;
+    let frequency = m.frequency;
+    for list in lists.iter().flatten() {
+        if let Some(r) = m.recordings.get_mut(&(list.as_raw() as usize)) {
+            if let Some((kind, begin, end)) = r.sample(|pair| read_pair_raw(mapped, pair)) {
+                account(kind, micros(begin, end, frequency));
+            }
+            r.state = State::Running(fence.clone());
+        }
+    }
+}
+
+/// Attach a successfully signalled fence to the recordings it covers.
+pub(crate) fn signalled(fence: &ID3D12Fence, value: u64) {
+    if !on() {
+        return;
+    }
+    let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(m)) = meter.as_mut() else { return };
+    for r in m.recordings.values_mut() {
+        if matches!(&r.state, State::Running(owner) if owner.as_raw() == fence.as_raw()) {
+            r.state = State::Submitted(fence.clone(), value);
+        }
+    }
+}
+
 /// Begins timing a list of `kind`: records the opening timestamp query.
 pub(crate) fn begin(list: &ID3D12GraphicsCommandList, kind: Kind) -> Span {
     if !on() {
@@ -265,55 +354,31 @@ fn micros(begin: u64, end: u64, frequency: u64) -> u64 {
     ((end - begin) as u128 * 1_000_000 / frequency as u128).min(10_000_000) as u64
 }
 
-fn collect_ready(
-    pending: &mut VecDeque<(u32, Kind, std::time::Instant)>,
-    seen: &mut [(u64, u64)],
-    frequency: u64,
-    now: std::time::Instant,
-    mut read: impl FnMut(u32) -> (u64, u64),
-) {
-    while let Some(&(pair, kind, at)) = pending.front() {
-        if now.duration_since(at) < AFTER {
-            break;
-        }
-        pending.pop_front();
-        let (begin, end) = read(pair);
-        if std::mem::replace(&mut seen[pair as usize], (begin, end)) == (begin, end) {
-            continue;
-        }
-        let us = micros(begin, end, frequency);
-        use crate::framelog::{T, add};
-        match kind {
-            Kind::Sync => {
-                add(T::CardSyncUs, us);
-                add(T::CardSyncLists, 1);
-            }
-            Kind::Check => {
-                add(T::CardCheckUs, us);
-                add(T::CardCheckLists, 1);
-            }
-            Kind::Lists => {
-                add(T::CardListsUs, us);
-                add(T::CardLists, 1);
-            }
-        }
-    }
+fn account(kind: Kind, us: u64) {
+    use crate::framelog::{T, add};
+    let (time, count) = match kind {
+        Kind::Sync => (T::CardSyncUs, T::CardSyncLists),
+        Kind::Check => (T::CardCheckUs, T::CardCheckLists),
+        Kind::Lists => (T::CardListsUs, T::CardLists),
+    };
+    add(time, us);
+    add(count, 1);
 }
 
-/// Collects resolved pairs older than [`AFTER`] into the frame log's totals.
+/// Collect completed samples without releasing their recorded slots.
 pub(crate) fn collect() {
     if !on() {
         return;
     }
     let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(Some(m)) = meter.as_mut() else {
-        return;
-    };
-    let (pending, seen, frequency, mapped) =
-        (&mut m.pending, &mut m.seen, m.frequency, m.mapped);
-    collect_ready(pending, seen, frequency, std::time::Instant::now(), |pair| {
-        read_pair_raw(mapped, pair)
-    });
+    let Some(Some(m)) = meter.as_mut() else { return };
+    let mapped = m.mapped;
+    let frequency = m.frequency;
+    for r in m.recordings.values_mut() {
+        if let Some((kind, begin, end)) = r.sample(|pair| read_pair_raw(mapped, pair)) {
+            account(kind, micros(begin, end, frequency));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -347,78 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn collect_ready_respects_delay_dedups_unchanged_and_routes_kinds() {
-        use crate::framelog::{T, total};
-        let t0 = std::time::Instant::now();
-        let mut pending = VecDeque::new();
-        let mut seen = vec![(0, 0); 8];
-        pending.push_back((0, Kind::Sync, t0));
-        pending.push_back((1, Kind::Check, t0));
-        pending.push_back((2, Kind::Lists, t0 + std::time::Duration::from_millis(500)));
-
-        let b_sync = (total(T::CardSyncUs), total(T::CardSyncLists));
-        let b_check = (total(T::CardCheckUs), total(T::CardCheckLists));
-        let b_lists = (total(T::CardListsUs), total(T::CardLists));
-
-        // Just before AFTER: nothing collected yet.
-        collect_ready(
-            &mut pending,
-            &mut seen,
-            1_000_000,
-            t0 + AFTER - std::time::Duration::from_millis(1),
-            |_| (100, 200),
-        );
-        assert_eq!(pending.len(), 3);
-
-        // At AFTER for pairs 0 and 1 (pair 2 not ready yet).
-        collect_ready(&mut pending, &mut seen, 1_000_000, t0 + AFTER, |pair| {
-            match pair {
-                0 => (10, 60),
-                1 => (20, 90),
-                _ => unreachable!("pair 2 is still immature"),
-            }
-        });
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].0, 2);
-        assert_eq!(
-            (
-                total(T::CardSyncUs) - b_sync.0,
-                total(T::CardSyncLists) - b_sync.1
-            ),
-            (50, 1)
-        );
-        assert_eq!(
-            (
-                total(T::CardCheckUs) - b_check.0,
-                total(T::CardCheckLists) - b_check.1
-            ),
-            (70, 1)
-        );
-        assert_eq!(total(T::CardLists) - b_lists.1, 0);
-
-        // Duplicate timestamps at slot 0 must not double-count; slot 2 matures at +500ms.
-        pending.push_back((0, Kind::Sync, t0));
-        collect_ready(
-            &mut pending,
-            &mut seen,
-            1_000_000,
-            t0 + AFTER + std::time::Duration::from_millis(500),
-            |pair| match pair {
-                2 => (5, 30),
-                0 => (10, 60),
-                _ => unreachable!(),
-            },
-        );
-        assert!(pending.is_empty());
-        assert_eq!(
-            (
-                total(T::CardListsUs) - b_lists.0,
-                total(T::CardLists) - b_lists.1
-            ),
-            (25, 1)
-        );
-        // Unchanged slot 0 pair did not add another Sync entry.
-        assert_eq!(total(T::CardSyncLists) - b_sync.1, 1);
+    fn unsubmitted_recording_is_not_read() {
+        let mut r = Recording { pair: 1, kind: Kind::Lists, state: State::Recorded };
+        assert!(r.sample(|_| panic!("unsubmitted slot")).is_none());
+        assert!(r.recyclable());
     }
 
     #[test]
@@ -459,7 +456,7 @@ mod tests {
                 .expect("list");
             // Advance past slot 0 so `span` is slot 1 (non-zero query/byte offsets).
             assert_eq!(
-                meter.alloc_slot(Kind::Lists, std::time::Instant::now()),
+                meter.alloc_slot(usize::MAX, Kind::Lists),
                 Some(0)
             );
             let span = meter.begin_list(&list, Kind::Lists);
@@ -477,21 +474,25 @@ mod tests {
             let (b, e) = meter.read_pair(1);
             assert!(b > 0 && e >= b, "expected resolved timestamps at slot 1: {b}..{e}");
 
-            // Ring wraps at PAIRS -> 0 and stops when PAIRS - HEADROOM slots are pending.
-            meter.pending.clear();
-            meter.next = PAIRS - 1;
-            assert_eq!(
-                meter.alloc_slot(Kind::Lists, std::time::Instant::now()),
-                Some(PAIRS - 1)
-            );
-            assert_eq!(
-                meter.alloc_slot(Kind::Lists, std::time::Instant::now()),
-                Some(0)
-            );
-            while meter.pending.len() < (PAIRS - HEADROOM) as usize {
-                assert!(meter.alloc_slot(Kind::Lists, std::time::Instant::now()).is_some());
+            let key = list_key(&list).unwrap();
+            let r = meter.recordings.get_mut(&key).unwrap();
+            r.state = State::Running(fence.clone());
+            assert!(r.sample(|_| panic!("unsignalled slot")).is_none());
+            assert!(!r.recyclable());
+            r.state = State::Submitted(fence.clone(), 2);
+            assert!(r.sample(|_| panic!("incomplete fence")).is_none());
+            fence.Signal(2).expect("complete fence");
+            assert_eq!(r.sample(|_| (10, 20)), Some((Kind::Lists, 10, 20)));
+            assert!(r.sample(|_| panic!("already sampled")).is_none());
+            // Even after collection, the slot belongs to the closed list.
+            assert!(!meter.free.contains(&span.raw()));
+            meter.release(key);
+            assert!(meter.free.contains(&span.raw()));
+            while meter.free.front().is_some() {
+                let key = meter.recordings.len() + 10;
+                assert!(meter.alloc_slot(key, Kind::Lists).is_some());
             }
-            assert!(meter.alloc_slot(Kind::Lists, std::time::Instant::now()).is_none());
+            assert!(meter.alloc_slot(usize::MAX - 1, Kind::Lists).is_none());
         }
     }
 }
