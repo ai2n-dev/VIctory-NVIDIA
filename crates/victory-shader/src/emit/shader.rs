@@ -454,8 +454,18 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// DXIL counts declared UAV ranges, not UAVs accessed through the heap.
+    fn update_stage_uav_flag(&mut self) {
+        let compute = self.threads.is_some() && self.mesh.is_none() && !self.rectangles;
+        let declared = !self.root_uavs.is_empty();
+        if declared && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        self.update_stage_uav_flag();
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let compute = self.threads.is_some() && self.mesh.is_none() && !self.rectangles;
@@ -792,6 +802,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
@@ -992,5 +1005,52 @@ mod tests {
             v.validate(&mut dead)
                 .unwrap_or_else(|err| panic!("ordered PS dead ROV failed validation: {err}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod stage_uav_tests {
+    use super::*;
+
+    #[test]
+    fn declared_uavs_require_graphics_stage_flag() {
+        for (pixel, threads, mesh, rectangles, declared, want) in [
+            (false, None, false, false, true, true),
+            (true, None, false, false, true, false),
+            (false, Some([1, 1, 1]), false, false, true, false),
+            (false, Some([1, 1, 1]), true, false, true, true),
+            (false, None, false, true, true, true),
+            (false, None, false, false, false, false),
+        ] {
+            let mut shader = Shader::new(pixel);
+            shader.threads = threads;
+            shader.rectangles = rectangles;
+            if mesh {
+                shader.mesh = Some(Mesh {
+                    max_vertices: 3,
+                    max_primitives: 1,
+                    topology: 2,
+                });
+            }
+            if declared {
+                shader.root_uav_handle(0, false);
+            } else {
+                shader.flags |= flags::RESOURCE_HEAP;
+            }
+            shader.update_stage_uav_flag();
+            assert_eq!(shader.flags & flags::UAVS_EVERY_STAGE != 0, want);
+        }
+    }
+
+    #[test]
+    fn vertex_root_uav_sets_container_feature_bit() {
+        let mut shader = Shader::new(false);
+        shader.root_uav_handle(0, false);
+        shader.m.terminate(shader.entry, super::super::bitcode::Term::Ret);
+        let dxil = shader.finish();
+        let first = u32::from_le_bytes(dxil[32..36].try_into().unwrap()) as usize;
+        assert_eq!(&dxil[first..first + 4], b"SFI0");
+        let features = u64::from_le_bytes(dxil[first + 8..first + 16].try_into().unwrap());
+        assert_ne!(features & 0x4, 0);
     }
 }

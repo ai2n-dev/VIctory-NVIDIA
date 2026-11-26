@@ -6,6 +6,9 @@
 //! instructions of `main` in block order.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+use crate::structure::Fx;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -201,12 +204,45 @@ enum MdDef {
     Node(Vec<Option<Md>>),
 }
 
+/// [`Fx`] with its high bits rotated down into the low ones, which pick the
+/// bucket: floats such as 1.0 and 3.0 differ only in their high bits, and
+/// would all start at one bucket. The tables it keys are only probed, never
+/// walked (ids follow insertion order), so it cannot change what is written.
+#[derive(Default)]
+struct Interned(Fx);
+
+impl Hasher for Interned {
+    fn finish(&self) -> u64 {
+        self.0.finish().rotate_left(26)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.0.write_u32(n);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0.write_u64(n);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0.write_usize(n);
+    }
+}
+
+/// Every `i32()`, `cmp()` and `dx.op` call looks up one of these, so the hash
+/// has to be cheap.
+type Ids<K> = HashMap<K, u32, BuildHasherDefault<Interned>>;
+
 #[derive(Default)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
-    type_ids: HashMap<TypeDef, u32>,
+    type_ids: Ids<TypeDef>,
     consts: Vec<(Ty, Const)>,
-    const_ids: HashMap<(Ty, Const), u32>,
+    const_ids: Ids<(Ty, Const)>,
     globals: Vec<Global>,
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,
@@ -358,7 +394,23 @@ impl Module {
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
-            self.consts[o as usize] = self.consts[n as usize].clone();
+            if o == n {
+                return;
+            }
+            let previous = self.consts[o as usize].clone();
+            let replacement = self.consts[n as usize].clone();
+            if self.const_ids.get(&previous) == Some(&o) {
+                self.const_ids.remove(&previous);
+                // Another constant may still hold the previous value after
+                // an earlier replacement. Keep its canonical ID if present.
+                if let Some(i) = self.consts.iter().enumerate().find_map(|(i, c)| {
+                    (i != o as usize && *c == previous).then_some(i as u32)
+                }) {
+                    self.const_ids.insert(previous, i);
+                }
+            }
+            self.consts[o as usize] = replacement.clone();
+            self.const_ids.entry(replacement).or_insert(n);
         }
     }
 
@@ -1405,6 +1457,47 @@ mod tests {
             let live = m.live();
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
+    }
+
+    /// Ids are the insertion order, whatever the hasher does with the keys:
+    /// words with only high bits set (1.0, 3.0, ...) are the hard case.
+    #[test]
+    fn interned_ids_follow_insertion_order() {
+        let mut m = Module::default();
+        let f32t = m.float();
+        let i32t = m.int(32);
+        let floats: Vec<V> = (0..2048u32).map(|k| m.f32(k << 16)).collect();
+        let ints: Vec<V> = (0..2048u32).map(|k| m.i32(k << 20)).collect();
+        for (k, &v) in floats.iter().chain(&ints).enumerate() {
+            assert_eq!(v, V::Const(k as u32));
+        }
+        for k in 0..2048u32 {
+            assert_eq!(m.f32(k << 16), floats[k as usize]);
+            assert_eq!(m.i32(k << 20), ints[k as usize]);
+        }
+        assert_eq!((f32t, i32t), (m.float(), m.int(32)));
+        assert_eq!(m.consts.len(), 4096);
+    }
+
+    #[test]
+    fn replacing_constants_preserves_interning_keys() {
+        let mut m = Module::default();
+        let old = m.i32(10);
+        let new = m.i32(20);
+        m.replace_const(old, new);
+        assert_eq!(m.int_value(old), Some(20));
+        assert_eq!(m.i32(20), new);
+        let ten = m.i32(10);
+        assert_ne!(ten, old);
+        assert_eq!(m.int_value(ten), Some(10));
+
+        // Replacing the canonical 20 leaves the other 20 valid.
+        let thirty = m.i32(30);
+        m.replace_const(new, thirty);
+        assert_eq!(m.i32(20), old);
+        assert_eq!(m.int_value(new), Some(30));
+        m.replace_const(old, old);
+        assert_eq!(m.i32(20), old);
     }
 
     #[test]

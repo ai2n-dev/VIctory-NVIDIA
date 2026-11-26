@@ -62,7 +62,7 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     /// It animates or draws hair strands ([`hair_strands`]).
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "diagnostics"))]
     hair: bool,
     /// Its result gets the least indirect light ([`crate::ambient`]).
     #[cfg(windows)]
@@ -82,7 +82,7 @@ pub(crate) struct Shader {
 /// strands, by its name. `VICTORY_HAIR` has them run.
 /// shortcut: left out, as some of them do not translate (an address from a
 /// phi) and the others draw lines all over the screen without them.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 fn hair_strands(container: &[u8]) -> bool {
     static RUN: OnceLock<bool> = OnceLock::new();
     const NAMES: [&[u8]; 18] = [
@@ -190,7 +190,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
-                #[cfg(windows)]
+                #[cfg(all(windows, feature = "diagnostics"))]
                 hair: hair_strands(bytes),
                 #[cfg(windows)]
                 resolves_light: bytes
@@ -365,6 +365,7 @@ impl Shader {
             stage: source.stage,
             hash: source.hash.clone(),
             container: source.container.clone(),
+            #[cfg(feature = "diagnostics")]
             hair: source.hair,
             resolves_light: source.resolves_light,
             draws_sky: source.draws_sky,

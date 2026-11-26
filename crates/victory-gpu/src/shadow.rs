@@ -138,16 +138,58 @@ static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// Tile snapshots kept at most (512 MiB).
 const TILE_POOL_MOST: usize = 8192;
 
-/// `n` empty buffers with room for a tile, under one lock of the pool.
-fn pooled_tiles(n: usize) -> Vec<Vec<u8>> {
-    let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    (0..n)
-        .map(|_| {
-            let mut v = pool.pop().unwrap_or_else(|| Vec::with_capacity(PAGE));
-            v.clear();
-            v
-        })
-        .collect()
+/// Empty tile buffers, acquired together under one pool lock.
+fn pooled_tiles(count: usize) -> Vec<Vec<u8>> {
+    let mut buffers = Vec::with_capacity(count);
+    {
+        let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let available = count.min(pool.len());
+        let from = pool.len() - available;
+        buffers.extend(pool.drain(from..));
+    }
+    buffers.resize_with(count, || Vec::with_capacity(PAGE));
+    for buffer in &mut buffers {
+        buffer.clear();
+    }
+    buffers
+}
+
+/// Copy read-only tile views into independent owned snapshots. The shared
+/// work pool joins all participating workers before returning or unwinding.
+fn snapshot_tiles(views: &[&[u8]], buffers: &mut [Vec<u8>], parallel: bool) {
+    assert_eq!(views.len(), buffers.len());
+    let copy = |src: &[&[u8]], dst: &mut [Vec<u8>]| {
+        for (view, buffer) in src.iter().zip(dst) {
+            buffer.clear();
+            buffer.extend_from_slice(view);
+        }
+    };
+    // Keep the existing 8 MiB threshold until hardware benchmarks justify
+    // changing it. Do not start helpers for small or disabled snapshots.
+    if !parallel || views.len() < 128 {
+        copy(views, buffers);
+        return;
+    }
+    let threads = crate::workpool::threads();
+    let chunk = views.len().div_ceil(threads);
+    let chunks = Mutex::new(views.chunks(chunk).zip(buffers.chunks_mut(chunk)));
+    crate::workpool::broadcast(threads - 1, &|| {
+        loop {
+            // Take ownership of one disjoint mutable slice. The mutex is
+            // released before any copy; no raw pointers or new worker threads.
+            let next = {
+                let mut chunks = chunks.lock().unwrap_or_else(|e| e.into_inner());
+                chunks.next()
+            };
+            let Some((src, dst)) = next else { break };
+            copy(src, dst);
+        }
+    });
+}
+
+fn parallel_snapshots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARALLEL_SNAPSHOTS").is_some_and(|v| v == "1"))
 }
 
 /// Returns tile snapshots to their pool.
@@ -328,6 +370,8 @@ impl Shadow {
                 let gpu_new = unsafe {
                     std::slice::from_raw_parts((rb_ptr + (k as usize) * PAGE) as *const u8, n)
                 };
+                // SAFETY: the staging mapping covers off..off+n; the
+                // submission's per-shadow merge has exclusive access here.
                 let staging_old =
                     unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
                 if gpu_new == staging_old {
@@ -444,14 +488,14 @@ impl Shadow {
     /// This memory from a start `address` is a multiple of `element` bytes
     /// after.
     fn on_element(self: &Arc<Self>, address: u64, element: u64) -> Option<Arc<Shadow>> {
-        if element == 0 || (address - self.start) % element == 0 {
+        if element == 0 || (address - self.start).is_multiple_of(element) {
             return Some(self.clone());
         }
         let direct = self.direct.as_ref()?;
         let (page, first) = (PAGE as u64, self.start);
         let mut base = first + page;
         while base <= address && base - first <= 4096 * page {
-            if (address - base) % element == 0 {
+            if (address - base).is_multiple_of(element) {
                 let mut aliases = direct.aliases.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((_, s)) = aliases.iter().find(|(b, _)| *b == base) {
                     return Some(s.clone());
@@ -1218,7 +1262,6 @@ static DIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 pub(crate) fn died() -> u64 {
     DIED.load(Ordering::Acquire)
 }
-
 /// Stretches shorter than this are copied: each window is a host heap.
 const STRETCH_LEAST: usize = 4 << 20;
 
@@ -1483,7 +1526,7 @@ const BLOCK: usize = 1 << 10;
 /// A quick hash, never 0.
 fn mixed(bytes: &[u8]) -> u64 {
     let mut h = [0x9e37_79b9_7f4a_7c15_u64, 0xc2b2_ae3d_27d4_eb4f, 0x1656_67b1_9e37_79f9, 0x27d4_eb2f_1656_67c5];
-    for c in bytes.chunks_exact(32) {
+    for c in bytes.as_chunks::<32>().0 {
         for (k, h) in h.iter_mut().enumerate() {
             let x = u64::from_le_bytes(c[8 * k..8 * k + 8].try_into().unwrap_or_default());
             *h = (*h ^ x).wrapping_mul(0x9fb2_1c65_1e98_df25).rotate_left(29);
@@ -1763,7 +1806,7 @@ pub(crate) fn sweep(frame: u64) {
     if given > 0 || took > std::time::Duration::from_millis(20) {
         tracing::info!(
             tiles = given,
-            megabytes = given * PAGE as u64 >> 20,
+            megabytes = (given * PAGE as u64) >> 20,
             frame,
             ms = took.as_millis() as u64,
             "tiles given back"
@@ -1998,14 +2041,14 @@ impl Shadow {
     /// A sparse copy from a start `address` is a multiple of `element` bytes
     /// after.
     fn sparse_on_element(self: &Arc<Self>, address: u64, element: u64) -> Option<Arc<Shadow>> {
-        if element == 0 || (address - self.start) % element == 0 {
+        if element == 0 || (address - self.start).is_multiple_of(element) {
             return Some(self.clone());
         }
         let s = self.sparse.as_ref()?;
         let page = PAGE as u64;
         let mut base = self.start + page;
         while base <= address && base - self.start <= 4096 * page {
-            if (address - base) % element == 0 {
+            if (address - base).is_multiple_of(element) {
                 let mut aliases = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(a) = aliases.iter().find(|a| a.start == base) {
                     return Some(a.clone());
@@ -2064,8 +2107,8 @@ impl Shadow {
     }
 
     /// [`Shadow::writing`] of a sparse copy. A range inside one already
-    /// declared for this submission has its tiles' snapshots taken; new
-    /// snapshots are copied on several threads (hundreds of MB a frame).
+    /// declared for this submission skips re-snapshotting (`pending`), and
+    /// new snapshots are pinned under `s.tiles` and copied via `snapshot_tiles`.
     fn sparse_writing(&self, s: &Sparse, address: usize, len: usize) {
         let end = address + len;
         let covered = {
@@ -2079,34 +2122,41 @@ impl Shadow {
         if covered {
             return;
         }
-        let views = self.tiles_of(s, address, end);
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
-        // (tile, the start of its view) of tiles without a snapshot yet.
-        let new: Vec<(u32, usize)> = views
-            .iter()
-            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data & !(PAGE - 1)))
-            .filter(|(tile, _)| !before.contains_key(tile))
-            .collect();
-        if new.is_empty() {
+        let mut tiles = Vec::new();
+        self.each_tile(s, address, end, |at, data, _| {
+            let tile = ((at - start) / PAGE) as u32;
+            if !before.contains_key(&tile) {
+                tiles.push((tile, sparse_tile_base(data as usize, at)));
+            }
+        });
+        if tiles.is_empty() {
+            return;
+        }
+        // Keep the tile map locked while borrowing its CPU mappings. A sweep
+        // cannot remove or recycle these tiles until the pool call returns.
+        let mapped = s.tiles.lock().unwrap_or_else(|e| e.into_inner());
+        tiles.retain(|&(tile, base)| mapped.get(&tile).is_some_and(|t| t.data == base));
+        if tiles.is_empty() {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        SPARSE_WRITES[1].fetch_add((new.len() * PAGE) as u64, Ordering::Relaxed);
-        let mut bufs = pooled_tiles(new.len());
-        let copies: Vec<(usize, usize)> =
-            new.iter().zip(&mut bufs).map(|(&(_, view), buf)| (view, buf.as_mut_ptr() as usize)).collect();
-        crate::host::in_parallel(&copies, 16, |chunk| {
-            for &(view, buf) in chunk {
-                // SAFETY: the tile's mapping; a buffer with room for a tile,
-                // each written by one thread.
-                unsafe { std::ptr::copy_nonoverlapping(view as *const u8, buf as *mut u8, PAGE) };
-            }
-        });
-        for (&(tile, _), mut buf) in new.iter().zip(bufs) {
-            // SAFETY: filled above, within its capacity.
-            unsafe { buf.set_len(PAGE) };
-            before.insert(tile, buf);
+        SPARSE_WRITES[1].fetch_add((tiles.len() * PAGE) as u64, Ordering::Relaxed);
+        let views: Vec<&[u8]> = tiles
+            .iter()
+            .map(|&(_, base)| {
+                // SAFETY: the map lock keeps the validated mappings alive,
+                // and the submission's snapshot phase precedes GPU writes.
+                unsafe { std::slice::from_raw_parts(base as *const u8, PAGE) }
+            })
+            .collect();
+        let mut buffers = pooled_tiles(tiles.len());
+        snapshot_tiles(&views, &mut buffers, parallel_snapshots());
+        drop(views);
+        drop(mapped);
+        for ((tile, _), buffer) in tiles.into_iter().zip(buffers) {
+            before.insert(tile, buffer);
         }
     }
 
@@ -2131,6 +2181,8 @@ impl Shadow {
                 // SAFETY: the tile's mapping and its snapshot (kept under the
                 // lock held above); this tile is this thread's alone.
                 let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
+                // SAFETY: `before` outlives this call, each tile holds a distinct
+                // snapshot page, and `at % PAGE + n <= PAGE`.
                 let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
@@ -2170,6 +2222,11 @@ impl Shadow {
         }
         written
     }
+}
+
+/// Recover the mapped tile base from the address of a byte in that tile.
+fn sparse_tile_base(data: usize, address: usize) -> usize {
+    data - address % PAGE
 }
 
 /// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
@@ -2575,6 +2632,32 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn batched_snapshots_match_serial_for_partial_chunks() {
+        let source: Vec<Vec<u8>> = (0..137usize)
+            .map(|i| (0..super::PAGE).map(|j| (i * 31 + j * 17) as u8).collect())
+            .collect();
+        let views: Vec<&[u8]> = source.iter().map(Vec::as_slice).collect();
+        let mut serial = vec![Vec::new(); views.len()];
+        let mut parallel = vec![vec![0xff; 7]; views.len()];
+        super::snapshot_tiles(&views, &mut serial, false);
+        super::snapshot_tiles(&views, &mut parallel, true);
+        assert_eq!(serial, source);
+        assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn sparse_tile_base_uses_offset_not_host_alignment() {
+        let page = super::PAGE;
+        for base in [page * 4, page * 4 + 4096, page * 4 + 32768] {
+            for offset in [0, 1, 4095, 4096, page - 1] {
+                let address = page * 8 + offset;
+                let data = base + offset;
+                assert_eq!(super::sparse_tile_base(data, address), base);
+            }
+        }
+    }
+
     use super::*;
     use std::ops::Range;
 

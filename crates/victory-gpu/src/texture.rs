@@ -333,9 +333,20 @@ impl Staging {
         }
         // Read through our safe copy: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them.
-        SCRATCH.with_borrow_mut(|tiled| {
-            tiled.resize(size, 0);
+        SCRATCH.with_borrow_mut(|scratch| {
+            // As in `with_tiled_copy`: the length stays, the copy writes all
+            // of `size` (zeros for what cannot be read), so only a bigger
+            // texture than any before is zeroed.
+            if size > scratch.len() {
+                scratch.resize(size, 0);
+            }
+            let tiled = &mut scratch[..size];
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            // The diagnostics mode without copies writes nothing: it hashes zeros, as before.
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::mode() == 2 {
+                tiled.fill(0);
+            }
             let read = self.changed(last, tiled, rewritten);
             last.still = if read.1 { 0 } else { (last.still + 1).min(6) };
             // Not all in the same frame; static textures back off up to 32 frames
@@ -345,8 +356,8 @@ impl Staging {
                 k => frame + (1 << (k - 1).min(5)) - (self.memory as u64 >> 16) % 2,
             };
             // As in `with_tiled_copy`: a one-off huge read is not kept.
-            if tiled.capacity() > 64 << 20 {
-                *tiled = Vec::new();
+            if scratch.capacity() > 64 << 20 {
+                *scratch = Vec::new();
             }
             read
         })
@@ -457,9 +468,11 @@ pub(crate) mod flips {
         first: u64,
         last: u64,
     }
-    static SEEN: Mutex<Option<HashMap<(usize, [u32; 4]), Seen>>> = Mutex::new(None);
+    type SeenViews = HashMap<(usize, [u32; 4]), Seen>;
+    static SEEN: Mutex<Option<SeenViews>> = Mutex::new(None);
     /// The views made of placed textures, by address.
-    pub(crate) static VIEWS: Mutex<std::collections::BTreeMap<u64, Vec<([u32; 14], [u32; 16])>>> =
+    type PlacedView = ([u32; 14], [u32; 16]);
+    pub(crate) static VIEWS: Mutex<std::collections::BTreeMap<u64, Vec<PlacedView>>> =
         Mutex::new(std::collections::BTreeMap::new());
 
     /// A view of a placed texture.

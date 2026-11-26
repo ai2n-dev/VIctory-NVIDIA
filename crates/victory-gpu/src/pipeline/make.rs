@@ -134,7 +134,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
+    // A load first: after the first draw this only reads.
+    if made.is_some() && !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
     made
@@ -142,7 +143,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 
 /// Queues `p` for the workers, once.
 fn start(p: &Arc<Pending>) {
-    if !p.queued.swap(true, Ordering::Relaxed) {
+    // A load first: every draw that finds it not made yet comes here.
+    if !p.queued.load(Ordering::Relaxed) && !p.queued.swap(true, Ordering::Relaxed) {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         queue(p.clone());
     }
@@ -168,6 +170,11 @@ fn wait(p: &Pending, frame: u64) {
         waited.store(0, Ordering::Relaxed);
     }
     let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
+    // Spent: the loop cannot run, and time added to a spent budget changes
+    // nothing, so neither the lock nor the clock is needed.
+    if left.is_zero() {
+        return;
+    }
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());

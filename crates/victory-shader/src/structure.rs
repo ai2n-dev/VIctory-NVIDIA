@@ -107,7 +107,7 @@ impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
 
 /// FxHash's multiply-rotate step.
 #[derive(Default)]
-struct Fx(u64);
+pub(crate) struct Fx(u64);
 
 impl Hasher for Fx {
     fn finish(&self) -> u64 {

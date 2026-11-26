@@ -99,6 +99,23 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
 /// tables (`[1]`).
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Readback wait attempts, wait time (us), bytes requested, and copy commands.
+#[cfg(feature = "diagnostics")]
+static FETCH_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_fetch_stats() -> [u64; 4] {
+    std::array::from_fn(|i| FETCH_STATS[i].swap(0, Ordering::Relaxed))
+}
+
+/// Reserve device-local bytes without transiently exceeding the shared cap.
+fn reserve_card_bytes(used: &AtomicU64, size: u64, limit: u64) -> bool {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.checked_add(size).filter(|&next| next <= limit)
+    })
+    .is_ok()
+}
+
 /// Card buffers with pending CPU→VRAM uploads (`dirty_up`).
 static DIRTY_CARDS: Mutex<Vec<Weak<CardState>>> = Mutex::new(Vec::new());
 
@@ -180,7 +197,7 @@ impl CardState {
             return None;
         }
         let (min_bytes, max_bytes) = limits();
-        if size < min_bytes || size >= (1 << 30) || size % PAGE as u64 != 0 {
+        if size < min_bytes || size >= (1 << 30) || !size.is_multiple_of(PAGE as u64) {
             return None;
         }
         if !host.card_ready() {
@@ -192,8 +209,7 @@ impl CardState {
         {
             return None;
         }
-        if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > max_bytes {
-            CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        if !reserve_card_bytes(&CARD_BYTES[0], size, max_bytes) {
             return None;
         }
         Self::new_unchecked(host, staging, size, true)
@@ -259,11 +275,11 @@ impl CardState {
 
     fn take_dirty_up(&self) -> Vec<(usize, usize)> {
         self.queued.store(false, Ordering::Release);
-        let mut dirty = self.dirty_up.lock().unwrap_or_else(|e| e.into_inner());
-        if dirty.is_empty() {
-            return Vec::new();
-        }
-        let mut ranges = std::mem::take(&mut *dirty);
+        let mut ranges = {
+            let mut dirty = self.dirty_up.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *dirty)
+        };
+        // The detached ranges no longer need the per-card mutex while sorting.
         merge_byte_ranges(&mut ranges);
         ranges
     }
@@ -271,6 +287,31 @@ impl CardState {
     pub(crate) fn total_pieces(&self) -> u32 {
         (self.size / PAGE as u64) as u32
     }
+}
+
+/// Groups consecutive runs by entry without allocating a vector per shadow.
+/// Entries arrive in plan order; the returned spans index the flat pieces.
+type ReadbackGroup = (usize, std::ops::Range<usize>);
+type ReadbackPiece = (u32, u32, usize);
+type DirtyCard = (Arc<CardState>, Vec<(usize, usize)>);
+type RehashUpload = (Arc<CardState>, ID3D12Resource, Vec<(u32, u32)>);
+
+fn group_readback_runs(
+    runs: impl IntoIterator<Item = (usize, u32, u32, usize)>,
+) -> (Vec<ReadbackGroup>, Vec<ReadbackPiece>) {
+    let mut groups: Vec<ReadbackGroup> = Vec::new();
+    let runs = runs.into_iter();
+    let mut pieces = Vec::with_capacity(runs.size_hint().0);
+    for (entry, first, count, ptr) in runs {
+        let at = pieces.len();
+        pieces.push((first, count, ptr));
+        if let Some((_, span)) = groups.last_mut().filter(|(i, _)| *i == entry) {
+            span.end = at + 1;
+        } else {
+            groups.push((entry, at..at + 1));
+        }
+    }
+    (groups, pieces)
 }
 
 /// Merges overlapping or adjacent `[from, to)` ranges in place.
@@ -292,38 +333,74 @@ fn merge_byte_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.truncate(out + 1);
 }
 
+/// Optional extra pages to hash between upload rehash runs. Never apply this
+/// to the post-submission compare: that must retain exact declared coverage.
+fn rehash_gap() -> u32 {
+    static GAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_REHASH_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(16)
+    })
+}
+
+/// Input runs are sorted, disjoint and bounded by the card size. Bridging
+/// small gaps trades extra hash work for fewer dispatches. Rehash only.
+fn join_rehash_runs(runs: &mut Vec<(u32, u32)>, gap: u32) {
+    if gap == 0 || runs.len() < 2 {
+        return;
+    }
+    let mut out = 0;
+    for i in 1..runs.len() {
+        let (first, count) = runs[i];
+        let (base, span) = runs[out];
+        let end = base + span;
+        if first.saturating_sub(end) <= gap {
+            runs[out].1 = end.max(first + count) - base;
+        } else {
+            out += 1;
+            runs[out] = (first, count);
+        }
+    }
+    runs.truncate(out + 1);
+}
+
 /// Converts byte ranges `[from, to)` into sorted, merged 64 KiB piece runs `(first_piece, count)`.
 fn byte_ranges_to_piece_runs(ranges: &[(usize, usize)], max_pieces: u32) -> Vec<(u32, u32)> {
     if ranges.is_empty() || max_pieces == 0 {
         return Vec::new();
     }
-    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    let mut spans = Vec::with_capacity(ranges.len());
     for &(from, to) in ranges {
         if from >= to {
             continue;
         }
-        let first = (from / PAGE) as u32;
-        let end = (to.div_ceil(PAGE) as u32).min(max_pieces);
+        // Clip before narrowing, so large offsets cannot wrap into valid pages.
+        let first = (from / PAGE).min(max_pieces as usize) as u32;
+        let end = to.div_ceil(PAGE).min(max_pieces as usize) as u32;
         if first < end {
             spans.push((first, end));
         }
     }
-    if spans.is_empty() {
-        return Vec::new();
-    }
     spans.sort_unstable();
-    let mut out: Vec<(u32, u32)> = Vec::with_capacity(spans.len());
-    for (a, b) in spans {
-        if let Some(last) = out.last_mut()
-            && a <= last.0 + last.1
-        {
-            let end = (last.0 + last.1).max(b);
-            last.1 = end - last.0;
+    // Compact in place instead of allocating a second vector of runs.
+    let mut used = 0;
+    for i in 0..spans.len() {
+        let (first, end) = spans[i];
+        if used > 0 && first <= spans[used - 1].1 {
+            spans[used - 1].1 = spans[used - 1].1.max(end);
         } else {
-            out.push((a, b - a));
+            spans[used] = (first, end);
+            used += 1;
         }
     }
-    out
+    spans.truncate(used);
+    for (first, end) in &mut spans {
+        *end -= *first;
+    }
+    spans
 }
 
 /// Per-submission plan built in `card_before` and consumed in `card_after` + `card_back`.
@@ -369,8 +446,10 @@ pub(crate) struct CardEngine {
     fetch_list: ID3D12GraphicsCommandList,
     differs_gpu: ID3D12Resource,
     differs_rb: (ID3D12Resource, usize, u64),
+    direct_flags: bool,
     dummy_uav: ID3D12Resource,
     fetch_rb: Option<(ID3D12Resource, usize, u64)>,
+    dirty_queue: Vec<Weak<CardState>>,
 }
 
 // SAFETY: accessed only under `Host::submitted` lock or `CardEngine` mutex;
@@ -379,6 +458,11 @@ unsafe impl Send for CardEngine {}
 
 impl CardEngine {
     pub(crate) fn new(host: &Host) -> windows::core::Result<Self> {
+        let direct = std::env::var_os("VICTORY_CARD_DIRECT_FLAGS").is_some_and(|v| v == "1");
+        Self::new_with_direct_flags(host, direct)
+    }
+
+    fn new_with_direct_flags(host: &Host, direct: bool) -> windows::core::Result<Self> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: valid HLSL source and entry point.
         unsafe {
@@ -440,17 +524,13 @@ impl CardEngine {
         let (fetch_alloc, fetch_list) = make_pair()?;
 
         let init_diff_bytes = 256 << 10; // 65,536 pieces (4 GiB of ranges)
-        let differs_gpu = host
-            .uav_buffer(init_diff_bytes)
-            .ok_or_else(windows::core::Error::empty)?;
-        let (rb_res, rb_ptr) = host
-            .readback_buffer(init_diff_bytes)
-            .ok_or_else(windows::core::Error::empty)?;
+        let (differs_gpu, rb_res, rb_ptr, direct_flags) =
+            Self::allocate_flags(host, init_diff_bytes, direct)
+                .ok_or_else(windows::core::Error::empty)?;
         let dummy_uav = host
             .uav_buffer(256)
             .ok_or_else(windows::core::Error::empty)?;
-        crate::host::name(&differs_gpu, || "card differs gpu".into());
-        crate::host::name(&rb_res, || "card differs readback".into());
+        tracing::debug!(direct_flags, "card compare flag buffer");
         crate::host::name(&dummy_uav, || "card dummy uav".into());
 
         Ok(Self {
@@ -463,10 +543,30 @@ impl CardEngine {
             fetch_alloc,
             fetch_list,
             differs_gpu,
-            differs_rb: (rb_res, rb_ptr as usize, init_diff_bytes),
+            differs_rb: (rb_res, rb_ptr, init_diff_bytes),
+            direct_flags,
             dummy_uav,
             fetch_rb: None,
+            dirty_queue: Vec::new(),
         })
+    }
+
+    /// Prefer a CPU-mapped L0 UAV for the small dirty-flag array when opted in.
+    /// If it is unavailable, retain the default device-local UAV + readback.
+    fn allocate_flags(
+        host: &Host,
+        size: u64,
+        direct: bool,
+    ) -> Option<(ID3D12Resource, ID3D12Resource, usize, bool)> {
+        if direct && let Some((resource, ptr)) = host.shared_buffer(size) {
+            crate::host::name(&resource, || "card direct L0 flags".into());
+            return Some((resource.clone(), resource, ptr as usize, true));
+        }
+        let gpu = host.uav_buffer(size)?;
+        let (rb, ptr) = host.readback_buffer(size)?;
+        crate::host::name(&gpu, || "card differs gpu".into());
+        crate::host::name(&rb, || "card differs readback".into());
+        Some((gpu, rb, ptr as usize, false))
     }
 
     fn ensure_differs_capacity(&mut self, host: &Host, needed_bytes: u64) -> bool {
@@ -474,14 +574,14 @@ impl CardEngine {
             return true;
         }
         let size = needed_bytes.next_multiple_of(256 << 10);
-        let Some(gpu) = host.uav_buffer(size) else {
-            return false;
-        };
-        let Some((rb, ptr)) = host.readback_buffer(size) else {
+        let Some((gpu, rb, ptr, direct_flags)) =
+            Self::allocate_flags(host, size, self.direct_flags)
+        else {
             return false;
         };
         let old_gpu = std::mem::replace(&mut self.differs_gpu, gpu);
-        let old_rb = std::mem::replace(&mut self.differs_rb, (rb, ptr as usize, size));
+        let old_rb = std::mem::replace(&mut self.differs_rb, (rb, ptr, size));
+        self.direct_flags = direct_flags;
         crate::host::retire((old_gpu, old_rb.0));
         true
     }
@@ -508,16 +608,12 @@ impl CardEngine {
         vram: &ID3D12Resource,
         hashes: &ID3D12Resource,
         differs: &ID3D12Resource,
-        first: u32,
-        size: u32,
-        count: u32,
-        out_at_bytes: u32,
-        compare: u32,
+        constants: [u32; 6],
     ) {
+        let count = constants[3];
         if count == 0 {
             return;
         }
-        let constants = [first, 0u32, size, count, out_at_bytes, compare];
         // SAFETY: caller ensures `list` is open with `root_sig` and `pso` bound
         // and all 3 buffers are live with valid states.
         unsafe {
@@ -538,15 +634,18 @@ impl CardEngine {
         writes: &[(Arc<crate::shadow::Shadow>, usize, usize)],
     ) -> (Option<ID3D12CommandList>, CardPlan) {
         // 1. Drain all card shadows with pending CPU -> VRAM uploads.
-        let mut dirty_cards: Vec<(Arc<CardState>, Vec<(usize, usize)>)> = Vec::new();
+        let mut dirty_cards: Vec<DirtyCard> = Vec::new();
         {
             let mut q = DIRTY_CARDS.lock().unwrap_or_else(|e| e.into_inner());
-            for weak in q.drain(..) {
-                if let Some(card) = weak.upgrade() {
-                    let ranges = card.take_dirty_up();
-                    if !ranges.is_empty() {
-                        dirty_cards.push((card, ranges));
-                    }
+            // Swap reusable queue storage, then release the global lock
+            // before inspecting cards or sorting their dirty ranges.
+            std::mem::swap(&mut *q, &mut self.dirty_queue);
+        }
+        for weak in self.dirty_queue.drain(..) {
+            if let Some(card) = weak.upgrade() {
+                let ranges = card.take_dirty_up();
+                if !ranges.is_empty() {
+                    dirty_cards.push((card, ranges));
                 }
             }
         }
@@ -554,19 +653,25 @@ impl CardEngine {
         // 2. Group declared `Step::GpuWrite` ranges by `Card` shadow and ensure
         //    each written card shadow has its hash table allocated.
         let mut entries: Vec<CardWriteEntry> = Vec::new();
+        let mut entry_indices = std::collections::HashMap::<_, usize>::new();
         let mut need_full_hash: Vec<(Arc<CardState>, ID3D12Resource)> = Vec::new();
+        let mut full_hash_cards = std::collections::HashSet::new();
         let mut total_pieces = 0u32;
 
         for (shadow, address, len) in writes {
+            let key = Arc::as_ptr(shadow);
+            if let Some(&index) = entry_indices.get(&key) {
+                entries[index].declared.push((*address, *len));
+                continue;
+            }
             let Some(card) = shadow.card_state() else {
                 continue;
             };
-            if let Some(entry) = entries.iter_mut().find(|e| Arc::ptr_eq(&e.shadow, shadow)) {
-                entry.declared.push((*address, *len));
-            } else if let Some((hashes, full_init)) = card.ensure_hashes(host) {
-                if full_init {
+            if let Some((hashes, full_init)) = card.ensure_hashes(host) {
+                if full_init && full_hash_cards.insert(Arc::as_ptr(&card)) {
                     need_full_hash.push((card.clone(), hashes.clone()));
                 }
+                entry_indices.insert(key, entries.len());
                 entries.push(CardWriteEntry {
                     shadow: shadow.clone(),
                     card: card.clone(),
@@ -593,10 +698,11 @@ impl CardEngine {
 
         // Also check which dirty-uploaded shadows already have hashes (so we
         // re-hash their newly uploaded pieces after CopyBufferRegion).
-        let mut rehash_uploads: Vec<(Arc<CardState>, ID3D12Resource, Vec<(u32, u32)>)> = Vec::new();
+        let mut rehash_uploads: Vec<RehashUpload> = Vec::new();
+        let mut partial_hash_cards = std::collections::HashSet::new();
         for (card, ranges) in &dirty_cards {
             // Skip partial rehash if this card is already getting a full hash below.
-            if need_full_hash.iter().any(|(c, _)| Arc::ptr_eq(c, card)) {
+            if full_hash_cards.contains(&Arc::as_ptr(card)) {
                 continue;
             }
             if card.hashes_ready.load(Ordering::Acquire)
@@ -606,8 +712,10 @@ impl CardEngine {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
             {
-                let runs = byte_ranges_to_piece_runs(ranges, card.total_pieces());
+                let mut runs = byte_ranges_to_piece_runs(ranges, card.total_pieces());
+                join_rehash_runs(&mut runs, rehash_gap());
                 if !runs.is_empty() {
+                    partial_hash_cards.insert(Arc::as_ptr(card));
                     rehash_uploads.push((card.clone(), hashes, runs));
                 }
             }
@@ -654,8 +762,8 @@ impl CardEngine {
         let mut to_srv = Vec::new();
         let mut to_common = Vec::new();
         for (card, _) in &dirty_cards {
-            let will_hash = need_full_hash.iter().any(|(c, _)| Arc::ptr_eq(c, card))
-                || rehash_uploads.iter().any(|(c, _, _)| Arc::ptr_eq(c, card));
+            let key = Arc::as_ptr(card);
+            let will_hash = full_hash_cards.contains(&key) || partial_hash_cards.contains(&key);
             let after = if will_hash {
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
             } else {
@@ -695,11 +803,7 @@ impl CardEngine {
                         &card.vram,
                         hashes,
                         &self.dummy_uav,
-                        0,
-                        card.size as u32,
-                        card.total_pieces(),
-                        0,
-                        0,
+                        [0, 0, card.size as u32, card.total_pieces(), 0, 0],
                     );
                 }
                 card.hashes_ready.store(true, Ordering::Release);
@@ -713,11 +817,7 @@ impl CardEngine {
                             &card.vram,
                             hashes,
                             &self.dummy_uav,
-                            first,
-                            card.size as u32,
-                            count,
-                            0,
-                            0,
+                            [first, 0, card.size as u32, count, 0, 0],
                         );
                     }
                 }
@@ -741,7 +841,8 @@ impl CardEngine {
     }
 
     /// Records the post-submission GPU hash compare (`compare = 2`) and copies
-    /// the tiny `differs` array to `differs_rb` (runs in the same GPU wait!).
+    /// the tiny `differs` array to `differs_rb`, or writes it directly into
+    /// a mapped L0 UAV. Both paths retain the original submission fence.
     pub(crate) fn record_after(&mut self, host: &Host, plan: &CardPlan) -> Option<ID3D12CommandList> {
         if plan.total_pieces == 0 {
             return None;
@@ -768,39 +869,48 @@ impl CardEngine {
                         &entry.card.vram,
                         &entry.hashes,
                         &self.differs_gpu,
-                        first,
-                        entry.card.size as u32,
-                        count,
-                        out_idx * 4,
-                        2, // compare against previous hash AND store updated hash
+                        // Mode 2 compares and stores the updated hash.
+                        [first, 0, entry.card.size as u32, count, out_idx * 4, 2],
                     );
                     out_idx += count;
                 }
             }
 
-            let to_copy = [transition_barrier(
-                &self.differs_gpu,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )];
-            self.after_list.ResourceBarrier(&to_copy);
-            drop_barriers(to_copy);
+            if self.direct_flags {
+                // The CPU reads the mapped L0 flags only after the existing
+                // submission fence. No GPU-to-readback copy is needed.
+                let common = [transition_barrier(
+                    &self.differs_gpu,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )];
+                self.after_list.ResourceBarrier(&common);
+                drop_barriers(common);
+            } else {
+                let to_copy = [transition_barrier(
+                    &self.differs_gpu,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )];
+                self.after_list.ResourceBarrier(&to_copy);
+                drop_barriers(to_copy);
 
-            self.after_list.CopyBufferRegion(
-                &self.differs_rb.0,
-                0,
-                &self.differs_gpu,
-                0,
-                needed_bytes,
-            );
+                self.after_list.CopyBufferRegion(
+                    &self.differs_rb.0,
+                    0,
+                    &self.differs_gpu,
+                    0,
+                    needed_bytes,
+                );
 
-            let back_common = [transition_barrier(
-                &self.differs_gpu,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-                D3D12_RESOURCE_STATE_COMMON,
-            )];
-            self.after_list.ResourceBarrier(&back_common);
-            drop_barriers(back_common);
+                let back_common = [transition_barrier(
+                    &self.differs_gpu,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )];
+                self.after_list.ResourceBarrier(&back_common);
+                drop_barriers(back_common);
+            }
 
             crate::cardmeter::end(&self.after_list, timed);
             self.after_list.Close().ok()?;
@@ -820,8 +930,9 @@ impl CardEngine {
         if plan.entries.is_empty() {
             return 0;
         }
-        // SAFETY: GPU finished writing `differs_rb` before the fence returned.
         let differs: &[u32] = if plan.total_pieces > 0 {
+            // SAFETY: the caller waits for the compare list's fence; the
+            // allocated mapping covers plan.total_pieces u32 flag values.
             unsafe {
                 std::slice::from_raw_parts(
                     self.differs_rb.1 as *const u32,
@@ -884,6 +995,8 @@ impl CardEngine {
         if total_bytes > 0
             && let Some((fetch_res, fetch_ptr)) = self.ensure_fetch_capacity(host, total_bytes)
         {
+            // SAFETY: the submitted lock serializes access to the allocator;
+            // previous fetch commands have completed before it is reused.
             let ok = unsafe {
                 self.fetch_alloc.Reset().is_ok()
                     && self.fetch_list.Reset(&self.fetch_alloc, None).is_ok()
@@ -902,26 +1015,40 @@ impl CardEngine {
                         );
                     }
                 }
+                // SAFETY: the fetch list is open and all recorded resources are live.
                 if unsafe { self.fetch_list.Close() }.is_ok()
                     && let Ok(cmd) = self.fetch_list.cast::<ID3D12CommandList>()
                 {
+                    #[cfg(feature = "diagnostics")]
+                    let fetch_started = std::time::Instant::now();
                     host.execute_and_wait_locked(cmd, submitted);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        FETCH_STATS[0].fetch_add(1, Ordering::Relaxed);
+                        FETCH_STATS[1].fetch_add(
+                            fetch_started.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
+                        FETCH_STATS[2].fetch_add(total_bytes, Ordering::Relaxed);
+                        FETCH_STATS[3].fetch_add(dirty_runs.len() as u64, Ordering::Relaxed);
+                    }
 
                     // Group dirty runs by entry so distinct shadows merge in parallel.
-                    let mut per_entry: Vec<(usize, Vec<(u32, u32, usize)>)> = Vec::new();
-                    for run in &dirty_runs {
-                        let ptr = fetch_ptr + run.rb_offset as usize;
-                        if let Some(g) = per_entry.iter_mut().find(|(i, _)| *i == run.entry_idx) {
-                            g.1.push((run.first_piece, run.count, ptr));
-                        } else {
-                            per_entry.push((run.entry_idx, vec![(run.first_piece, run.count, ptr)]));
-                        }
-                    }
+                    let (per_entry, pieces) = group_readback_runs(dirty_runs.iter().map(|run| {
+                        (
+                            run.entry_idx,
+                            run.first_piece,
+                            run.count,
+                            fetch_ptr + run.rb_offset as usize,
+                        )
+                    }));
                     let total_written = AtomicU64::new(0);
                     crate::host::in_parallel(&per_entry, 4, |chunk| {
-                        for (entry_idx, runs) in chunk {
+                        for (entry_idx, span) in chunk {
                             let entry = &plan.entries[*entry_idx];
-                            let n = entry.shadow.merge_card_pieces(&entry.card, runs);
+                            let n = entry
+                                .shadow
+                                .merge_card_pieces(&entry.card, &pieces[span.clone()]);
                             total_written.fetch_add(n as u64, Ordering::Relaxed);
                         }
                     });
@@ -984,6 +1111,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn card_reservations_respect_limit_and_overflow() {
+        let used = AtomicU64::new(u64::MAX - 8);
+        assert!(!reserve_card_bytes(&used, 9, u64::MAX));
+        assert_eq!(used.load(Ordering::Relaxed), u64::MAX - 8);
+        assert!(reserve_card_bytes(&used, 8, u64::MAX));
+        assert!(!reserve_card_bytes(&used, 1, u64::MAX));
+        used.fetch_sub(8, Ordering::Relaxed);
+        assert!(reserve_card_bytes(&used, 8, u64::MAX));
+    }
+
+    #[test]
+    fn concurrent_card_reservations_share_one_limit() {
+        let used = AtomicU64::new(0);
+        let gate = std::sync::Barrier::new(8);
+        let accepted = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        reserve_card_bytes(&used, 64, 192)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|&ok| ok)
+                .count()
+        });
+        assert_eq!(accepted, 3);
+        assert_eq!(used.load(Ordering::Relaxed), 192);
+    }
+
+    #[test]
+    fn piece_runs_match_bitmap_with_unsorted_and_clipped_ranges() {
+        let mut seed = 0x2934_5abcu32;
+        for count in 0..128 {
+            let mut ranges = Vec::new();
+            let mut expected = [false; 31];
+            for _ in 0..count {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let from = seed as usize % (40 * PAGE);
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let to = from + seed as usize % (4 * PAGE);
+                ranges.push((from, to));
+                if from < to {
+                    for page in expected.iter_mut().take(to.div_ceil(PAGE)).skip(from / PAGE) {
+                        *page = true;
+                    }
+                }
+            }
+            ranges.push((usize::MAX - PAGE, usize::MAX));
+            ranges.push((PAGE, PAGE));
+            let runs = byte_ranges_to_piece_runs(&ranges, expected.len() as u32);
+            let mut actual = [false; 31];
+            let mut previous_end = None;
+            for (first, count) in runs {
+                assert!(count > 0);
+                assert!(previous_end.is_none_or(|end| first > end));
+                let end = first + count;
+                assert!(end <= actual.len() as u32);
+                actual[first as usize..end as usize].fill(true);
+                previous_end = Some(end);
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn readback_groups_preserve_order_and_offsets() {
+        let input = [
+            (0, 1, 2, 0x1000),
+            (0, 5, 1, 0x3000),
+            (2, 0, 3, 0x4000),
+            (7, 9, 1, 0x7000),
+            (7, 11, 4, 0x8000),
+        ];
+        let (groups, pieces) = group_readback_runs(input);
+        assert_eq!(groups, vec![(0, 0..2), (2, 2..3), (7, 3..5)]);
+        assert_eq!(
+            pieces,
+            input.map(|(_, first, count, ptr)| (first, count, ptr))
+        );
+        let (groups, pieces) = group_readback_runs(std::iter::empty());
+        assert!(groups.is_empty());
+        assert!(pieces.is_empty());
+    }
+
+    #[test]
+    fn rehash_gap_coalesces_only_small_gaps() {
+        let original = vec![(0, 2), (4, 3), (8, 1), (20, 2)];
+        let mut baseline = original.clone();
+        join_rehash_runs(&mut baseline, 0);
+        assert_eq!(baseline, original);
+
+        let mut one = original.clone();
+        join_rehash_runs(&mut one, 1);
+        assert_eq!(one, vec![(0, 2), (4, 5), (20, 2)]);
+
+        let mut two = original;
+        join_rehash_runs(&mut two, 2);
+        assert_eq!(two, vec![(0, 9), (20, 2)]);
+        join_rehash_runs(&mut Vec::new(), 4);
+    }
+
+    #[test]
     fn range_helpers_merge_and_convert_pieces() {
         let mut r = vec![(100, 200), (50, 120), (300, 400), (200, 300)];
         merge_byte_ranges(&mut r);
@@ -998,10 +1231,20 @@ mod tests {
 
     #[test]
     fn warp_card_roundtrip_upload_wave64_hash_and_concurrent_merge() {
+        for direct in [false, true] {
+            card_roundtrip(direct);
+        }
+    }
+
+    fn card_roundtrip(direct: bool) {
         let Some(host) = Host::new_warp() else {
             return;
         };
-        let mut engine = CardEngine::new(&host).expect("CardEngine should build on WARP");
+        let mut engine = CardEngine::new_with_direct_flags(&host, direct)
+            .expect("CardEngine should build on WARP");
+        assert_eq!(engine.direct_flags, direct);
+        assert!(engine.ensure_differs_capacity(&host, (256 << 10) + 4));
+        assert_eq!(engine.direct_flags, direct);
         let pages = 4usize;
         let size = (pages * PAGE) as u64;
         let mut title = vec![0u8; size as usize];
@@ -1030,6 +1273,7 @@ mod tests {
         host.execute_and_wait_locked(before.unwrap(), &mut submitted);
         host.execute_and_wait_locked(after, &mut submitted);
 
+        // SAFETY: command queue finished `after`, so `differs_rb` is coherent on CPU.
         let differs_1 = unsafe {
             std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec()
         };
@@ -1041,7 +1285,9 @@ mod tests {
         // 4 different bytes on the same page 2.
         let (patch_buf, patch_ptr) = host.shared_buffer(256).expect("patch buffer");
         let gpu_bytes = [0xDEu8, 0xAD, 0xBE, 0xEF];
+        // SAFETY: `patch_ptr` points to a 256-byte persistently mapped upload buffer.
         unsafe { std::ptr::copy_nonoverlapping(gpu_bytes.as_ptr(), patch_ptr, 4) };
+        // SAFETY: valid D3D12 device/command list calls on live test resources.
         unsafe {
             let alloc: ID3D12CommandAllocator = host
                 .device

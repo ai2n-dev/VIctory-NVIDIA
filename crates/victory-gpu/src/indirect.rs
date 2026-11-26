@@ -393,7 +393,7 @@ pub(crate) fn bound_before(
     if records == 0 {
         return None;
     }
-    let (c, budget) = (clamp()?, clamps.budget()?);
+    let (c, (budget, budget_resource)) = (clamp()?, clamps.budget_with_resource()?);
     // SAFETY: live buffers.
     let (src_base, count_base) =
         unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
@@ -436,7 +436,15 @@ pub(crate) fn bound_before(
         // Mode 7: one clamp after another, so that the budget is charged in
         // the order of the draws as it is when each clamp precedes its draw.
         if hoist_mode() == 7 {
-            l.ResourceBarrier(&[uav_barrier()]);
+            // The destination ranges are disjoint. Only the shared budget
+            // needs ordering here; clamp_room/clamp_end keep their barriers.
+            // Experimental until validated on real D3D12 adapters.
+            let barrier = if scoped_budget_barrier() {
+                uav_barrier_on(budget_resource)
+            } else {
+                uav_barrier()
+            };
+            l.ResourceBarrier(&[barrier]);
         }
     }
     Some((dst, at))
@@ -457,6 +465,26 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// Opt-in A/B test for mode 7; leave the global barrier as the baseline.
+fn scoped_budget_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOIST_SCOPED_BUDGET").is_some_and(|v| v == "1"))
+}
+
+fn uav_barrier_on(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: borrowed interface pointer; the budget stays alive
+                // in HostList and the barrier never releases the pointer.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+            }),
+        },
+    }
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -1045,6 +1073,87 @@ void main() {
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+    }
+
+    /// Three consecutive clamps share a budget but write disjoint output ranges.
+    /// The scoped and global barriers must preserve which records get the budget.
+    #[test]
+    fn warp_scoped_budget_barrier_matches_global() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const STRIDE: u32 = 32;
+        const RECORDS: u32 = 3;
+        const BYTES: u64 = (STRIDE * RECORDS) as u64;
+        let mut results = Vec::new();
+        for scoped in [false, true] {
+            let (src, src_ptr, src_gpu) = warp.shared_buffer(u64::from(STRIDE));
+            let (budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (readback, out, _) = warp.shared_buffer(BYTES);
+            let dst = warp.default_uav(BYTES);
+            let input = [u32::MAX, u32::MAX, 17, 23, 31, 37, 41, 43];
+            let constants = [0u32, STRIDE, 1, 0, 0, 0];
+            // SAFETY: live mapped buffers and an open command list. Each dispatch
+            // writes its own aligned output span; only the budget is shared.
+            unsafe {
+                std::ptr::copy_nonoverlapping(input.as_ptr(), src_ptr.cast::<u32>(), input.len());
+                budget_ptr.cast::<u32>().write_volatile(0);
+                std::ptr::write_bytes(out, 0, BYTES as usize);
+                let l = &warp.list;
+                l.ResourceBarrier(&[transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                l.SetComputeRootSignature(&warp.clamp.root);
+                l.SetPipelineState(&warp.clamp.pso);
+                l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src_gpu);
+                l.SetComputeRootShaderResourceView(2, src_gpu);
+                l.SetComputeRootUnorderedAccessView(4, budget_gpu);
+                for i in 0..RECORDS {
+                    l.SetComputeRootUnorderedAccessView(
+                        3,
+                        dst.GetGPUVirtualAddress() + u64::from(i * STRIDE),
+                    );
+                    l.Dispatch(1, 1, 1);
+                    let barrier = if scoped {
+                        uav_barrier_on(&budget)
+                    } else {
+                        uav_barrier()
+                    };
+                    l.ResourceBarrier(&[barrier]);
+                }
+                l.ResourceBarrier(&[transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&readback, 0, &dst, 0, BYTES);
+            }
+            warp.submit_and_wait();
+            // SAFETY: fence completed; mappings remain alive.
+            let (spent, words) = unsafe {
+                (
+                    budget_ptr.cast::<u32>().read_volatile(),
+                    std::slice::from_raw_parts(out.cast::<u32>(), BYTES as usize / 4).to_vec(),
+                )
+            };
+            assert_eq!(spent, 1 << 27);
+            for (i, record) in words.as_chunks::<8>().0.iter().enumerate() {
+                let counts = if i < 2 { [1 << 24, 4] } else { [0, 0] };
+                assert_eq!(&record[..2], &counts);
+                assert_eq!(&record[2..], &input[2..]);
+            }
+            assert_eq!(
+                // SAFETY: `src_ptr` points to an open mapped upload buffer of `STRIDE` bytes.
+                unsafe { std::slice::from_raw_parts(src_ptr.cast::<u32>(), 8) },
+                &input
+            );
+            results.push(words);
+            drop(src);
+        }
+        assert_eq!(results[0], results[1]);
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,

@@ -24,6 +24,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+/// What a heap handle made in a block is looked up by: the block, the load
+/// that produced the descriptor, its first word, whether it is a sampler and
+/// the properties of the view.
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -529,8 +534,6 @@ fn half_shift(width: u32) -> u32 {
     debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
     if width == 16 { 0 } else { 15 - width }
 }
-
-type HandleKey = (usize, Site, u8, bool, (u32, u32));
 
 struct Lower<'a> {
     s: Shader,

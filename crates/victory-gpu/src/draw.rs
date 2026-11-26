@@ -73,6 +73,10 @@ pub(crate) struct Hoist {
     pub(crate) writes: u64,
 }
 
+/// A large table's records and its first dynamic slot (see
+/// [`State::large_tables`]).
+type LargeTable = (Vec<[u32; 3]>, u32);
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -108,7 +112,7 @@ pub(crate) struct State {
     fresh_records: Vec<[u32; 3]>,
     /// Of them, large ones by table: the records it was made from and the
     /// first dynamic slot. A shader that reads less of one takes the same.
-    large_tables: std::collections::HashMap<u64, Vec<(Vec<[u32; 3]>, u32)>>,
+    large_tables: std::collections::HashMap<u64, Vec<LargeTable>>,
     /// What [`State::tables`] made for the stage being bound: root slot, byte
     /// offset of its fresh table. Kept to reuse its storage across draws.
     made: Vec<(u8, u32)>,

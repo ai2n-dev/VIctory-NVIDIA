@@ -60,23 +60,53 @@ struct Finish {
 unsafe impl Send for Finish {}
 
 /// Whether the title's submissions may return before the host GPU is done
-/// (`VICTORY_ASYNC_SUBMIT=0` turns it off). At the stilt house with 8,400
-/// draws a frame it is 150-186 ms a frame against 200-238 (run as5 against
-/// rw1, 2026-11-25): the wait for the host GPU goes from 78-95 to 4-17 ms.
-/// It gained nothing while the title's recording threads took turns on the
-/// views table's mutex.
+/// (`VICTORY_ASYNC_SUBMIT=1`; off by default until RC0 async baseline passes).
+#[cfg(not(test))]
 fn async_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1"))
+}
+
+/// Tests run submissions synchronously, whatever the environment says,
+/// unless a test of the asynchronous path turns it on.
+#[cfg(test)]
+static ASYNC_IN_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn async_submit() -> bool {
+    ASYNC_IN_TESTS.load(Ordering::Relaxed)
 }
 
 /// Microseconds spent bringing buffer copies up to date while the
 /// submission before ran ([`Host::prewarm`]), since the last frame line.
 static PREWARM_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The newest unwaited submission (its fence value) that is finished:
-/// waited for and its results put back.
-static FINISHED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// This thread is putting back the results of an unwaited submission,
+    /// holding `Host::submitted`: what it calls meanwhile must not wait for
+    /// that submission or take the lock again.
+    static FINISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the thread as finishing a submission until dropped.
+struct Finishing;
+
+impl Finishing {
+    fn enter() -> Finishing {
+        FINISHING.with(|finishing| finishing.set(true));
+        Finishing
+    }
+}
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        FINISHING.with(|finishing| finishing.set(false));
+    }
+}
+
+fn finishing_here() -> bool {
+    FINISHING.with(std::cell::Cell::get)
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -89,6 +119,10 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     /// Async submissions not yet retired, oldest first.
     in_flight: Mutex<std::collections::VecDeque<InFlight>>,
+    /// The newest fence value of `fence` whose submission is finished: its
+    /// results are put back, not just run. One per host, as each counts its
+    /// own fence.
+    finished_fence: std::sync::atomic::AtomicU64,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -327,7 +361,12 @@ pub(crate) fn video_memory() -> Option<[(u64, u64); 2]> {
 
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            // Its threads start now, not inside the first submission that
+            // splits a copy.
+            crate::workpool::threads();
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -336,13 +375,13 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
-/// Waits for any in-flight async host GPU submissions without creating the
-/// host device if it has not been initialised yet.
 /// Whether a submission is still to be waited for and finished.
 pub(crate) fn has_in_flight() -> bool {
     matches!(HOST.get(), Some(Some(h)) if h.has_in_flight())
 }
 
+/// Waits for any in-flight async host GPU submissions without creating the
+/// host device if it has not been initialised yet.
 pub(crate) fn wait_in_flight_if_ready() {
     if let Some(Some(h)) = HOST.get() {
         h.wait_in_flight();
@@ -483,6 +522,7 @@ impl Host {
                 fence,
                 submitted: Mutex::new(0),
                 in_flight: Mutex::new(std::collections::VecDeque::new()),
+                finished_fence: std::sync::atomic::AtomicU64::new(0),
                 event,
                 rtvs,
                 rtv_size,
@@ -806,6 +846,33 @@ mod tests {
 
     use super::*;
 
+    /// Constants and texture footprints share scratch chunks without overlap.
+    #[test]
+    fn scratch_uploads_keep_footprint_alignment_and_disjoint_ranges() {
+        use windows::core::Interface;
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let (gpu, constant) = list.scratch(1).unwrap();
+        let (first, offset, bytes) = list.upload(257).unwrap();
+        assert_eq!(offset % 512, 0);
+        // SAFETY: a live upload buffer.
+        assert_eq!(unsafe { first.GetGPUVirtualAddress() } + offset, gpu + 512);
+        assert_eq!(bytes as usize - constant as usize, 512);
+
+        let (second, next, next_bytes) = list.upload(1).unwrap();
+        assert_eq!(first.as_raw(), second.as_raw());
+        assert_eq!(next, offset + 512);
+        assert_eq!(next_bytes as usize - bytes as usize, 512);
+
+        let (large, large_offset, _) = list.upload(SCRATCH_CHUNK + 1).unwrap();
+        assert_ne!(large.as_raw(), first.as_raw());
+        assert_eq!(large_offset, 0);
+
+        let (new_chunk, new_offset, _) = list.upload(SCRATCH_CHUNK).unwrap();
+        assert_ne!(new_chunk.as_raw(), first.as_raw());
+        assert_eq!(new_offset, 0);
+    }
+
     /// A list with no work before its waits, as the title's queues meet one
     /// another halfway: each write goes as soon as the waits before it are
     /// met, and work holds the later ones back.
@@ -848,6 +915,33 @@ mod tests {
         unsafe { slot(1).write_volatile(0) };
         host.execute(&[&list]);
         assert_eq!(value(1), 5);
+    }
+
+    /// With asynchronous submission on, a title submission may return before
+    /// its results are put back; they are there once it is waited for.
+    #[test]
+    fn an_unwaited_submission_is_finished_when_waited_for() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let mut memory = [0u64; 2];
+        let at = memory.as_mut_ptr();
+        list.count_work();
+        list.defer_write(at.cast(), crate::queue::Written::Value(5), 8);
+        list.close();
+        let list = std::sync::Arc::new(list);
+
+        ASYNC_IN_TESTS.store(true, Ordering::Relaxed);
+        host.execute_title(std::slice::from_ref(&list));
+        ASYNC_IN_TESTS.store(false, Ordering::Relaxed);
+
+        host.wait_in_flight();
+        // SAFETY: inside the array.
+        assert_eq!(unsafe { at.read_volatile() }, 5);
+        let (finished, last) = (
+            host.finished_fence.load(Ordering::Acquire),
+            list.last_fence.load(Ordering::Acquire),
+        );
+        assert!(finished >= last, "finished {finished}, list's last fence {last}");
     }
 
     /// A name picks an adapter by a part of its description, ignoring case.
@@ -933,7 +1027,7 @@ pub(crate) struct HostList {
     /// released it while a submission of it was still to run.
     kept: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
     /// Draws and dispatches recorded.
-    work: Mutex<usize>,
+    work: std::sync::atomic::AtomicUsize,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Queries begun in the list and not ended yet: host heap, type, index,
@@ -1373,7 +1467,7 @@ impl Host {
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 kept: Mutex::default(),
-                work: Mutex::default(),
+                work: Default::default(),
                 writes: Default::default(),
                 clamp_chunks: Mutex::default(),
                 pipelines: Mutex::default(),
@@ -1398,27 +1492,36 @@ impl Host {
         let completed = unsafe { self.fence.GetCompletedValue() };
         let mut last_sub = 0u64;
         loop {
-            let done = {
+            // The entry stays queued until it is finished: a thread that
+            // looks for unfinished submissions meanwhile (a fence about to
+            // be signalled) has to wait for this one, whoever finishes it.
+            let ready = {
                 let mut q = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-                match q.front() {
-                    Some(front) if front.fence <= completed => q.pop_front(),
+                match q.front_mut() {
+                    Some(front) if front.fence <= completed => {
+                        Some((front.fence, front.submission, front.finish.take()))
+                    }
                     _ => None,
                 }
             };
-            let Some(mut done) = done else { break };
-            last_sub = last_sub.max(done.submission);
-            if let Some(Finish { lists, back }) = done.finish.take() {
+            let Some((fence, submission, finish)) = ready else { break };
+            last_sub = last_sub.max(submission);
+            if let Some(Finish { lists, back }) = finish {
+                let _finishing = Finishing::enter();
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+                    self.fail_if_device_removed(&runs);
                     self.finish_submission(&runs, back);
+                    self.log_messages();
                 }
                 // Before its lists go: a list that goes with it waits for
                 // this fence, with `submitted` held here.
-                FINISHED_FENCE.fetch_max(done.fence, Ordering::AcqRel);
+                self.finished_fence.fetch_max(fence, Ordering::AcqRel);
                 drop(lists);
             } else {
-                FINISHED_FENCE.fetch_max(done.fence, Ordering::AcqRel);
+                self.finished_fence.fetch_max(fence, Ordering::AcqRel);
             }
+            self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         }
         if last_sub != 0 {
             FINISHED.fetch_max(last_sub, Ordering::AcqRel);
@@ -1428,12 +1531,12 @@ impl Host {
 
     /// Whether a submission is still to be waited for and finished.
     fn has_in_flight(&self) -> bool {
-        !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        !finishing_here() && !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Waits until the host GPU fence reaches at least `target`.
     pub(crate) fn wait_fence(&self, target: u64) {
-        if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
+        if target == 0 || finishing_here() || self.finished_fence.load(Ordering::Acquire) >= target {
             return;
         }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1642,8 +1745,7 @@ impl Host {
         let each = timing();
         #[cfg(not(feature = "diagnostics"))]
         let each = false;
-        let can_async = !cfg!(test)
-            && keep.is_some()
+        let can_async = keep.is_some()
             && !each
             && async_submit()
             && card_writes.is_empty()
@@ -1683,15 +1785,18 @@ impl Host {
             let fence_val = *submitted;
             if can_async {
                 // SAFETY: the fence is ours.
-                if let Err(e) = unsafe { self.queue.Signal(&self.fence, fence_val) } {
-                    tracing::warn!(error = %e, "host async submission not signalled");
-                } else {
-                    for list in runs {
-                        list.last_fence.store(fence_val, Ordering::Release);
+                match unsafe { self.queue.Signal(&self.fence, fence_val) } {
+                    Ok(()) => {
+                        for list in runs {
+                            list.last_fence.store(fence_val, Ordering::Release);
+                        }
+                        async_signalled = true;
+                        continue;
                     }
-                    async_signalled = true;
+                    // Waited for below like a synchronous submission: its
+                    // resources must not be released while the GPU runs.
+                    Err(e) => tracing::warn!(error = %e, "host async submission not signalled"),
                 }
-                continue;
             }
             // SAFETY: the fence and event are ours.
             unsafe {
@@ -1771,15 +1876,7 @@ impl Host {
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
-            ));
-        }
+        self.fail_if_device_removed(runs);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -1800,9 +1897,23 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.finish_submission(runs, cpu_back);
+        self.finished_fence.fetch_max(*submitted, Ordering::AcqRel);
         self.log_messages();
     }
 
+    /// Stops the process with the removal data when the host device was
+    /// removed while `runs` ran.
+    fn fail_if_device_removed(&self, runs: &[&HostList]) {
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            fail(format_args!(
+                "host GPU device removed after a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs)
+            ));
+        }
+    }
     /// After a submission ran: what its shaders wrote goes back into title
     /// memory, then its read-backs, then the bottom-of-pipe writes that
     /// tell the title the GPU is done.
@@ -1822,13 +1933,13 @@ impl Host {
             // across CPU cores without lock contention on `before`/`pending`.
             let mut groups: Vec<Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>> =
                 Vec::new();
+            let mut indices = std::collections::HashMap::<_, usize>::new();
             for item in back {
-                if let Some(g) = groups
-                    .iter_mut()
-                    .find(|g| std::sync::Arc::ptr_eq(&g[0].0, &item.0))
-                {
-                    g.push(item);
+                let key = std::sync::Arc::as_ptr(&item.0);
+                if let Some(&index) = indices.get(&key) {
+                    groups[index].push(item);
                 } else {
+                    indices.insert(key, groups.len());
                     groups.push(vec![item]);
                 }
             }
@@ -2337,7 +2448,7 @@ impl HostList {
         }
         self.release_kept();
         *self.deferred() = Deferred::default();
-        *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        self.work.store(0, Ordering::Relaxed);
         self.writes.store(0, Ordering::Relaxed);
         {
             let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
@@ -2666,7 +2777,7 @@ impl HostList {
         let mut deferred = self.deferred();
         let before = deferred.writes.len();
         deferred.waits.push((before, wait));
-        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let work = self.work.load(Ordering::Relaxed);
         deferred.wait_marks.push(work);
     }
 
@@ -2674,7 +2785,7 @@ impl HostList {
     ///
     /// Work is draws, dispatches, clears and copies: what has to run first.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
-        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let work = self.work.load(Ordering::Relaxed);
         let mut deferred = self.deferred();
         deferred.writes.push((dst as usize, what, bytes));
         deferred.marks.push(work);
@@ -2693,14 +2804,14 @@ impl HostList {
             events.push((*before, 0, format!("R[{:x}]>={:x}@{mark}", w.address, w.reference)));
         }
         events.sort_by_key(|e| (e.0, e.1));
-        let work = *self.work.lock().unwrap_or_else(|e| e.into_inner());
+        let work = self.work.load(Ordering::Relaxed);
         let texts: Vec<_> = events.into_iter().map(|e| e.2).collect();
         format!("{} ({work} in all)", texts.join(" "))
     }
 
     /// Whether the list has work: draws, dispatches, clears or copies.
     pub(crate) fn worked(&self) -> bool {
-        *self.work.lock().unwrap_or_else(|e| e.into_inner()) > 0
+        self.work.load(Ordering::Relaxed) > 0
     }
 
     /// How many queries begun in the list still run.
@@ -2797,7 +2908,7 @@ impl HostList {
 
     /// Counts a draw, dispatch, clear or copy.
     pub(crate) fn count_work(&self) {
-        *self.work.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.work.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Does the list's writes that come before its first wait not met, if no
@@ -2890,7 +3001,6 @@ impl HostList {
             }
         }
     }
-
     /// `size` bytes of mapped upload memory, 512-byte aligned for a placed
     /// footprint, alive until the list is reset: the buffer, the offset in
     /// it and the CPU pointer.
@@ -2962,6 +3072,11 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_with_resource().map(|(gpu, _)| gpu)
+    }
+
+    /// The budget address and its backing resource, for scoped UAV ordering.
+    pub(crate) fn budget_with_resource(&self) -> Option<(u64, &ID3D12Resource)> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -2979,7 +3094,7 @@ impl HostList {
                 .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((unsafe { buffer.GetGPUVirtualAddress() }, buffer))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
@@ -3412,14 +3527,15 @@ impl Early {
     }
 }
 
-/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
+/// Runs `f` on pieces of `list`, of `least` items or more, on the threads of
+/// the work pool and the calling one.
 pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
-    const THREADS: usize = 6;
     if list.len() <= least {
         return f(list);
     }
+    let pool_threads = crate::workpool::threads();
     // Small pieces, taken in turn: they are not equally long to do.
-    let piece = (list.len() / (THREADS * 8)).max(least);
+    let piece = (list.len() / (pool_threads * 8)).max(least);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let work = || {
         loop {
@@ -3430,13 +3546,8 @@ pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + 
             f(&list[from..(from + piece).min(list.len())]);
         }
     };
-    let threads = THREADS.min(list.len().div_ceil(piece));
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(work);
-        }
-        work();
-    });
+    let threads = pool_threads.min(list.len().div_ceil(piece));
+    crate::workpool::broadcast(threads - 1, &work);
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.
@@ -3507,6 +3618,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is a local structure of the size passed.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
@@ -4011,6 +4123,19 @@ impl Meter {
             }
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
+            #[cfg(feature = "diagnostics")]
+            {
+                let [waits, wait_us, bytes, copies] = crate::card::take_fetch_stats();
+                if waits != 0 {
+                    tracing::info!(
+                        waits,
+                        wait_ms = wait_us as f64 / 1000.0,
+                        requested_mb = bytes as f64 / 1e6,
+                        copies,
+                        "card readback since last report (includes queue execution)"
+                    );
+                }
+            }
             #[cfg(feature = "diagnostics")]
             log_gpu_waits();
             #[cfg(feature = "diagnostics")]

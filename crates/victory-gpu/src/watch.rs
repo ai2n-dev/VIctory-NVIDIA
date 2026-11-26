@@ -110,6 +110,26 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+/// Record kernel pages in the coarser journal without a temporary vector.
+fn record_pages(
+    written: &mut BTreeMap<usize, u64>,
+    found: &[usize],
+    guarded: impl IntoIterator<Item = usize>,
+    now: u64,
+) {
+    let mut previous = None;
+    for &address in found {
+        let page = address / PAGE;
+        if previous != Some(page) {
+            written.insert(page, now);
+            previous = Some(page);
+        }
+    }
+    for page in guarded {
+        written.insert(page, now);
+    }
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -154,10 +174,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
-    }
+    record_pages(&mut j.written, &j.found[..count], guarded, now);
     Some((
         now,
         j.written
@@ -231,6 +248,13 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Guards {
+    fn expire_pins(&mut self) {
+        if !self.pins.is_empty() {
+            let now = std::time::Instant::now();
+            self.pins.retain(|&(_, _, until)| until > now);
+        }
+    }
+
     /// Whether `block` is left writable for a kernel write.
     fn pinned(&self, block: usize) -> bool {
         self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
@@ -294,6 +318,7 @@ pub(crate) fn stretch(at: usize, end: usize, reach: usize) -> Option<(usize, usi
 /// the views, their sections, the longest view, and the runs of views that
 /// follow one another in their section too (one run: the range is one
 /// stretch of a section).
+#[cfg(feature = "diagnostics")]
 pub(crate) fn layout(at: usize, len: usize) -> (usize, usize, usize, usize) {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(views) = views.as_ref() else { return (0, 0, 0, 0) };
@@ -419,6 +444,11 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A range whose every block is already clean needs no per-block lookup.
+fn fully_clean(clean: &BTreeSet<usize>, first: usize, last: usize) -> bool {
+    first <= last && clean.range(first..last).count() == last - first
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -429,12 +459,23 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     {
         let mut g = guards();
         if g.protected.contains(&first) || g.holes.contains(&first) {
+            g.expire_pins();
+            // All blocks are already clean: one ordered walk instead of
+            // repeated logarithmic lookups, under the same guard lock.
+            if fully_clean(&g.clean, first, last) {
+                return Some(Vec::new());
+            }
             let mut written = Vec::new();
             let mut run: Option<usize> = None;
             for block in first..=last {
                 let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
                 if open {
-                    if g.protected.contains(&block) {
+                    // Like the slow path, never re-protect a block while
+                    // a kernel write may still be in progress.
+                    if g.pinned(block) {
+                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                        bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+                    } else if g.protected.contains(&block) {
                         g.clean.insert(block);
                         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                     } else {
@@ -460,10 +501,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let check_each = probe != start;
     install();
     let mut g = guards();
-    if !g.pins.is_empty() {
-        let now = std::time::Instant::now();
-        g.pins.retain(|&(_, _, until)| until > now);
-    }
+    g.expire_pins();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     for block in first..=last {
@@ -921,6 +959,28 @@ fn writable(at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn record_pages_matches_old_journal_with_duplicates_and_unsorted_addresses() {
+        use super::{PAGE, record_pages};
+        let mut seed = 0x1234_5678u32;
+        for count in 0..256usize {
+            let mut found = Vec::new();
+            for i in 0..count {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let page = (seed as usize >> 16) % 31;
+                found.push(page * PAGE + (i % 16) * 4096);
+            }
+            let guarded = [2usize, 2, 8, 29];
+            let mut expected = std::collections::BTreeMap::from([(99, 1), (8, 2)]);
+            let mut actual = expected.clone();
+            for page in found.iter().map(|a| a / PAGE).chain(guarded) {
+                expected.insert(page, 3);
+            }
+            record_pages(&mut actual, &found, guarded, 3);
+            assert_eq!(actual, expected);
+        }
+    }
+
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -1099,6 +1159,19 @@ mod tests {
     }
 
     #[test]
+    fn fully_clean_requires_every_block() {
+        let mut clean: BTreeSet<usize> = (10..20).collect();
+        assert!(fully_clean(&clean, 10, 20));
+        assert!(fully_clean(&clean, 15, 15));
+        assert!(!fully_clean(&clean, 9, 20));
+        assert!(!fully_clean(&clean, 10, 21));
+        clean.remove(&15);
+        assert!(!fully_clean(&clean, 10, 20));
+        assert!(fully_clean(&clean, 16, 20));
+        assert!(!fully_clean(&clean, 20, 10));
+    }
+
+    #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -1133,6 +1206,31 @@ mod tests {
         title_memory_remapped(p, 4 * PAGE);
         // SAFETY: our allocation, journal entries cleared before releasing the VA.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn guard_fast_path_keeps_kernel_write_pins_open() {
+        let (one, two) = two_views();
+        let _ = guard(one, one + 2 * BLOCK).expect("mapped");
+        // The first block remains protected, selecting the fast path.
+        writing(one + BLOCK, BLOCK);
+        let page = (one + BLOCK) / PAGE;
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![page]));
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![page]));
+        {
+            let mut g = guards();
+            assert!(g.protected.contains(&(one / BLOCK)));
+            assert!(!g.protected.contains(&page));
+            assert!(g.pinned(page));
+            // Expire only this test's pins, including the second view.
+            let test_pages = [one / BLOCK + 1, two / BLOCK + 1];
+            g.pins.retain(|&(first, last, _)| {
+                !test_pages.iter().any(|&p| first <= p && p < last)
+            });
+        }
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(vec![page]));
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(Vec::new()));
+        drop_views(&[one, two]);
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

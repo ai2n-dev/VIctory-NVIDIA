@@ -684,12 +684,13 @@ fn emit_program_pruned(
     })
 }
 
+/// A signature element's interpolation: `(row, col, kind, interp)`.
+type PsvInterp = (Option<u32>, u8, u8, u8);
+
 /// Interpolation modes of the input (for pixel) or output (for vertex/mesh)
 /// signature elements carried in a container's `PSV0` part: `(row, col, kind,
 /// interp)`.
-type PsvInterpRow = (Option<u32>, u8, u8, u8);
-
-fn psv_interp(part: &[u8], pixel: bool) -> Option<Vec<PsvInterpRow>> {
+fn psv_interp(part: &[u8], pixel: bool) -> Option<Vec<PsvInterp>> {
     use crate::dxbc::u32_at;
     let info_sz = u32_at(part, 0).ok()? as usize;
     if info_sz < 32 {

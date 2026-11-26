@@ -17,6 +17,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, stale_views, view_at};
 use crate::host::{Host, host};
 
+/// A range of title memory a slot reads: its host copy, address and bytes.
+pub(crate) type CopyRange = (Arc<crate::shadow::Shadow>, usize, usize);
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -253,6 +256,9 @@ impl Bindless {
 /// Slots waiting to be made: at submission, at recording (for the log).
 pub(crate) static BACKLOG: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// A slot's record and what it needs, once looked at (`None`: left null).
+type MadeSlot = Option<((u32, u32), Option<SlotUse>)>;
+
 /// What one bindless slot needs at submission.
 #[derive(Default)]
 struct SlotUse {
@@ -394,7 +400,7 @@ impl BindlessPlan {
     /// Returns the title memory to bring up to date, by the same rule.
     /// And whether it is all of it (and may be looked at less often where it
     /// does not change) rather than what is new.
-    pub(crate) fn copy_constants(&self) -> (&[(Arc<crate::shadow::Shadow>, usize, usize)], bool) {
+    pub(crate) fn copy_constants(&self) -> (&[CopyRange], bool) {
         let frame = crate::queue::presented() + 1;
         // Counted for all plans: each is the one before with a few changes.
         static FRAME: AtomicU64 = AtomicU64::new(0);
@@ -913,23 +919,7 @@ impl HostHeap {
         if FAILED[1].load(Ordering::Relaxed) >= WALKS {
             return None;
         }
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = free_dynamic_run(&taken[..spare], *next as usize, n);
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
@@ -1857,24 +1847,21 @@ impl HostHeap {
         let mut made_any = false;
         let mut fresh = Vec::new();
         let mut fresh_reads = Vec::new();
-        let mut results: Vec<(u32, Option<((u32, u32), Option<SlotUse>)>)> =
-            Vec::with_capacity(todo.len());
+        let mut results: Vec<(u32, MadeSlot)> = Vec::with_capacity(todo.len());
         let mut over: Option<u32> = None;
         let mut todo = todo.into_iter();
-        let mut count = 0usize;
-        for (index, entry) in todo.by_ref() {
+        for (count, (index, entry)) in todo.by_ref().enumerate() {
             if count >= exempt && (count & 15) == 0 && started.elapsed().as_micros() as u64 > left {
                 // Over budget: the rest waits for the next submission.
                 over = Some(index);
                 break;
             }
-            count += 1;
             made_any = true;
             let made = entry.map(|e| (e, self.use_slot(index, e)));
             results.push((index, made));
         }
         self.budget_spend(0, started.elapsed().as_micros() as u64);
-        plan_note(3, started, count, 0);
+        plan_note(3, started, results.len(), 0);
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         let t_apply = std::time::Instant::now();
         let applied = results.len();
@@ -2140,10 +2127,6 @@ impl HostHeap {
         Some(slot)
     }
 
-    /// The view host slot `index` was made from, in a few words, with the
-    /// title and host addresses of a buffer view (diagnostics). "null" for
-    /// a slot never made or left null.
-    #[cfg(feature = "diagnostics")]
     /// What a slot views and how it was made, for the device-removed report.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn report_slot(&self, index: u32) -> String {
@@ -2180,6 +2163,10 @@ impl HostHeap {
         text
     }
 
+    /// The view host slot `index` was made from, in a few words, with the
+    /// title and host addresses of a buffer view (diagnostics). "null" for
+    /// a slot never made or left null.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
         let key = *self
             .made
@@ -2331,15 +2318,21 @@ fn view_stride(view: &View) -> u32 {
 fn view_count(view: &View) -> u32 {
     let srv = |w: &[u32; 10]| {
         let desc = srv_desc(w);
-        // SAFETY: a buffer view's union member.
-        (desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER)
-            .then(|| unsafe { desc.Anonymous.Buffer }.NumElements)
+        if desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
+            // SAFETY: a buffer view's union member.
+            Some(unsafe { desc.Anonymous.Buffer }.NumElements)
+        } else {
+            None
+        }
     };
     let uav = |w: &[u32; 10]| {
         let desc = uav_desc(w);
-        // SAFETY: a buffer view's union member.
-        (desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER)
-            .then(|| unsafe { desc.Anonymous.Buffer }.NumElements)
+        if desc.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
+            // SAFETY: a buffer view's union member.
+            Some(unsafe { desc.Anonymous.Buffer }.NumElements)
+        } else {
+            None
+        }
     };
     match view {
         View::Shader(_, Some(desc)) => srv(desc),
@@ -3014,6 +3007,26 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Search candidate starts from the cursor, then before it. A run may
+/// cross the cursor but may never cross the physical end of the heap.
+fn free_dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let end = taken.len();
+    if n == 0 || n > end || cursor >= end {
+        return None;
+    }
+    let second_end = cursor.saturating_add(n - 1).min(end);
+    for span in [cursor..end, 0..second_end] {
+        let mut run = 0;
+        for at in span {
+            run = if taken[at] { 0 } else { run + 1 };
+            if run == n {
+                return Some(at + 1 - n);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3206,6 +3219,26 @@ void main() {
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
+    #[test]
+    fn free_dynamic_run_matches_linear_oracle() {
+        for len in 1..=9 {
+            for mask in 0..(1usize << len) {
+                let taken: Vec<bool> = (0..len).map(|i| mask & (1 << i) != 0).collect();
+                for cursor in 0..len {
+                    for n in 1..=len {
+                        let expected = (cursor..len).chain(0..cursor).find(|&start| {
+                            start + n <= len && taken[start..start + n].iter().all(|&v| !v)
+                        });
+                        assert_eq!(free_dynamic_run(&taken, cursor, n), expected);
+                    }
+                }
+            }
+        }
+        assert_eq!(free_dynamic_run(&[], 0, 1), None);
+        assert_eq!(free_dynamic_run(&[false], 0, 0), None);
+        assert_eq!(free_dynamic_run(&[false], 0, 2), None);
+    }
+
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
