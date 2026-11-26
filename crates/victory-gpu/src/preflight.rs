@@ -51,6 +51,10 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
 /// driver (`CreateComputePipelineState` / `CreateGraphicsPipelineState` /
 /// `CreatePipelineState`).
 pub fn validate_dxil_container(bytes: &[u8]) -> Result<(), PreflightError> {
+    inspect_dxil_container(bytes).map(|_| ())
+}
+
+fn inspect_dxil_container(bytes: &[u8]) -> Result<bool, PreflightError> {
     if bytes.len() < 32 {
         return Err(PreflightError::new(
             "dxil",
@@ -97,6 +101,7 @@ pub fn validate_dxil_container(bytes: &[u8]) -> Result<(), PreflightError> {
     }
 
     let mut has_shader_part = false;
+    let mut has_dxil = false;
     let mut prev_offset = table_end.saturating_sub(1);
     for idx in 0..part_count {
         let off = read_u32_le(bytes, 32 + idx * 4).ok_or_else(|| {
@@ -138,6 +143,7 @@ pub fn validate_dxil_container(bytes: &[u8]) -> Result<(), PreflightError> {
         if matches!(fourcc, b"DXIL" | b"ILDB" | b"SHEX" | b"SHDR") {
             has_shader_part = true;
             if fourcc == b"DXIL" {
+                has_dxil = true;
                 validate_dxil_program_header(&bytes[payload_start..payload_end])?;
             }
         }
@@ -148,14 +154,18 @@ pub fn validate_dxil_container(bytes: &[u8]) -> Result<(), PreflightError> {
             "container contains no shader bytecode chunk (DXIL/ILDB/SHEX/SHDR)",
         ));
     }
-    Ok(())
+    Ok(has_dxil)
 }
 
 /// Validates a DXBC/DXIL container structurally and, whenever `dxil.dll`
 /// (`IDxcValidator`) is available and `VICTORY_VALIDATE_DXIL != "0"`, runs
 /// full semantic DXIL verification before passing the shader to the driver.
 pub fn validate_dxil_semantic(bytes: &[u8]) -> Result<(), PreflightError> {
-    validate_dxil_container(bytes)?;
+    if !inspect_dxil_container(bytes)? {
+        // Legacy DXBC containers (`SHEX`/`SHDR`) do not hold a `DXIL` chunk for
+        // `IDxcValidator` and are validated directly by D3D12.
+        return Ok(());
+    }
     if std::env::var_os("VICTORY_VALIDATE_DXIL").is_some_and(|v| v == "0") {
         return Ok(());
     }
@@ -903,6 +913,12 @@ mod tests {
                 .expect_err("IDxcValidator must reject truncated/corrupt DXIL bitcode");
             assert_eq!(err.stage, "dxil_semantic");
         }
+    }
+
+    #[test]
+    fn legacy_shex_container_skips_dxil_semantic_validator() {
+        let container = build_dxbc_container(&[(b"SHEX", b"\x51\x00\x00\x00\x00\x00\x00\x00")]);
+        assert!(validate_dxil_semantic(&container).is_ok());
     }
 
     #[test]
