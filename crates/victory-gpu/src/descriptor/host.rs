@@ -3431,14 +3431,25 @@ void main() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(heap.spare - 100).unwrap();
+        // On a capped host one dynamic slot stays null and splits the
+        // slots: the slots before it are taken, and the test goes on in
+        // the run behind it.
+        let capped = heap.count() + heap.spare == PORTABLE_VIEWS - crate::memory::SLOTS;
+        let (first, room) = if capped {
+            let before = CAPPED_NULL_SLOT - heap.count();
+            assert_eq!(heap.dynamic(before), Some(4));
+            (4 + before + 1, heap.spare - before - 1)
+        } else {
+            (4, heap.spare)
+        };
+        let a = heap.dynamic(room - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.spare - 100));
+        assert_eq!((a, b), (first, first + room - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.spare - 40));
+        assert_eq!(heap.dynamic(50), Some(first));
+        assert_eq!(heap.dynamic(40), Some(first + room - 40));
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps
