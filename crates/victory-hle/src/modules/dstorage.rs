@@ -442,6 +442,7 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    let mut intermediate = Vec::new();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -450,7 +451,7 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = guarded(|| execute(&job.request));
+        let result = guarded(|| execute(&job.request, &mut intermediate));
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -812,7 +813,7 @@ fn guarded(run: impl FnOnce() -> Result<(), HRESULT>) -> Result<(), HRESULT> {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, intermediate: &mut Vec<u8>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -846,20 +847,30 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let mut large = Vec::new();
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let size = request.intermediate_size as usize;
+        // Keep small intermediates per worker. Large requests are accounted
+        // for by the scheduler and release their buffer when the job ends.
+        const REUSE_BYTES: usize = 256 << 10;
+        let packed = if size <= REUSE_BYTES { intermediate } else { &mut large };
+        if size > packed.len() {
+            packed
+                .try_reserve_exact(size - packed.len())
+                .map_err(|_| fail(E_OUTOFMEMORY, "zlib intermediate allocation"))?;
+            packed.resize(size, 0);
+        }
+        let n = inflate(&source, &mut packed[..size]).map_err(|hr| fail(hr, "zlib"))?;
+        &packed[..n]
     } else {
-        source
+        source.as_ref()
     };
     into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
+        Some(tables) => bcpack::decode(bc, source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -923,7 +934,7 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request) -> Result<Cow<'_, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
