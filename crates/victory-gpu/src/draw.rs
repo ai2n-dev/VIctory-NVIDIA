@@ -81,6 +81,22 @@ fn bind_cache_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"))
 }
 
+fn viewports_match(a: &[D3D12_VIEWPORT], b: &[D3D12_VIEWPORT]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.TopLeftX.to_bits() == y.TopLeftX.to_bits()
+                && x.TopLeftY.to_bits() == y.TopLeftY.to_bits()
+                && x.Width.to_bits() == y.Width.to_bits()
+                && x.Height.to_bits() == y.Height.to_bits()
+                && x.MinDepth.to_bits() == y.MinDepth.to_bits()
+                && x.MaxDepth.to_bits() == y.MaxDepth.to_bits()
+        })
+}
+
+fn blend_factor_match(a: Option<&[f32; 4]>, b: Option<&[f32; 4]>) -> bool {
+    a.map(|v| v.map(f32::to_bits)) == b.map(|v| v.map(f32::to_bits))
+}
+
 /// Fixed-function state and the views bound for output.
 #[derive(Default)]
 struct Fixed {
@@ -89,6 +105,12 @@ struct Fixed {
     blend: Option<Option<[f32; 4]>>,
     stencil: Option<u32>,
     views: Option<(Vec<crate::descriptor::RtvRecord>, Option<crate::descriptor::RtvRecord>)>,
+    /// Last host topology value (`0` = unset on active host list).
+    host_topology: u32,
+    host_viewports_set: bool,
+    host_scissors_set: bool,
+    host_blend_set: bool,
+    host_stencil_set: bool,
     /// Last render/depth target keys actually bound on the active host list.
     host_views: Option<BoundTargets>,
     /// Reusable candidate target-key buffer for `bind_targets`.
@@ -442,11 +464,15 @@ impl State {
             }
             t => t,
         };
+        if bind_cache_enabled() && self.fixed.host_topology == host && host != 0 {
+            return;
+        }
         // SAFETY: an open list.
         unsafe {
             list.list
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
         };
+        self.fixed.host_topology = host;
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
@@ -545,6 +571,11 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.fixed.host_topology = 0;
+        self.fixed.host_viewports_set = false;
+        self.fixed.host_scissors_set = false;
+        self.fixed.host_blend_set = false;
+        self.fixed.host_stencil_set = false;
         self.fixed.host_views = None;
         // Making one refreshes what it names, which is each list's own work.
         self.fresh_tables.clear();
@@ -555,15 +586,19 @@ impl State {
         }
         if !self.fixed.viewports.is_empty() {
             viewports(list, &self.fixed.viewports);
+            self.fixed.host_viewports_set = true;
         }
         if !self.fixed.scissors.is_empty() {
             scissors(list, &self.fixed.scissors);
+            self.fixed.host_scissors_set = true;
         }
         if let Some(factor) = &self.fixed.blend {
             blend_factor(list, factor.as_ref());
+            self.fixed.host_blend_set = true;
         }
         if let Some(reference) = self.fixed.stencil {
             stencil_ref(list, reference);
+            self.fixed.host_stencil_set = true;
         }
         if let Some((targets, depth)) = self.fixed.views.take() {
             self.bind_targets(list, targets, depth);
@@ -571,23 +606,52 @@ impl State {
     }
 
     pub(crate) fn set_viewports(&mut self, list: &HostList, items: &[D3D12_VIEWPORT]) {
+        if bind_cache_enabled()
+            && self.fixed.host_viewports_set
+            && viewports_match(&self.fixed.viewports, items)
+        {
+            return;
+        }
         replace_snapshot(&mut self.fixed.viewports, items);
         viewports(list, items);
+        self.fixed.host_viewports_set = true;
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        if bind_cache_enabled() && self.fixed.host_scissors_set && self.fixed.scissors == rects {
+            return;
+        }
         replace_snapshot(&mut self.fixed.scissors, rects);
         scissors(list, rects);
+        self.fixed.host_scissors_set = true;
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        if bind_cache_enabled()
+            && self.fixed.host_blend_set
+            && self
+                .fixed
+                .blend
+                .as_ref()
+                .is_some_and(|prev| blend_factor_match(prev.as_ref(), factor))
+        {
+            return;
+        }
         self.fixed.blend = Some(factor.copied());
         blend_factor(list, factor);
+        self.fixed.host_blend_set = true;
     }
 
     pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        if bind_cache_enabled()
+            && self.fixed.host_stencil_set
+            && self.fixed.stencil == Some(reference)
+        {
+            return;
+        }
         self.fixed.stencil = Some(reference);
         stencil_ref(list, reference);
+        self.fixed.host_stencil_set = true;
     }
 
     /// Render targets and depth, set on the host list at once.
@@ -2452,5 +2516,26 @@ mod group_limit_tests {
         let mut diff_dsv = first.clone();
         diff_dsv.dsv = None;
         assert!(!diff_dsv.matches(Some(&first)));
+    }
+
+    #[test]
+    fn fixed_function_state_matchers_compare_bitwise_for_floats_and_blend() {
+        let vp_a = [super::D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: 1920.0,
+            Height: 1080.0,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }];
+        let mut vp_b = vp_a;
+        assert!(super::viewports_match(&vp_a, &vp_b));
+        vp_b[0].TopLeftX = -0.0;
+        assert!(!super::viewports_match(&vp_a, &vp_b));
+        assert!(super::blend_factor_match(
+            Some(&[0.5, 0.25, 0.0, 1.0]),
+            Some(&[0.5, 0.25, 0.0, 1.0]),
+        ));
+        assert!(!super::blend_factor_match(Some(&[0.5, 0.25, 0.0, 1.0]), None));
     }
 }
