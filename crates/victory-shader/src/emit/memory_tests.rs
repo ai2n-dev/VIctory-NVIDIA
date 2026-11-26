@@ -182,6 +182,9 @@ fn check_shader(
             return;
         }
     }
+    if !host.test_shader_wave(&shader) {
+        return;
+    }
     let (root, pso) = host.compute_pipeline(&shader).expect("create memory PSO");
     let mut roots = vec![(
         0,

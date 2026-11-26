@@ -438,6 +438,26 @@ impl Host {
         false
     }
 
+    /// Check the actual emitted PSV0 wave-size requirement, before asking
+    /// the driver to create a pipeline. A malformed container is a test
+    /// failure, not a capability skip.
+    #[cfg(test)]
+    pub(crate) fn test_shader_wave(&self, shader: &HostShader) -> bool {
+        let c = crate::Container::parse(&shader.dxil).expect("parse test DXIL");
+        let psv = c.part(crate::FourCC::PSV0).expect("test DXIL PSV0").data;
+        let min = crate::dxbc::u32_at(psv, 4 + 16).expect("PSV wave minimum");
+        let max = crate::dxbc::u32_at(psv, 4 + 20).expect("PSV wave maximum");
+        let target = self.target();
+        if min <= target.lanes_max && max >= target.lanes_min {
+            return true;
+        }
+        eprintln!(
+            "CAPABILITY_SKIP: DXIL requires waves {min}-{max}; host reports {}-{}",
+            target.lanes_min, target.lanes_max
+        );
+        false
+    }
+
     /// Makes an object, naming the debug layer's reasons if it is refused:
     /// with the layer on (`VICTORY_D3D12_DEBUG=1` in a diagnostics build) the
     /// error carries what the layer said, not only the bare code. Creations

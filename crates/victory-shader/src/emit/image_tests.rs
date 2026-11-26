@@ -264,14 +264,12 @@ fn point(compare: bool) -> D3D12_SAMPLER_DESC {
 /// `out` at 2: what `out` holds afterwards.
 fn run(
     host: &Host,
-    inst: Mimg,
-    literals: &[(u8, u32)],
+    s: &HostShader,
     (image, out): (View, View),
     sampler: D3D12_SAMPLER_DESC,
     addr: &[[u32; ADDR]],
 ) -> Result<Vec<u32>, String> {
-    let s = translate(inst, literals).map_err(|e| e.to_string())?;
-    let (root, pso) = host.compute_pipeline(&s)?;
+    let (root, pso) = host.compute_pipeline(s)?;
     let mut data = vec![0; s.user_data_dwords().max(1) as usize];
     for u in &s.user_data {
         data[u.index as usize] = match u.slot {
@@ -460,7 +458,18 @@ fn check(
             })
             .collect();
         let out = View::RawUav(4 * LANES as u32);
-        let got = match run(host, c.inst, &c.literals, (image(), out), sampler, &addr) {
+        let shader = match translate(c.inst, &c.literals) {
+            Ok(shader) => shader,
+            Err(e) => {
+                failures.push(format!("{}: {e}", c.what));
+                continue;
+            }
+        };
+        if !host.test_shader_wave(&shader) {
+            eprintln!("CAPABILITY_SKIP: image case {}", c.what);
+            continue;
+        }
+        let got = match run(host, &shader, (image(), out), sampler, &addr) {
             Ok(g) => g,
             Err(e) => {
                 failures.push(format!("{}: {e}", c.what));
@@ -806,10 +815,13 @@ fn stores_of_some_channels_write_zero_to_the_others() {
             })
             .collect();
         let dummy: &'static [[f32; 4]] = &[[0.0; 4]];
+        let shader = translate(inst, &[]).expect("translate image store");
+        if !host.test_shader_wave(&shader) {
+            continue;
+        }
         let got = run(
             &host,
-            inst,
-            &[],
+            &shader,
             (View::Texture(1, 1, dummy), View::TextureUav(8, 4)),
             point(false),
             &addr,
