@@ -506,7 +506,8 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Dxgi::*;
-    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::core::Interface;
 
     const WORKER_CS: &str = r#"
@@ -530,10 +531,13 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// Released after every object above: see [`crate::host::warp_serial`].
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let serial = crate::host::warp_serial();
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -572,6 +576,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _serial: serial,
                 })
             }
         }
@@ -688,9 +693,29 @@ void main() {
                 self.fence
                     .SetEventOnCompletion(self.submitted, self.event)
                     .unwrap();
-                WaitForSingleObject(self.event, INFINITE);
+                let waited = WaitForSingleObject(self.event, 60_000);
+                assert_eq!(waited, WAIT_OBJECT_0, "WARP submission did not finish in 60 s");
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
+            }
+        }
+    }
+
+    impl Drop for WarpHarness {
+        /// Waits until the device is idle before any of its objects goes
+        /// (a test that panics between recording and waiting would
+        /// otherwise release buffers the GPU still reads), and closes the
+        /// event.
+        fn drop(&mut self) {
+            self.submitted += 1;
+            // SAFETY: our queue, fence and event; the event is closed once.
+            unsafe {
+                if self.queue.Signal(&self.fence, self.submitted).is_ok()
+                    && self.fence.SetEventOnCompletion(self.submitted, self.event).is_ok()
+                {
+                    WaitForSingleObject(self.event, 60_000);
+                }
+                let _ = CloseHandle(self.event);
             }
         }
     }

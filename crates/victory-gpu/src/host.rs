@@ -67,14 +67,18 @@ fn async_submit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1"))
 }
 
-/// Tests run submissions synchronously, whatever the environment says,
-/// unless a test of the asynchronous path turns it on.
+// Tests run submissions synchronously, whatever the environment says,
+// unless a test of the asynchronous path turns it on for its own thread
+// (a flag for the whole process made the title submissions of the queue
+// tests running beside it asynchronous too).
 #[cfg(test)]
-static ASYNC_IN_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static ASYNC_IN_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 fn async_submit() -> bool {
-    ASYNC_IN_TESTS.load(Ordering::Relaxed)
+    ASYNC_IN_TESTS.with(std::cell::Cell::get)
 }
 
 /// Microseconds spent bringing buffer copies up to date while the
@@ -137,6 +141,11 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// Device-local VRAM card buffer engine (Wave64 GPU page hashing), lazily initialized.
     card: OnceLock<Option<Mutex<crate::card::CardEngine>>>,
+    /// Tests only: held by a WARP host while it lives, so that one WARP
+    /// device works at a time ([`warp_serial`]). Declared last: it is
+    /// released after every object of the host.
+    #[cfg(test)]
+    warp_serial: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -482,6 +491,8 @@ impl Host {
                 next_rtv: AtomicU32::new(0),
                 presenter: Mutex::new(None),
                 card: OnceLock::new(),
+                #[cfg(test)]
+                warp_serial: None,
             })
         }
     }
@@ -533,12 +544,28 @@ impl Host {
     /// the process-global host singleton.
     #[cfg(test)]
     pub(crate) fn new_warp() -> Option<Host> {
+        let serial = warp_serial();
         let adapter = warp_adapter().ok()?;
         let mut device: Option<ID3D12Device> = None;
         // SAFETY: `adapter` is a verified software WARP adapter.
         unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
-        Host::from_device(device?, None).ok()
+        let mut host = Host::from_device(device?, None).ok()?;
+        host.warp_serial = Some(serial);
+        Some(host)
     }
+}
+
+/// Tests only: taken by everything that works on a WARP device for as long
+/// as it does. Tests run on several threads and the WARP adapter hands every
+/// one of them the same software device; three of the harnesses of
+/// `indirect::tests` running at once ended in an access violation inside
+/// d3d10warp.dll about once in thirty runs (13 of 400, and 0 of 300 when
+/// the tests ran one at a time or 0 of 400 with this lock). The GPU
+/// objects of each test are all released before the lock is.
+#[cfg(test)]
+pub(crate) fn warp_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Hardware details and D3D12 capabilities queried directly from a created
@@ -879,9 +906,9 @@ mod tests {
         list.close();
         let list = std::sync::Arc::new(list);
 
-        ASYNC_IN_TESTS.store(true, Ordering::Relaxed);
+        ASYNC_IN_TESTS.with(|on| on.set(true));
         host.execute_title(std::slice::from_ref(&list));
-        ASYNC_IN_TESTS.store(false, Ordering::Relaxed);
+        ASYNC_IN_TESTS.with(|on| on.set(false));
 
         host.wait_in_flight();
         // SAFETY: inside the array.
