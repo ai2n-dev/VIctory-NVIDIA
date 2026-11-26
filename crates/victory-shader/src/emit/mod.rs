@@ -211,6 +211,25 @@ pub const VIEW_SLOTS: u32 = 2_294_784;
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
+/// The last heap slot a title's view index may name in translated shaders:
+/// a larger index is cut to it. A host whose view heaps hold fewer than
+/// [`VIEW_SLOTS`] slots (NVIDIA's hold 1,000,000) keeps this slot null
+/// ([`set_heap_clamp`]), so an index it cannot mirror reads nothing instead
+/// of a slot of its own or memory past the heap.
+static HEAP_CLAMP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(OWN_SLOTS - 1);
+
+/// See [`HEAP_CLAMP`]. Part of the translation: the cache keys of
+/// translated shaders include it.
+pub fn heap_clamp() -> u32 {
+    HEAP_CLAMP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets the clamp of shaders translated from now on; the host calls it
+/// once, before it translates the first shader.
+pub fn set_heap_clamp(slot: u32) {
+    HEAP_CLAMP.store(slot, std::sync::atomic::Ordering::Relaxed);
+}
+
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.

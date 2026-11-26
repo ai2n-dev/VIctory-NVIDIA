@@ -531,6 +531,49 @@ const DYNAMIC: u32 = 1 << 20;
 /// [`PORTABLE_VIEWS`].
 const DYNAMIC_CAPPED: u32 = 1 << 16;
 
+/// The title slots a capped view heap mirrors at most, and the heap slot
+/// that follows them (the first dynamic one of the title's own heap):
+/// shaders cut every heap index they name past the heap to it
+/// ([`victory_shader::emit::set_heap_clamp`]), and it stays null. Without it
+/// those indices (the title's heap holds 1,245,184 slots, and fills nearly
+/// all) read the host's dynamic slots, or memory past the heap.
+const CAPPED_NULL_SLOT: u32 = PORTABLE_VIEWS - crate::memory::SLOTS - DYNAMIC_CAPPED;
+
+/// The title slots kept and the dynamic slots made in a capped view heap
+/// of [`PORTABLE_VIEWS`] slots for a title heap of `count` slots. A heap of few title
+/// slots is not padded to the cap with title slots (its dynamic ones start
+/// past them).
+fn capped_layout(count: u32) -> (u32, u32) {
+    let room = PORTABLE_VIEWS - crate::memory::SLOTS;
+    let kept = count.min(CAPPED_NULL_SLOT);
+    (kept, room - kept)
+}
+
+/// Sets where translated shaders cut the heap indices they read: on a host
+/// whose view heaps are capped (it cannot make one of the slots shaders
+/// keep their indices in) at [`CAPPED_NULL_SLOT`], else at the last slot of
+/// the padded heap. Called before the host translates its first shader.
+pub(crate) fn clamp_shader_indices(device: &ID3D12Device) {
+    // SAFETY: plain heap creation; the heap is dropped at once.
+    let probe = unsafe {
+        device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: victory_shader::emit::VIEW_SLOTS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    };
+    if let Err(e) = probe {
+        tracing::warn!(
+            error = %e,
+            slot = CAPPED_NULL_SLOT,
+            "the host cannot make a view heap of {} slots: shaders cut heap indices to a null slot",
+            victory_shader::emit::VIEW_SLOTS
+        );
+        victory_shader::emit::set_heap_clamp(CAPPED_NULL_SLOT);
+    }
+}
+
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
@@ -693,6 +736,7 @@ impl HostHeap {
         }
         let extra = if sampler { 0 } else { DYNAMIC };
         let wanted = count;
+        let mut capped = false;
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
@@ -703,7 +747,8 @@ impl HostHeap {
                 // rest: a heap of few title slots is not padded to the cap
                 // with title slots (its dynamic ones started past them).
                 let room = PORTABLE_VIEWS - crate::memory::SLOTS;
-                let kept = count.min(room - DYNAMIC_CAPPED);
+                let (kept, spare) = capped_layout(count);
+                capped = true;
                 tracing::warn!(
                     error = %e,
                     wanted,
@@ -711,14 +756,28 @@ impl HostHeap {
                     lost = wanted - kept,
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
-                (make(room).ok()?, kept, room - kept)
+                (make(room).ok()?, kept, spare)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                 return None;
             }
         };
-        Some(Self::with(host, heap, kind, count, extra))
+        let made = Self::with(host, heap, kind, count, extra);
+        if capped && count == CAPPED_NULL_SLOT {
+            // Title slots were left out: the indices past the kept ones read
+            // the first dynamic slot, which must stay null.
+            made.reserve_first_dynamic_slot();
+        }
+        Some(made)
+    }
+
+    /// Keeps the first dynamic slot out of every table, so it stays null.
+    fn reserve_first_dynamic_slot(&self) {
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(taken) = guard.1.first_mut() {
+            *taken = true;
+        }
     }
 
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
@@ -3109,6 +3168,54 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
+
+    /// The title's own heap (1,245,184 slots) fills the capped heap up to
+    /// the null slot, and the dynamic reserve is the small one; a small
+    /// heap keeps all its slots. Every layout ends in the memory slots at
+    /// the cap.
+    #[test]
+    fn capped_layout_holds_the_null_slot() {
+        let memory_at = PORTABLE_VIEWS - crate::memory::SLOTS;
+        let (kept, spare) = capped_layout(1_245_184);
+        assert_eq!(kept, CAPPED_NULL_SLOT);
+        assert_eq!(spare, DYNAMIC_CAPPED);
+        assert_eq!(kept + spare, memory_at);
+
+        let (kept, spare) = capped_layout(1000);
+        assert_eq!(kept, 1000);
+        assert_eq!(kept + spare, memory_at);
+        assert!((CAPPED_NULL_SLOT - kept) < spare);
+
+        assert!(CAPPED_NULL_SLOT < memory_at);
+    }
+
+    /// On a host whose view heaps are capped, the slot shaders cut heap
+    /// indices to is never handed out as a dynamic slot, and the title's
+    /// heap keeps the slots below it.
+    #[test]
+    fn capped_heap_never_hands_out_the_null_slot() {
+        let Some(host) = host() else { return };
+        if victory_shader::emit::heap_clamp() != CAPPED_NULL_SLOT {
+            clamp_shader_indices(&host.device);
+        }
+        if victory_shader::emit::heap_clamp() != CAPPED_NULL_SLOT {
+            eprintln!("view heaps are not capped on this host: nothing to check");
+            return;
+        }
+        eprintln!("view heaps are capped on this host");
+        let heap = HostHeap::new(false, 1_245_184).expect("a capped view heap");
+        assert_eq!(heap.count(), CAPPED_NULL_SLOT);
+        let first = heap.dynamic(1).expect("a dynamic slot");
+        assert_eq!(first, CAPPED_NULL_SLOT + 1, "slot {CAPPED_NULL_SLOT} stays null");
+        heap.release(first, 1);
+        let all = heap.dynamic(DYNAMIC_CAPPED - 1).expect("the rest of the dynamic slots");
+        assert_eq!(all, CAPPED_NULL_SLOT + 1);
+
+        // A heap that keeps all its title slots leaves nothing out.
+        let small = HostHeap::new(false, 1000).expect("a small capped view heap");
+        assert_eq!(small.count(), 1000);
+        assert_eq!(small.dynamic(1), Some(1000));
+    }
 
     const HEAP_IID: Iid = guid(
         0x8efb471d,

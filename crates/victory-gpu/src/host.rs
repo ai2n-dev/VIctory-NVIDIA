@@ -1535,6 +1535,7 @@ impl Host {
     pub(crate) fn target(&self) -> victory_shader::emit::Target {
         static TARGET: OnceLock<victory_shader::emit::Target> = OnceLock::new();
         *TARGET.get_or_init(|| {
+            crate::descriptor::host::clamp_shader_indices(&self.device);
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
             // SAFETY: the query writes the structure of the given size.
             let ok = unsafe {
