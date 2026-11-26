@@ -274,6 +274,15 @@ fn scalar_sym(inst: &Inst, op: &Operand, uni: &HashMap<Value, Sym>) -> Sym {
     }
 }
 
+/// Inline constants are interpreted in the instruction's operand format.
+/// Whole-wave FP16 arithmetic must not reuse the FP32 bit patterns.
+fn valu_inline(name: &str, c: u8) -> Sym {
+    if name == "v_add_f16" && (240..=248).contains(&c) {
+        return Sym::K(super::lower::inline_f16(c));
+    }
+    crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)
+}
+
 /// What lane `l` holds of `x`, read from another lane `from` (DPP,
 /// `v_permlane16`, `v_readlane`): a lane's own value of an earlier VGPR is
 /// that lane's only.
@@ -415,7 +424,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Found {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
-                Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
+                Operand::Const(c) => one(valu_inline(name, c)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
             }
@@ -831,6 +840,24 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_wave_f16_inline_constants_use_half_bits() {
+        let expected = [
+            0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+        ];
+        let x = Sym::Own(Value(1));
+        for (c, bits) in (240..=248u8).zip(expected) {
+            let half = valu_inline("v_add_f16", c);
+            assert_eq!(half, Sym::K(bits));
+            assert_eq!(combine(Op::AddF16, x, half), Sym::Unknown);
+            assert_eq!(
+                valu_inline("v_add_f32", c),
+                Sym::K(crate::resource::inline(c).unwrap())
+            );
+        }
+        assert_eq!(combine(Op::AddF16, x, valu_inline("v_add_f16", 128)), x);
+    }
 
     #[test]
     fn dpp_lanes_follow_the_isa() {
