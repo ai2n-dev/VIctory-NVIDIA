@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result};
 
@@ -52,6 +54,15 @@ impl Cache {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
+        // The same missing shader can be requested by many pipeline workers.
+        // Serialize only identical output paths, then recheck the disk. Hits
+        // do not touch the registry and unrelated conversions run in parallel.
+        let flight = flight_for(&path);
+        let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
+        if path.is_file() {
+            tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit after concurrent conversion");
+            return Ok(path);
+        }
         let output = converter
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
@@ -68,6 +79,27 @@ impl Cache {
         published?;
         Ok(path)
     }
+}
+
+// Weak references keep only in-flight locks alive. Pruning on each miss
+// bounds the registry by the concurrent requests, not the number of shaders.
+// The map is process-wide so independently opened caches can also cooperate.
+// It never stays locked during conversion or disk IO.
+type Flights = Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>;
+
+fn flight_for(path: &Path) -> Arc<Mutex<()>> {
+    static FLIGHTS: OnceLock<Flights> = OnceLock::new();
+    let mut flights = FLIGHTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    flights.retain(|_, lock| lock.strong_count() != 0);
+    if let Some(lock) = flights.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    flights.insert(path.to_owned(), Arc::downgrade(&lock));
+    lock
 }
 
 /// Skip a stale staging name after PID reuse, without truncating another
@@ -127,6 +159,52 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn concurrent_misses_convert_once_across_independently_opened_caches() {
+        struct Slow(AtomicUsize);
+        impl Converter for Slow {
+            fn id(&self) -> &'static str {
+                "test.concurrent"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                Ok(input.to_ascii_uppercase())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("cache");
+        let converter = Slow(AtomicUsize::new(0));
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let cache = Cache::open(&root).unwrap();
+                    start.wait();
+                    let path = cache.get_or_convert(&converter, b"same shader").unwrap();
+                    assert_eq!(std::fs::read(path).unwrap(), b"SAME SHADER");
+                });
+            }
+        });
+        assert_eq!(converter.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn flights_are_shared_only_for_identical_output_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let first = flight_for(&a);
+        let same = flight_for(&a);
+        let other = flight_for(&b);
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert!(other.try_lock().is_ok());
     }
 
     #[test]
