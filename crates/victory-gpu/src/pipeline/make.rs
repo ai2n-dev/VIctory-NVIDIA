@@ -43,6 +43,8 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// Reserved or spent lifetime wait in the optional bounded policy.
+    wait_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -68,6 +70,7 @@ impl Pending {
             lost: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            wait_us: AtomicU64::new(0),
         }
     }
 
@@ -159,8 +162,77 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+/// Inspired by trustno1-coder/VIctory-NVIDIA 77e13a97 (GPL-3.0).
+/// In the experimental policy a pending pipeline cannot consume a fresh
+/// full budget every frame. Reserve both budgets before sleeping so
+/// concurrent recording threads cannot all spend the same allowance.
+fn bounded_wait_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_some_and(|v| v == "1"))
+}
+
+#[derive(Default)]
+struct WaitBudget {
+    frame: Option<u64>,
+    spent: u64,
+}
+
+impl WaitBudget {
+    // Every access to own is under the same per-kind mutex.
+    fn reserve(&mut self, frame: u64, budget: u64, own: &AtomicU64) -> u64 {
+        if self.frame.is_some_and(|current| frame < current) {
+            return 0;
+        }
+        if self.frame != Some(frame) {
+            self.frame = Some(frame);
+            self.spent = 0;
+        }
+        let left = budget
+            .saturating_sub(self.spent)
+            .min(budget.saturating_sub(own.load(Ordering::Relaxed)));
+        self.spent += left;
+        own.fetch_add(left, Ordering::Relaxed);
+        left
+    }
+
+    fn settle(&mut self, frame: u64, own: &AtomicU64, reserved: u64, elapsed: u64) {
+        let unused = reserved.saturating_sub(elapsed);
+        own.fetch_sub(unused, Ordering::Relaxed);
+        // A waiter from a previous frame must never refund the new frame.
+        if self.frame == Some(frame) {
+            self.spent = self.spent.saturating_sub(unused);
+        }
+    }
+}
+
+fn wait_bounded(p: &Pending, frame: u64) {
+    static SPENT: [Mutex<WaitBudget>; 2] =
+        [const { Mutex::new(WaitBudget { frame: None, spent: 0 }) }; 2];
+    let kind = usize::from(p.screen);
+    let budget = [BUDGET, SCREEN_BUDGET][kind].as_micros() as u64;
+    if p.wait_us.load(Ordering::Relaxed) >= budget {
+        return;
+    }
+    let reserved = SPENT[kind]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .reserve(frame, budget, &p.wait_us);
+    if reserved == 0 {
+        return;
+    }
+    let elapsed = wait_for_pipeline(p, Duration::from_micros(reserved));
+    SPENT[kind]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .settle(frame, &p.wait_us, reserved, elapsed);
+}
+
 /// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
+    if bounded_wait_on() {
+        wait_bounded(p, frame);
+        return;
+    }
     static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
     static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let kind = usize::from(p.screen);
@@ -175,6 +247,11 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    let elapsed = wait_for_pipeline(p, left);
+    waited.fetch_add(elapsed, Ordering::Relaxed);
+}
+
+fn wait_for_pipeline(p: &Pending, left: Duration) -> u64 {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -185,11 +262,9 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-    crate::framelog::add(
-        crate::framelog::T::PipelineWaitUs,
-        started.elapsed().as_micros() as u64,
-    );
+    let elapsed = started.elapsed().as_micros() as u64;
+    crate::framelog::add(crate::framelog::T::PipelineWaitUs, elapsed);
+    elapsed
 }
 
 /// What the workers take from: the ordinary pipelines, the screen passes.
@@ -297,6 +372,37 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_wait_reserves_both_budgets_and_refunds_only_unused_time() {
+        let mut shared = WaitBudget::default();
+        let a = AtomicU64::new(0);
+        let b = AtomicU64::new(0);
+        assert_eq!(shared.reserve(1, 100, &a), 100);
+        assert_eq!(shared.reserve(1, 100, &b), 0);
+        shared.settle(1, &a, 100, 40);
+        assert_eq!(shared.reserve(1, 100, &b), 60);
+        shared.settle(1, &b, 60, 80);
+        assert_eq!(shared.reserve(2, 100, &a), 60);
+        shared.settle(2, &a, 60, 60);
+        assert_eq!(shared.reserve(3, 100, &a), 0);
+        assert_eq!(shared.reserve(3, 100, &b), 40);
+    }
+
+    #[test]
+    fn old_waiter_does_not_refund_or_reopen_new_frame() {
+        let mut shared = WaitBudget::default();
+        let a = AtomicU64::new(0);
+        let b = AtomicU64::new(0);
+        assert_eq!(shared.reserve(1, 100, &a), 100);
+        assert_eq!(shared.reserve(2, 100, &b), 100);
+        shared.settle(1, &a, 100, 10);
+        assert_eq!(a.load(Ordering::Relaxed), 10);
+        assert_eq!(shared.reserve(2, 100, &a), 0);
+        assert_eq!(shared.reserve(1, 100, &a), 0);
+        shared.settle(2, &b, 100, 20);
+        assert_eq!(shared.reserve(2, 100, &a), 80);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
