@@ -1154,6 +1154,8 @@ impl Shadow {
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
+        // Take the journal snapshot before acquiring the shadow's copy lock.
+        let subs = crate::watch::dirty_subpages(from, to);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
@@ -1171,10 +1173,27 @@ impl Shadow {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                let mask = subs.binary_search_by_key(&page, |&(p, _)| p).ok()
+                    .and_then(|i| crate::watch::narrow_dirty_mask(*at, write, subs[i].1));
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                run.get_or_insert(page);
+                if let Some(mask) = mask {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    for bit in 0..16usize {
+                        if mask & (1u16 << bit) != 0 {
+                            let lo = (page * PAGE + bit * 4096).max(from);
+                            let hi = (page * PAGE + (bit + 1) * 4096).min(to);
+                            if lo < hi {
+                                bytes += self.copy(lo, hi);
+                            }
+                        }
+                    }
+                } else {
+                    run.get_or_insert(page);
+                }
             } else if let Some(first) = run.take() {
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }

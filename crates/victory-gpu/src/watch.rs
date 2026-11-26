@@ -100,6 +100,8 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// Kernel 4 KiB dirty mask, current and preceding write stamps.
+    subpages: BTreeMap<usize, (u64, u64, u16)>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
 }
@@ -107,8 +109,48 @@ struct Journal {
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
+    subpages: BTreeMap::new(),
     found: Vec::new(),
 });
+
+/// Opt-in fine-grained refresh, inspired by fxceless/victory-fork e4245f3c.
+fn dirty_4k() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRTY_4K").is_some_and(|v| v == "1"))
+}
+
+/// Aggregate the kernel's answer before the coarse journal advances.
+fn record_subpages(
+    sub: &mut BTreeMap<usize, (u64, u64, u16)>,
+    written: &BTreeMap<usize, u64>,
+    found: &[usize],
+    now: u64,
+) {
+    for &address in found {
+        let page = address / PAGE;
+        let bit = 1u16 << ((address % PAGE) / KERNEL_PAGE);
+        let entry = sub.entry(page).or_insert((0, 0, 0));
+        if entry.0 != now {
+            *entry = (now, written.get(&page).copied().unwrap_or(0), 0);
+        }
+        entry.2 |= bit;
+    }
+}
+
+/// A separate snapshot is safe: consumers must match the exact coarse stamp.
+pub(crate) fn dirty_subpages(start: usize, end: usize) -> Vec<(usize, (u64, u64, u16))> {
+    if !dirty_4k() {
+        return Vec::new();
+    }
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.subpages.range(start / PAGE..end.div_ceil(PAGE)).map(|(&p, &v)| (p, v)).collect()
+}
+
+/// A partial copy is valid only if the shadow contains every prior write.
+pub(crate) fn narrow_dirty_mask(copied: u64, write: u64, sub: (u64, u64, u16)) -> Option<u16> {
+    let (stamp, previous, mask) = sub;
+    (copied != 0 && write != 0 && stamp == write && copied >= previous && mask != 0).then_some(mask)
+}
 
 /// Record kernel pages in the coarser journal without a temporary vector.
 fn record_pages(
@@ -146,6 +188,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             let now = j.asked;
             for page in pages {
                 j.written.insert(page, now);
+                j.subpages.remove(&page);
             }
             return Some((
                 now,
@@ -194,6 +237,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
+    if dirty_4k() && granularity == KERNEL_PAGE as u32 {
+        record_subpages(&mut j.subpages, &j.written, &j.found[..count], now);
+    } else {
+        for &address in &j.found[..count] {
+            j.subpages.remove(&(address / PAGE));
+        }
+    }
+    for &page in &guarded {
+        j.subpages.remove(&page);
+    }
     record_pages(&mut j.written, &j.found[..count], guarded, now);
     Some((
         now,
@@ -224,6 +277,7 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     let now = j.asked;
     for page in guarded {
         j.written.insert(page, now);
+                j.subpages.remove(&page);
     }
     Some((
         now,
@@ -1155,6 +1209,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             .collect();
         for page in pages {
             j.written.remove(&page);
+            j.subpages.remove(&page);
         }
     }
     crate::shadow::remapped(at as u64, end as u64);
@@ -1190,6 +1245,7 @@ pub fn title_memory_written(at: usize, len: usize) {
             let now = j.asked;
             for page in at / PAGE..(at + len).div_ceil(PAGE) {
                 j.written.insert(page, now);
+                j.subpages.remove(&page);
             }
         }
         crate::resource::textures_rewritten(at as u64, (at + len) as u64);
@@ -1326,6 +1382,21 @@ fn writable(at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fine_dirty_masks_require_a_current_stamp_and_prior_copy() {
+        use super::*;
+        let written = BTreeMap::from([(2usize, 7u64)]);
+        let mut sub = BTreeMap::new();
+        record_subpages(&mut sub, &written, &[2 * PAGE + 4096, 2 * PAGE + 15 * 4096, 2 * PAGE + 4096], 9);
+        let mask = sub[&2];
+        assert_eq!(mask, (9, 7, 0x8002));
+        assert_eq!(narrow_dirty_mask(7, 9, mask), Some(0x8002));
+        assert_eq!(narrow_dirty_mask(6, 9, mask), None);
+        assert_eq!(narrow_dirty_mask(0, 9, mask), None);
+        assert_eq!(narrow_dirty_mask(8, 10, mask), None);
+        assert_eq!(narrow_dirty_mask(8, 9, (9, 7, 0)), None);
+    }
+
     #[test]
     fn record_pages_matches_old_journal_with_duplicates_and_unsorted_addresses() {
         use super::{PAGE, record_pages};
