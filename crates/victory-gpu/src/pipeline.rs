@@ -924,6 +924,40 @@ mod tests {
         assert_eq!(after.1, before.1 + 3);
     }
 
+    #[test]
+    fn stream_rejects_every_truncated_shader_subobject() {
+        let mut bytes = [0u8; 24];
+        bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+        for size in 8..24 {
+            let desc = StreamDesc { size, stream: bytes.as_ptr() };
+            let mut p = std::ptr::null();
+            assert_eq!(
+                create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                E_INVALIDARG,
+                "size {size}"
+            );
+            assert!(p.is_null());
+        }
+    }
+
+    #[test]
+    fn stream_accepts_unaligned_shader_bytecode_fields() {
+        let shader_bytes = [7u8, 9, 13];
+        let mut backing = [0u64; 4];
+        // SAFETY: 24 bytes starting one byte into 32 bytes of aligned storage.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 24)
+        };
+        bytes[..4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[8..16].copy_from_slice(&(shader_bytes.as_ptr() as u64).to_le_bytes());
+        bytes[16..24].copy_from_slice(&(shader_bytes.len() as u64).to_le_bytes());
+        let desc = StreamDesc { size: bytes.len(), stream: bytes.as_ptr() };
+        let mut p = std::ptr::null();
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(shaders(p), [("vertex", shader_bytes.to_vec())]);
+        release(p);
+    }
+
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
             .shaders

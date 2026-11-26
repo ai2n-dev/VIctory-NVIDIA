@@ -3039,6 +3039,50 @@ mod tests {
     }
 
     #[test]
+    fn simd_equal_prefix_matches_byte_oracle_for_offsets_and_tails() {
+        let a = [0x3cu8; 512];
+        let mut b = a;
+        let mut c = a;
+        for offset in [0usize, 1, 7, 15, 31, 63] {
+            for len in [0usize, 1, 7, 8, 31, 32, 63, 64, 65, 127, 128, 129, 257] {
+                for dirty in 0..=len {
+                    // Exercise either comparison independently, including all-equal tails.
+                    if dirty < len {
+                        if dirty % 2 == 0 {
+                            b[offset + dirty] ^= 1;
+                        } else {
+                            c[offset + dirty] ^= 1;
+                        }
+                    }
+                    let (aa, bb, cc) = (&a[offset..offset + len], &b[offset..offset + len], &c[offset..offset + len]);
+                    let exact = aa.iter().zip(bb).zip(cc)
+                        .position(|((&x, &y), &z)| x != y || x != z).unwrap_or(len);
+                    assert_eq!(skip_equal3_scalar(aa, bb, cc), exact / 8 * 8);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if std::arch::is_x86_feature_detected!("avx2") {
+                            // SAFETY: feature checked above, bounded slices.
+                            assert_eq!(unsafe { skip_equal3_avx2(aa, bb, cc) }, exact / 32 * 32);
+                        }
+                        if std::arch::is_x86_feature_detected!("avx512f")
+                            && std::arch::is_x86_feature_detected!("avx512bw")
+                        {
+                            // SAFETY: features checked above, bounded slices.
+                            assert_eq!(unsafe { skip_equal3_avx512(aa, bb, cc) }, exact / 64 * 64);
+                        }
+                    }
+                    let dispatched = skip_equal3(aa, bb, cc);
+                    assert!(dispatched <= exact && exact - dispatched < 64);
+                    if dirty < len {
+                        b[offset + dirty] = a[offset + dirty];
+                        c[offset + dirty] = a[offset + dirty];
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn batched_snapshots_match_serial_for_partial_chunks() {
         let source: Vec<Vec<u8>> = (0..137usize)
             .map(|i| (0..super::PAGE).map(|j| (i * 31 + j * 17) as u8).collect())

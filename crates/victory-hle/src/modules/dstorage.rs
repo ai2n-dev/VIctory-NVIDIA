@@ -895,6 +895,9 @@ fn execute(request: &Request, intermediate: &mut Vec<u8>) -> Result<(), HRESULT>
             packed.resize(size, 0);
         }
         let n = inflate(&source, &mut packed[..size]).map_err(|hr| fail(hr, "zlib"))?;
+        // The compressed file allocation is no longer needed while BCPack runs.
+        // Borrowed title memory is not freed by dropping its Cow.
+        drop(source);
         &packed[..n]
     } else {
         source.as_ref()
