@@ -1252,13 +1252,17 @@ mod tests {
 
         let mut done = 0u64;
         let list = Arc::new(host.new_list().expect("command list"));
-        let (upload, offset, src) = list.upload(4).expect("patch data");
-        // SAFETY: the list's upload covers four bytes and the card is live.
-        // Separate command lists handle transitions; this one promotes COMMON.
+        // This isolated WARP host must own both resources. HostList::upload
+        // uses global host scratch, which can belong to another device.
+        let (upload, src) = host.upload_buffer(4).expect("same-host patch data");
+        // SAFETY: the upload covers four bytes and both resources belong
+        // to this host. Separate command lists handle transitions.
         unsafe {
             std::ptr::copy_nonoverlapping([1, 2, 3, 4].as_ptr(), src, 4);
-            list.list.CopyBufferRegion(&card.vram, 128, &upload, offset, 4);
+            list.list.CopyBufferRegion(&card.vram, 128, &upload, 0, 4);
         }
+        // Preserve the resource through the unwaited submission.
+        list.deferred().uploads.push(upload);
         list.count_work();
         list.defer_gpu_write(&shadow, base + 128, 4);
         list.defer_write(std::ptr::addr_of_mut!(done).cast(), crate::queue::Written::Value(7), 8);
