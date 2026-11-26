@@ -213,6 +213,13 @@ pub(crate) fn retire<T: 'static>(object: T) {
 /// is kept waiting for the GPU shows in the memory report and in the
 /// pressure that shortens the wait ([`KeepPolicy`]).
 pub(crate) fn retire_bytes<T: 'static>(object: T, bytes: u64) {
+    if BURYING.get() && !KeepPolicy::current().strict {
+        // Let go of by an object that waited its whole time in the queue
+        // (a texture's host copy owns the texture and its memory): nothing
+        // else holds it, so what it owned has waited as long.
+        drop(object);
+        return;
+    }
     let submission = STARTED.load(Ordering::Acquire);
     let frame = crate::queue::presented();
     crate::memstat::add(&crate::memstat::RETIRED_BYTES, bytes);
@@ -224,6 +231,28 @@ pub(crate) fn retire_bytes<T: 'static>(object: T, bytes: u64) {
         bytes,
         object: Box::new(object),
     });
+}
+
+thread_local! {
+    /// The thread is dropping objects that waited in the queue.
+    static BURYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Drops objects that waited their time in the queue. What they let go of
+/// ([`retire`] from their `Drop`) is dropped with them, not queued again:
+/// a title texture's host copy was kept for 8 s, and then its resource and
+/// memory slot for 8 s more, as the host copy's drop retired them.
+/// `VICTORY_KEEP_STRICT=1` queues them again, as before.
+fn drop_waited(done: Vec<Retired>) {
+    struct Burying;
+    impl Drop for Burying {
+        fn drop(&mut self) {
+            BURYING.set(false);
+        }
+    }
+    BURYING.set(true);
+    let _reset = Burying;
+    drop(done);
 }
 
 /// The longest wait `VICTORY_KEEP_SECS` can ask for (larger values, and values
@@ -339,7 +368,7 @@ fn bury(finished: u64) {
         crate::memstat::sub(&crate::memstat::RETIRED_BYTES, r.bytes);
         crate::memstat::sub(&crate::memstat::RETIRED_COUNT, 1);
     }
-    drop(done);
+    drop_waited(done);
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -1195,6 +1224,45 @@ mod tests {
         // ... nor does an object whose frames have not passed.
         assert_eq!(expired(&queue, 9, all_frames - 1, Duration::ZERO), 0);
         assert_eq!(expired(&queue, 9, all_frames, Duration::ZERO), 3);
+    }
+
+    /// What an object lets go of while it is dropped after its wait is
+    /// dropped with it, but queued like any other when something else drops
+    /// the object.
+    #[test]
+    fn what_a_waited_object_owned_is_not_queued_again() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        struct Marker(Arc<AtomicBool>);
+        impl Drop for Marker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct Owner(Option<Marker>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                retire_bytes(self.0.take(), 0);
+            }
+        }
+        let gone = Arc::new(AtomicBool::new(false));
+        drop_waited(vec![retired_object(Owner(Some(Marker(gone.clone()))))]);
+        assert!(gone.load(Ordering::SeqCst), "dropped with its owner");
+        assert!(!BURYING.get());
+
+        let queued = Arc::new(AtomicBool::new(false));
+        drop(Owner(Some(Marker(queued.clone()))));
+        assert!(!queued.load(Ordering::SeqCst), "any other drop queues it");
+    }
+
+    fn retired_object<T: 'static>(object: T) -> Retired {
+        Retired {
+            submission: 0,
+            frame: 0,
+            at: std::time::Instant::now(),
+            bytes: 0,
+            object: Box::new(object),
+        }
     }
 
     /// The wait and the strict mode come from the environment's texts; a
