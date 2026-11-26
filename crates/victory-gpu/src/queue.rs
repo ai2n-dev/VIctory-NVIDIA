@@ -355,6 +355,7 @@ extern "system" fn present(
             presenting.elapsed().as_micros() as u64,
         );
         crate::framelog::frame();
+        crate::frametrace::present();
     }
     hr
 }
