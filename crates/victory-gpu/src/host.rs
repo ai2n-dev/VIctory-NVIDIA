@@ -4907,7 +4907,9 @@ impl Presenter {
             device.CreateRenderTargetView(back, None, view);
             if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
                 list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
-                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+                for chunk in crate::readout::clear_rect_chunks(&marks) {
+                    list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(chunk));
+                }
             }
         }
     }

@@ -6,6 +6,18 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::RECT;
 
+/// Keep individual overlay clear calls small: large glyph batches have been
+/// associated with NVIDIA user-mode driver fail-fast crashes.
+#[cfg(any(windows, test))]
+const MAX_CLEAR_RECTS: usize = 8;
+
+/// Non-empty batches in original order. An empty glyph list must not issue
+/// a D3D12 clear: zero rectangles would clear the entire render target.
+#[cfg(any(windows, test))]
+pub(crate) fn clear_rect_chunks(rects: &[RECT]) -> impl Iterator<Item = &[RECT]> {
+    rects.chunks(MAX_CLEAR_RECTS)
+}
+
 /// Whether the readout is drawn.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -72,6 +84,33 @@ pub(crate) fn rects(text: &str, at: (i32, i32), dot: i32) -> Vec<RECT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_batches_preserve_every_rect_and_never_clear_an_empty_list() {
+        for n in 0..=257 {
+            let input: Vec<_> = (0..n)
+                .map(|i| RECT {
+                    left: i,
+                    top: 0,
+                    right: i + 1,
+                    bottom: 1,
+                })
+                .collect();
+            let chunks: Vec<_> = clear_rect_chunks(&input).collect();
+            assert_eq!(chunks.len(), input.len().div_ceil(MAX_CLEAR_RECTS));
+            assert!(chunks.iter().all(|c| !c.is_empty() && c.len() <= MAX_CLEAR_RECTS));
+            let actual: Vec<_> = chunks.into_iter().flatten().copied().collect();
+            assert_eq!(actual, input);
+        }
+    }
+
+    #[test]
+    fn real_fps_glyphs_fit_in_bounded_batches() {
+        let marks = rects("120.0 FPS  8 MS", (12, 12), 4);
+        assert!(marks.len() > MAX_CLEAR_RECTS);
+        let actual: Vec<_> = clear_rect_chunks(&marks).flatten().copied().collect();
+        assert_eq!(actual, marks);
+    }
 
     #[test]
     fn a_row_of_dots_is_one_rectangle() {
