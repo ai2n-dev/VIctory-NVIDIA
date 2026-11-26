@@ -857,26 +857,44 @@ fn mask_numbers(st: &Structured, p: &crate::ir::Program) -> HashSet<Value> {
             }
         }
     }
-    loop {
-        let before = out.len();
-        for b in &p.blocks {
-            for phi in &b.phis {
-                if out.contains(&phi.value) {
-                    out.extend(phi.args.iter().copied().filter(|&a| is_mask(a)));
-                }
-            }
-            for i in &b.insts {
-                if matches!(i.fields, Fields::Sop { .. })
-                    && mask_set_op(i.name())
-                    && i.writes.iter().any(|w| out.contains(&w.1))
-                {
-                    let read = i.reads.iter().filter(|r| matches!(r.0, Reg::S(_)));
-                    out.extend(read.map(|r| r.1).filter(|&v| is_mask(v)));
+    if out.is_empty() {
+        return out;
+    }
+    // Index definitions instead of scanning the whole program for each
+    // step of a backward dependency chain.
+    let mut deps: HashMap<Value, Vec<Value>> = HashMap::new();
+    for b in &p.blocks {
+        for phi in b.phis.iter().filter(|phi| is_mask(phi.value)) {
+            deps.entry(phi.value)
+                .or_default()
+                .extend(phi.args.iter().copied().filter(|&a| is_mask(a)));
+        }
+        for i in &b.insts {
+            if matches!(i.fields, Fields::Sop { .. }) && mask_set_op(i.name()) {
+                for &(_, w) in i.writes.iter().filter(|w| is_mask(w.1)) {
+                    deps.entry(w).or_default().extend(
+                        i.reads.iter()
+                            .filter(|r| matches!(r.0, Reg::S(_)) && is_mask(r.1))
+                            .map(|r| r.1),
+                    );
                 }
             }
         }
-        if out.len() == before {
-            return out;
+    }
+    expand_mask_dependencies(&mut out, &deps);
+    out
+}
+
+/// Reachability through mask definitions, including cyclic loop phis.
+fn expand_mask_dependencies(out: &mut HashSet<Value>, deps: &HashMap<Value, Vec<Value>>) {
+    let mut pending: Vec<Value> = out.iter().copied().collect();
+    while let Some(v) = pending.pop() {
+        if let Some(reads) = deps.get(&v) {
+            for &read in reads {
+                if out.insert(read) {
+                    pending.push(read);
+                }
+            }
         }
     }
 }
@@ -885,7 +903,7 @@ fn mask_numbers(st: &Structured, p: &crate::ir::Program) -> HashSet<Value> {
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let ops: Vec<&Operand> = match &i.fields {
+    let ops: &[Operand] = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
             if i.writes
@@ -894,15 +912,15 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         {
             return false;
         }
-        Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Sop { src, .. } => src,
         Fields::Valu(v)
             if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
         {
-            v.src.iter().collect()
+            &v.src
         }
         _ => return false,
     };
-    ops.into_iter().any(|op| match *op {
+    ops.iter().any(|op| match *op {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
@@ -10130,6 +10148,38 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::super::container::SigElement;
+
+    #[test]
+    fn mask_dependency_worklist_matches_fixed_point() {
+        use crate::ir::Value;
+        use std::collections::{HashMap, HashSet};
+        let deps = HashMap::from([
+            (Value(0), vec![Value(1), Value(2)]),
+            (Value(1), vec![Value(3)]),
+            (Value(2), vec![Value(3), Value(4)]),
+            (Value(3), vec![Value(0)]),
+            (Value(4), vec![Value(5)]),
+            (Value(6), vec![Value(7)]),
+        ]);
+        for bits in 0..256u32 {
+            let seeds: HashSet<_> = (0..8).filter(|i| bits & (1 << i) != 0).map(Value).collect();
+            let mut expected = seeds.clone();
+            loop {
+                let before = expected.len();
+                for (v, reads) in &deps {
+                    if expected.contains(v) {
+                        expected.extend(reads.iter().copied());
+                    }
+                }
+                if expected.len() == before {
+                    break;
+                }
+            }
+            let mut actual = seeds;
+            super::expand_mask_dependencies(&mut actual, &deps);
+            assert_eq!(actual, expected, "seeds {bits:#x}");
+        }
+    }
     use super::{
         Lowered, Numeric, Parts, SubDword, buffer_format, code_table_start, half_shift, inline_f16,
         lower,
