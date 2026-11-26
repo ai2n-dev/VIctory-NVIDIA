@@ -676,6 +676,14 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
+            if let Err(err) = crate::preflight::validate_dxil_container(&t.dxil) {
+                tracing::warn!(
+                    %err,
+                    ?shaders,
+                    "refused malformed DXIL container before D3D12 PSO creation"
+                );
+                return None;
+            }
             bound.push(stage);
         }
         // A mesh pipeline's amplification stage (`crate::launch`): its three

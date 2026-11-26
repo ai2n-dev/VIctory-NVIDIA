@@ -1007,6 +1007,20 @@ impl HostHeap {
             FAILED[1].fetch_add(1, Ordering::Relaxed);
             return None;
         };
+        let first_slot = self.count + first as u32;
+        let null_slot = (!self.sampler
+            && self.count + self.spare == PORTABLE_VIEWS - crate::memory::SLOTS)
+            .then_some(CAPPED_NULL_SLOT);
+        if let Err(err) = crate::preflight::validate_descriptor_run(
+            first_slot,
+            n as u32,
+            self.count,
+            self.spare,
+            null_slot,
+        ) {
+            tracing::warn!(%err, "refused invalid dynamic descriptor run");
+            return None;
+        }
         taken[first..first + n].fill(true);
         #[cfg(feature = "diagnostics")]
         if !self.sampler {
@@ -1018,7 +1032,7 @@ impl HostHeap {
             }
         }
         *next = ((first + n) % spare) as u32;
-        Some(self.count + first as u32)
+        Some(first_slot)
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -1046,6 +1060,15 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        let null_slot = (!self.sampler
+            && self.count + self.spare == PORTABLE_VIEWS - crate::memory::SLOTS)
+            .then_some(CAPPED_NULL_SLOT);
+        if let Err(err) =
+            crate::preflight::validate_descriptor_slot(index, self.count + self.spare, null_slot)
+        {
+            tracing::warn!(%err, "refused out-of-bounds descriptor write");
+            return;
+        }
         let kept = make(view, self.cpu(index));
         let ok = kept.is_some();
         if !ok {

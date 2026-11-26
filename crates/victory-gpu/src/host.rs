@@ -75,11 +75,20 @@ fn async_submit() -> bool {
 #[cfg(test)]
 thread_local! {
     static ASYNC_IN_TESTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STRICT_IN_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
 fn async_submit() -> bool {
     ASYNC_IN_TESTS.with(std::cell::Cell::get)
+}
+
+fn strict_keep() -> bool {
+    #[cfg(test)]
+    if let Some(strict) = STRICT_IN_TESTS.with(std::cell::Cell::get) {
+        return strict;
+    }
+    KeepPolicy::current().strict
 }
 
 /// Microseconds spent bringing buffer copies up to date while the
@@ -213,7 +222,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
 /// is kept waiting for the GPU shows in the memory report and in the
 /// pressure that shortens the wait ([`KeepPolicy`]).
 pub(crate) fn retire_bytes<T: 'static>(object: T, bytes: u64) {
-    if BURYING.get() && !KeepPolicy::current().strict {
+    if BURYING.get() && !strict_keep() {
         // Let go of by an object that waited its whole time in the queue
         // (a texture's host copy owns the texture and its memory): nothing
         // else holds it, so what it owned has waited as long.
@@ -356,7 +365,7 @@ fn bury(finished: u64) {
         let policy = KeepPolicy::current();
         let mut n = expired(&retired, finished, now, policy.time);
         // Pressure is asked only when it would free the next object.
-        if !policy.strict
+        if !strict_keep()
             && retired.get(n).is_some_and(|r| waits_for_time_only(r, finished, now, policy.time))
             && video_memory_pressure()
         {
@@ -465,7 +474,10 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     tracing::error!("{text}");
     match ON_FAILURE.get() {
         Some(report) => report(&text),
-        None => std::process::abort(),
+        None => {
+            eprintln!("victory-gpu host::fail: {text}");
+            std::process::abort();
+        }
     }
 }
 
@@ -706,24 +718,29 @@ impl Host {
         self.card_engine().is_some()
     }
 
+    /// Signals `self.fence`, updates [`crate::cardmeter`], and waits for
+    /// completion. Caller MUST hold `self.submitted`.
+    fn signal_and_wait_locked(&self, submitted: &mut u64, warn_msg: &str) {
+        *submitted += 1;
+        let fence_val = *submitted;
+        // SAFETY: caller holds `self.submitted`; fence & event are ours.
+        match unsafe { self.queue.Signal(&self.fence, fence_val) } {
+            Ok(()) => {
+                crate::cardmeter::signalled(&self.fence, fence_val);
+                wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val);
+            }
+            Err(e) => tracing::warn!(error = %e, "{warn_msg}"),
+        }
+    }
+
     /// Executes a single command list on the direct queue and waits for it to
     /// finish. Caller MUST hold `self.submitted`.
     pub(crate) fn execute_and_wait_locked(&self, cmd: ID3D12CommandList, submitted: &mut u64) {
-        *submitted += 1;
-        let fence_val = *submitted;
-        // SAFETY: caller holds `self.submitted`; `cmd` is closed; fence & event are ours.
-        unsafe {
-            let lists = [Some(cmd)];
-            crate::cardmeter::executing(&lists, &self.fence);
-            self.queue.ExecuteCommandLists(&lists);
-            match self.queue.Signal(&self.fence, fence_val) {
-                Ok(()) => {
-                    crate::cardmeter::signalled(&self.fence, fence_val);
-                    wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val);
-                }
-                Err(e) => tracing::warn!(error = %e, "card GPU wait failed"),
-            }
-        }
+        let lists = [Some(cmd)];
+        crate::cardmeter::executing(&lists, &self.fence);
+        // SAFETY: caller holds `self.submitted` and `cmd` is closed.
+        unsafe { self.queue.ExecuteCommandLists(&lists) };
+        self.signal_and_wait_locked(submitted, "card GPU wait failed");
     }
 
     /// Creates an isolated WARP-backed `Host` for unit tests without touching
@@ -738,6 +755,12 @@ impl Host {
         let mut host = Host::from_device(device?, None).ok()?;
         host.warp_serial = Some(serial);
         Some(host)
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.wait_in_flight();
     }
 }
 
@@ -803,11 +826,23 @@ fn wait_for_value(fence: &ID3D12Fence, event: HANDLE, value: u64) {
         if let Err(e) = &armed {
             tracing::warn!(error = %e, value, "fence event not armed: polling the fence");
         }
+        let timeout_ms = crate::preflight::effective_fence_timeout_ms(
+            std::env::var("VICTORY_FENCE_TIMEOUT_MS").ok().as_deref(),
+            cfg!(test),
+        );
         let began = std::time::Instant::now();
         let mut logged = 0;
         while fence.GetCompletedValue() < value {
             if removed() {
                 return;
+            }
+            if let Some(limit) = timeout_ms
+                && began.elapsed().as_millis() >= u128::from(limit)
+            {
+                let completed = fence.GetCompletedValue();
+                fail(format_args!(
+                    "fence wait timed out after {limit} ms (target={value}, completed={completed})"
+                ));
             }
             if armed.is_err() || WaitForSingleObject(event, 1000) == WAIT_FAILED {
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1361,6 +1396,160 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    #[ignore = "quarantined per 2026-11-26 incident policy: GPU/WARP re-execution test requires isolated/preflighted execution"]
+    fn reexecuting_closed_list_and_unsubmitted_deferred_drop_work_in_sync_and_async() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        struct KeepProbe(Arc<AtomicUsize>);
+        impl Drop for KeepProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct AsyncReset;
+        impl Drop for AsyncReset {
+            fn drop(&mut self) {
+                ASYNC_IN_TESTS.with(|on| on.set(false));
+            }
+        }
+
+        let Some(host) = Host::new_warp() else { return };
+
+        // 1. An empty execution returns cleanly without hanging or leaking fence waits.
+        host.execute(&[]);
+
+        // 2. An unsubmitted closed list drops its deferred & kept state on drop without running writes.
+        let unsubmitted_drops = Arc::new(AtomicUsize::new(0));
+        let mut untouched = [0u64; 1];
+        {
+            let list = host.new_list().expect("unsubmitted list");
+            list.keep_until_run(Box::new(KeepProbe(unsubmitted_drops.clone())));
+            list.defer_write(untouched.as_mut_ptr().cast(), crate::queue::Written::Value(99), 8);
+            list.close();
+            assert_eq!(list.last_fence.load(Ordering::Acquire), 0);
+            assert_eq!(unsubmitted_drops.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(unsubmitted_drops.load(Ordering::SeqCst), 1);
+        // SAFETY: isolated local stack word never written by unsubmitted list.
+        assert_eq!(unsafe { untouched.as_ptr().read_volatile() }, 0);
+
+        // 3. Re-executing the same closed list synchronously keeps held state until reset/drop.
+        let kept_drops = Arc::new(AtomicUsize::new(0));
+        let list = Arc::new(host.new_list().expect("reused list"));
+        list.keep_until_run(Box::new(KeepProbe(kept_drops.clone())));
+        list.count_work();
+        list.close();
+
+        host.execute(&[&list]);
+        host.execute(&[&list]);
+        assert_eq!(kept_drops.load(Ordering::SeqCst), 0);
+
+        // 4. Re-executing the same closed list asynchronously advances last_fence and finishes on wait.
+        ASYNC_IN_TESTS.with(|on| on.set(true));
+        let _reset_async = AsyncReset;
+        host.execute_title(std::slice::from_ref(&list));
+        let fence_1 = list.last_fence.load(Ordering::Acquire);
+        host.execute_title(std::slice::from_ref(&list));
+        let fence_2 = list.last_fence.load(Ordering::Acquire);
+        drop(_reset_async);
+        assert!(fence_2 > fence_1 && fence_1 > 0, "fences {fence_1} -> {fence_2}");
+
+        host.wait_in_flight();
+        assert!(host.finished_fence.load(Ordering::Acquire) >= fence_2);
+        list.reset();
+        assert_eq!(kept_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[ignore = "quarantined after 2026-11-26 freeze/0xC0000409 incident: 200-cycle WARP handle test aborted intermittently under parallel runs; verify off-host"]
+    fn repeated_host_list_and_wait_cycles_do_not_leak_handles() {
+        let Some(host) = Host::new_warp() else { return };
+        let handle_count = || -> u32 {
+            let mut count = 0u32;
+            // SAFETY: valid process handle and out pointer.
+            let ok = unsafe {
+                windows_sys::Win32::System::Threading::GetProcessHandleCount(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    &mut count,
+                )
+            };
+            assert_ne!(ok, 0);
+            count
+        };
+
+        // Warm up once before measuring baseline handle count.
+        {
+            let warmup = host.new_list().expect("warmup list");
+            warmup.count_work();
+            warmup.close();
+            host.execute(&[&warmup]);
+            warmup.reset();
+        }
+        let before = handle_count();
+        const CYCLES: usize = 200;
+        for _ in 0..CYCLES {
+            let list = host.new_list().expect("cycle list");
+            list.count_work();
+            list.close();
+            host.execute(&[&list]);
+            // Exercise `wait_for_last_submission`'s temporary WaitForSingleObject event path.
+            list.last_fence.store(1, Ordering::Release);
+            list.wait_for_last_submission();
+            list.reset();
+            drop(list);
+        }
+        let after = handle_count();
+        let growth = after.saturating_sub(before);
+        assert!(
+            growth < 64,
+            "handle count grew by {growth} ({before} -> {after}) over {CYCLES} list+wait cycles"
+        );
+    }
+
+    #[test]
+    fn strict_keep_policy_queues_nested_drops_and_tracks_retired_bytes() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        struct StrictReset;
+        impl Drop for StrictReset {
+            fn drop(&mut self) {
+                STRICT_IN_TESTS.with(|s| s.set(None));
+            }
+        }
+        struct Marker(Arc<AtomicBool>);
+        impl Drop for Marker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct Owner(Option<Marker>, u64);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                retire_bytes(self.0.take(), self.1);
+            }
+        }
+
+        let strict_dropped = Arc::new(AtomicBool::new(false));
+        let _reset_strict = StrictReset;
+        STRICT_IN_TESTS.with(|s| s.set(Some(true)));
+
+        let before_count = crate::memstat::RETIRED_COUNT.load(Ordering::Relaxed);
+        let before_bytes = crate::memstat::RETIRED_BYTES.load(Ordering::Relaxed);
+        drop_waited(vec![retired_object(Owner(
+            Some(Marker(strict_dropped.clone())),
+            4096,
+        ))]);
+        assert!(
+            !strict_dropped.load(Ordering::SeqCst),
+            "strict mode must queue nested retired drops instead of dropping inline"
+        );
+        assert!(crate::memstat::RETIRED_COUNT.load(Ordering::Relaxed) > before_count);
+        assert!(crate::memstat::RETIRED_BYTES.load(Ordering::Relaxed) >= before_bytes + 4096);
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -1411,6 +1600,8 @@ pub(crate) struct HostList {
     clamp_chunks: Mutex<ClampChunks>,
     /// Timestamp slot pair for [`crate::cardmeter`] (`u32::MAX` when unstarted).
     meter: std::sync::atomic::AtomicU32,
+    /// Tracks whether `close()` finished recording without a subsequent `reset()`.
+    closed: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1862,6 +2053,7 @@ impl Host {
                 last_fence: std::sync::atomic::AtomicU64::new(0),
                 fence: self.fence.clone(),
                 meter: std::sync::atomic::AtomicU32::new(u32::MAX),
+                closed: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2027,6 +2219,27 @@ impl Host {
             self.prewarm(runs);
         }
         self.drain_in_flight_locked();
+        if !runs.is_empty() {
+            use windows::core::Interface;
+            let host_fence = self.fence.as_raw() as usize;
+            // SAFETY: plain completed-value query on live host fence.
+            let completed_fence = unsafe { self.fence.GetCompletedValue() };
+            let batch_meta: Vec<crate::preflight::ListExecMeta> = runs
+                .iter()
+                .map(|list| crate::preflight::ListExecMeta {
+                    key: list.list.as_raw() as usize,
+                    closed: list.closed.load(Ordering::Acquire),
+                    host_fence,
+                    list_fence: list.fence.as_raw() as usize,
+                    last_fence: list.last_fence.load(Ordering::Acquire),
+                    completed_fence,
+                    live_kept_resources: true,
+                })
+                .collect();
+            if let Err(err) = crate::preflight::validate_submission_batch(&batch_meta) {
+                fail(format_args!("host submission rejected by preflight: {err}"));
+            }
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -2122,17 +2335,20 @@ impl Host {
             && async_submit()
             && card_writes.is_empty()
             && runs.iter().all(|list| list.deferred().texture_backs.is_empty());
+        let mut unsignalled_pre = false;
         if let Some(first) = first {
             let lists = [Some(first)];
             crate::cardmeter::executing(&lists, &self.fence);
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&lists) };
+            unsignalled_pre = true;
         }
         if let Some(card_before) = card_before {
             let lists = [Some(card_before)];
             crate::cardmeter::executing(&lists, &self.fence);
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&lists) };
+            unsignalled_pre = true;
         }
         let mut async_signalled = false;
         let mut card_after_ran = false;
@@ -2160,13 +2376,14 @@ impl Host {
                 unsafe { self.queue.ExecuteCommandLists(&lists) };
                 card_after_ran = true;
             }
-            *submitted += 1;
-            let fence_val = *submitted;
             if can_async {
+                *submitted += 1;
+                let fence_val = *submitted;
                 // SAFETY: the fence is ours.
                 match unsafe { self.queue.Signal(&self.fence, fence_val) } {
                     Ok(()) => {
                         crate::cardmeter::signalled(&self.fence, fence_val);
+                        unsignalled_pre = false;
                         for list in runs {
                             list.last_fence.store(fence_val, Ordering::Release);
                         }
@@ -2178,14 +2395,8 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host async submission not signalled"),
                 }
             }
-            // SAFETY: the fence is ours.
-            match unsafe { self.queue.Signal(&self.fence, fence_val) } {
-                Ok(()) => {
-                    crate::cardmeter::signalled(&self.fence, fence_val);
-                    wait_for_value(&self.fence, HANDLE(self.event.as_raw_handle()), fence_val);
-                }
-                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-            }
+            self.signal_and_wait_locked(&mut submitted, "host submission not waited for");
+            unsignalled_pre = false;
             #[cfg(feature = "diagnostics")]
             if each {
                 // SAFETY: a plain query.
@@ -2211,8 +2422,12 @@ impl Host {
             let skip = false;
             if !skip {
                 self.execute_and_wait_locked(after, &mut submitted);
+                unsignalled_pre = false;
                 card_after_ran = true;
             }
+        }
+        if unsignalled_pre && !async_signalled {
+            self.signal_and_wait_locked(&mut submitted, "host prelude wait failed");
         }
         let _ = &firsts;
         if async_signalled {
@@ -2802,6 +3017,7 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.closed.store(true, Ordering::Release);
     }
 
     pub(crate) fn keep_until_run(&self, what: Box<dyn std::any::Any + Send>) {
@@ -2845,6 +3061,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.closed.store(false, Ordering::Release);
         self.meter.store(
             crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(),
             std::sync::atomic::Ordering::Relaxed,
@@ -2945,6 +3162,28 @@ impl HostList {
         if uploads.is_empty() && post_barriers.is_empty() {
             return None;
         }
+        let validate_barriers = |barriers: &[D3D12_RESOURCE_BARRIER]| {
+            use windows::core::Interface;
+            let checks: Vec<crate::preflight::BarrierTransition> = barriers
+                .iter()
+                .filter(|b| b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+                .map(|b| {
+                    // SAFETY: `Type == TRANSITION` guarantees `Anonymous.Transition` is active.
+                    let t = unsafe { &b.Anonymous.Transition };
+                    crate::preflight::BarrierTransition {
+                        resource: t.pResource.as_ref().map_or(0, |r| r.as_raw() as usize),
+                        subresource: t.Subresource,
+                        before: t.StateBefore.0 as u32,
+                        after: t.StateAfter.0 as u32,
+                    }
+                })
+                .collect();
+            if let Err(err) = crate::preflight::validate_resource_barriers(&checks) {
+                fail(format_args!("host prelude barrier rejected by preflight: {err}"));
+            }
+        };
+        validate_barriers(&pre_barriers);
+        validate_barriers(&post_barriers);
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures and staging buffers are live.

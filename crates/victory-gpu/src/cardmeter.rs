@@ -214,6 +214,36 @@ impl Meter {
         }
     }
 
+    fn executing_on(&mut self, lists: &[Option<ID3D12CommandList>], fence: &ID3D12Fence) {
+        let mapped = self.mapped;
+        let frequency = self.frequency;
+        for list in lists.iter().flatten() {
+            if let Some(r) = self.recordings.get_mut(&(list.as_raw() as usize)) {
+                if let Some((kind, begin, end)) = r.sample(|pair| read_pair_raw(mapped, pair)) {
+                    account(kind, micros(begin, end, frequency));
+                }
+                if !matches!(&r.state, State::Running(owner) if owner.as_raw() == fence.as_raw()) {
+                    r.state = State::Running(fence.clone());
+                    self.unsignalled
+                        .entry(fence.as_raw() as usize)
+                        .or_default()
+                        .push(list.as_raw() as usize);
+                }
+            }
+        }
+    }
+
+    fn signalled_on(&mut self, fence: &ID3D12Fence, value: u64) {
+        let Some(keys) = self.unsignalled.get_mut(&(fence.as_raw() as usize)) else { return };
+        for key in keys.drain(..) {
+            if let Some(r) = self.recordings.get_mut(&key)
+                && matches!(&r.state, State::Running(owner) if owner.as_raw() == fence.as_raw())
+            {
+                r.state = State::Submitted(fence.clone(), value);
+            }
+        }
+    }
+
     fn alloc_slot(&mut self, key: usize, kind: Kind) -> Option<u32> {
         // Only called after reset of the previous recording, if any.
         self.release(key);
@@ -292,22 +322,8 @@ pub(crate) fn executing(lists: &[Option<ID3D12CommandList>], fence: &ID3D12Fence
         return;
     }
     let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(Some(m)) = meter.as_mut() else { return };
-    let mapped = m.mapped;
-    let frequency = m.frequency;
-    for list in lists.iter().flatten() {
-        if let Some(r) = m.recordings.get_mut(&(list.as_raw() as usize)) {
-            if let Some((kind, begin, end)) = r.sample(|pair| read_pair_raw(mapped, pair)) {
-                account(kind, micros(begin, end, frequency));
-            }
-            if !matches!(&r.state, State::Running(owner) if owner.as_raw() == fence.as_raw()) {
-                r.state = State::Running(fence.clone());
-                m.unsignalled
-                    .entry(fence.as_raw() as usize)
-                    .or_default()
-                    .push(list.as_raw() as usize);
-            }
-        }
+    if let Some(Some(m)) = meter.as_mut() {
+        m.executing_on(lists, fence);
     }
 }
 
@@ -317,14 +333,8 @@ pub(crate) fn signalled(fence: &ID3D12Fence, value: u64) {
         return;
     }
     let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(Some(m)) = meter.as_mut() else { return };
-    let Some(keys) = m.unsignalled.get_mut(&(fence.as_raw() as usize)) else { return };
-    for key in keys.drain(..) {
-        if let Some(r) = m.recordings.get_mut(&key)
-            && matches!(&r.state, State::Running(owner) if owner.as_raw() == fence.as_raw())
-        {
-            r.state = State::Submitted(fence.clone(), value);
-        }
+    if let Some(Some(m)) = meter.as_mut() {
+        m.signalled_on(fence, value);
     }
 }
 
@@ -527,6 +537,97 @@ mod tests {
                 assert!(meter.alloc_slot(key, Kind::Lists).is_some());
             }
             assert!(meter.alloc_slot(usize::MAX - 1, Kind::Lists).is_none());
+        }
+    }
+
+    #[test]
+    #[ignore = "quarantined per 2026-11-26 incident policy: D3D12/WARP meter test requires isolated/preflighted execution"]
+    fn executing_and_signalled_handle_reexecution_unsubmitted_release_and_quarantine() {
+        use windows::core::Interface;
+        let Some(host) = crate::host::Host::new_warp() else { return };
+        let device = host.device();
+        let freq = host.timestamp_frequency().max(1);
+        let mut meter = Meter::make_on(device, freq).expect("warp timestamp meter");
+        // SAFETY: valid D3D12 allocator, command lists, queue, and fences on WARP device.
+        unsafe {
+            let alloc: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("alloc");
+            let submitted_list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .expect("submitted_list");
+            let span_a = meter.begin_list(&submitted_list, Kind::Lists);
+            assert_ne!(span_a, Span::NONE);
+            meter.end_list(&submitted_list, span_a);
+            submitted_list.Close().expect("close a");
+
+            let unsubmitted_list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .expect("unsubmitted_list");
+            let span_b = meter.begin_list(&unsubmitted_list, Kind::Sync);
+            assert_ne!(span_b, Span::NONE);
+            meter.end_list(&unsubmitted_list, span_b);
+            unsubmitted_list.Close().expect("close b");
+
+            let quarantined_list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .expect("quarantined_list");
+            let span_c = meter.begin_list(&quarantined_list, Kind::Check);
+            assert_ne!(span_c, Span::NONE);
+            meter.end_list(&quarantined_list, span_c);
+            quarantined_list.Close().expect("close c");
+
+            let fence_a: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence_a");
+            let fence_b: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence_b");
+
+            // Unsubmitted list released directly returns its slot cleanly without touching free count for others.
+            let key_b = list_key(&unsubmitted_list).unwrap();
+            assert!(!meter.free.contains(&span_b.raw()));
+            meter.release(key_b);
+            assert!(meter.free.contains(&span_b.raw()));
+
+            // Execute `submitted_list` on `fence_a` and `quarantined_list` on `fence_b`.
+            let cmd_a: ID3D12CommandList = submitted_list.cast().unwrap();
+            let cmd_c: ID3D12CommandList = quarantined_list.cast().unwrap();
+            meter.executing_on(&[Some(cmd_a.clone())], &fence_a);
+            meter.executing_on(&[Some(cmd_c.clone())], &fence_b);
+
+            // Re-executing `submitted_list` on `fence_a` before signalling stays in Running once.
+            meter.executing_on(&[Some(cmd_a.clone())], &fence_a);
+            assert_eq!(
+                meter.unsignalled.get(&(fence_a.as_raw() as usize)).map(Vec::len),
+                Some(1)
+            );
+
+            // Signalling `fence_a` must NOT transition `quarantined_list` (which ran on `fence_b`).
+            fence_a.Signal(1).expect("signal fence_a");
+            meter.signalled_on(&fence_a, 1);
+            assert_eq!(
+                meter.unsignalled.get(&(fence_a.as_raw() as usize)).map(Vec::len),
+                Some(0)
+            );
+            let key_a = list_key(&submitted_list).unwrap();
+            let key_c = list_key(&quarantined_list).unwrap();
+            assert!(matches!(
+                meter.recordings[&key_a].state,
+                State::Submitted(ref f, 1) if f.as_raw() == fence_a.as_raw()
+            ));
+            assert!(matches!(
+                meter.recordings[&key_c].state,
+                State::Running(ref f) if f.as_raw() == fence_b.as_raw()
+            ));
+
+            // Re-executing `submitted_list` after completion samples execution 1 and keeps slot `span_a`.
+            meter.executing_on(&[Some(cmd_a)], &fence_a);
+            assert_eq!(meter.recordings[&key_a].pair, span_a.raw());
+            fence_a.Signal(2).expect("signal fence_a 2");
+            meter.signalled_on(&fence_a, 2);
+            meter.release(key_a);
+            assert!(meter.free.contains(&span_a.raw()));
+
+            // Releasing `quarantined_list` while still Running (unsignalled on `fence_b`) quarantines `span_c`.
+            meter.release(key_c);
+            assert!(!meter.free.contains(&span_c.raw()));
         }
     }
 }

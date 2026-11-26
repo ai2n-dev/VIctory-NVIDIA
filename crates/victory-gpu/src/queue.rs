@@ -303,9 +303,14 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// Serializes unit tests that assert exact deltas on `FRAMES`.
+#[cfg(test)]
+static FRAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A frame passes (tests that check per-frame work).
 #[cfg(test)]
 pub(crate) fn pass_frame() {
+    let _guard = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     FRAMES.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -814,6 +819,7 @@ mod tests {
         let add_ref = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x08)(o);
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
 
+        let _frame_guard = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = FRAMES.load(Ordering::Relaxed);
         assert_eq!(wait(waits)(waits, ready, 1), S_OK);
         {

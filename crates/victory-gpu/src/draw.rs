@@ -1094,6 +1094,16 @@ impl State {
             // SAFETY: an open list; a dword of the program's user data.
             unsafe { list.list.SetComputeRoot32BitConstant(param, most, index) };
         }
+        if let Err(err) = crate::preflight::validate_dispatch(
+            x.min(MAX_GROUPS),
+            y,
+            z,
+            u64::from(crate::preflight::MAX_DISPATCH_GROUPS_PER_DIM)
+                .saturating_mul(u64::from(crate::preflight::MAX_DISPATCH_GROUPS_PER_DIM)),
+        ) {
+            tracing::warn!(%err, "skipped invalid compute dispatch before driver submission");
+            return;
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x.min(MAX_GROUPS), y, z) };
         if let Some((param, index)) = start {

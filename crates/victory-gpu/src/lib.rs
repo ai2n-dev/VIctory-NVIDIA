@@ -55,6 +55,8 @@ pub mod memstat;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+pub mod preflight;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
