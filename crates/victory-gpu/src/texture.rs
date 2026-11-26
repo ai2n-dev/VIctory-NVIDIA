@@ -321,13 +321,13 @@ impl Staging {
         {
             return (0, false);
         }
-        if !committed(self.memory, size) {
+        if !any_committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
                 size,
                 desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
+                "a sampled texture's memory has no committed pages"
             );
             return (0, false);
         }
@@ -550,10 +550,11 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
     });
 }
 
-/// Whether `[at, at + len)` is committed memory (streamed textures may be
-/// unmapped until their pages arrive).
+/// Whether `[at, at + len)` is completely committed, readable memory.
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let mut p = at as usize;
     let end = p + len;
     if crate::shadow::in_place(p as u64, end as u64) {
@@ -577,12 +578,58 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 || info.State != MEM_COMMIT || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 {
             return false;
         }
         p = info.BaseAddress as usize + info.RegionSize;
     }
     true
+}
+
+/// Whether `[at, at + len)` has any committed, readable memory (a streamed
+/// texture with mip 0 absent can still have resident smaller or interior mips).
+fn any_committed(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if len == 0 {
+        return false;
+    }
+    let start = at as usize;
+    let end = start.saturating_add(len);
+    if start >= end {
+        return false;
+    }
+    if crate::shadow::in_place(start as u64, end as u64) {
+        return true;
+    }
+    if !cfg!(test) {
+        let mut byte = [0u8; 1];
+        if crate::host::read_into(start as *const u8, &mut byte)
+            || crate::host::read_into((end - 1) as *const u8, &mut byte)
+        {
+            return true;
+        }
+        if (end - 1) / 4096 == start / 4096 {
+            return false;
+        }
+    }
+    let mut p = start;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if n == 0 || next <= p {
+            break;
+        }
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            return true;
+        }
+        p = next;
+    }
+    false
 }
 
 /// The staging state of a title texture, made on first use.
@@ -1124,5 +1171,45 @@ mod read_tests {
         });
         // SAFETY: this reservation is no longer used.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn streamed_texture_with_only_middle_mips_committed_is_detected() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() != 0 {
+            return;
+        }
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: private reservation owned exclusively by this test.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 5 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert!(!any_committed(base, 5 * BLOCK));
+            assert!(!committed(base, 5 * BLOCK));
+
+            let middle = base.add(2 * BLOCK);
+            assert_eq!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            let hidden = base.add(3 * BLOCK);
+            assert_eq!(VirtualAlloc(hidden.cast(), BLOCK, MEM_COMMIT, PAGE_NOACCESS), hidden.cast());
+            middle.write_bytes(0xb6, BLOCK);
+
+            assert!(any_committed(base, 5 * BLOCK));
+            assert!(!committed(base, 5 * BLOCK));
+            assert!(!any_committed(hidden, BLOCK));
+            with_tiled_copy(base, 5 * BLOCK, |tiled| {
+                assert!(tiled[..2 * BLOCK].iter().all(|&b| b == 0));
+                assert!(tiled[2 * BLOCK..3 * BLOCK].iter().all(|&b| b == 0xb6));
+                assert!(tiled[3 * BLOCK..].iter().all(|&b| b == 0));
+            });
+
+            assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert!(!any_committed(base, 5 * BLOCK));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 }
