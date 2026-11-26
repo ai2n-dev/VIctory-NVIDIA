@@ -532,7 +532,7 @@ void main() {
         clamp: Clamp,
         worker: Clamp,
         /// Released after every object above: see [`crate::host::warp_serial`].
-        _serial: std::sync::MutexGuard<'static, ()>,
+        _serial: crate::host::WarpSerial,
     }
 
     impl WarpHarness {

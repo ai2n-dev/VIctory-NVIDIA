@@ -7,13 +7,13 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
@@ -145,7 +145,7 @@ pub(crate) struct Host {
     /// device works at a time ([`warp_serial`]). Declared last: it is
     /// released after every object of the host.
     #[cfg(test)]
-    warp_serial: Option<std::sync::MutexGuard<'static, ()>>,
+    warp_serial: Option<WarpSerial>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -578,14 +578,8 @@ impl Host {
         // SAFETY: caller holds `self.submitted`; `cmd` is closed; fence & event are ours.
         unsafe {
             self.queue.ExecuteCommandLists(&[Some(cmd)]);
-            let waited = self
-                .queue
-                .Signal(&self.fence, fence_val)
-                .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event));
-            match waited {
-                Ok(()) => {
-                    WaitForSingleObject(self.event, INFINITE);
-                }
+            match self.queue.Signal(&self.fence, fence_val) {
+                Ok(()) => wait_for_value(&self.fence, self.event, fence_val),
                 Err(e) => tracing::warn!(error = %e, "card GPU wait failed"),
             }
         }
@@ -614,9 +608,81 @@ impl Host {
 /// the tests ran one at a time or 0 of 400 with this lock). The GPU
 /// objects of each test are all released before the lock is.
 #[cfg(test)]
-pub(crate) fn warp_serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+pub(crate) fn warp_serial() -> WarpSerial {
+    let (busy, freed) = &WARP_BUSY;
+    let mut busy = busy.lock().unwrap_or_else(|e| e.into_inner());
+    while *busy {
+        busy = freed.wait(busy).unwrap_or_else(|e| e.into_inner());
+    }
+    *busy = true;
+    WarpSerial(())
+}
+
+/// The turn of [`warp_serial`]: a flag and a condition, not a `MutexGuard`,
+/// which must be released by the thread that took it. A host (and the
+/// objects of a test) may be dropped on another thread than the one that
+/// made it.
+#[cfg(test)]
+static WARP_BUSY: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+
+/// Holds the turn until dropped.
+#[cfg(test)]
+pub(crate) struct WarpSerial(());
+
+#[cfg(test)]
+impl Drop for WarpSerial {
+    fn drop(&mut self) {
+        let (busy, freed) = &WARP_BUSY;
+        *busy.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        freed.notify_one();
+    }
+}
+
+/// Waits until `fence` reaches `value`, on `event`, which nothing else
+/// waits on meanwhile.
+///
+/// A device that was removed signals every fence, so the wait ends then too.
+/// A device that is alive is waited for as long as it takes: what the
+/// caller releases next may still be in use by the GPU. A fence whose event
+/// cannot be armed is polled instead of being taken for reached (it was, and
+/// the resources of the submission were released under the running GPU). A
+/// wait of ten seconds and more is logged every ten seconds.
+fn wait_for_value(fence: &ID3D12Fence, event: HANDLE, value: u64) {
+    // SAFETY: plain fence and device queries; the event is the caller's.
+    unsafe {
+        if fence.GetCompletedValue() >= value {
+            return;
+        }
+        let removed = || {
+            let mut device: Option<ID3D12Device> = None;
+            fence.GetDevice(&mut device).is_ok()
+                && device.is_some_and(|device| device.GetDeviceRemovedReason().is_err())
+        };
+        let armed = fence.SetEventOnCompletion(value, event);
+        if let Err(e) = &armed {
+            tracing::warn!(error = %e, value, "fence event not armed: polling the fence");
+        }
+        let began = std::time::Instant::now();
+        let mut logged = 0;
+        while fence.GetCompletedValue() < value {
+            if removed() {
+                return;
+            }
+            if armed.is_err() || WaitForSingleObject(event, 1000) == WAIT_FAILED {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let tens = began.elapsed().as_secs() / 10;
+            if tens > logged {
+                logged = tens;
+                tracing::warn!(
+                    value,
+                    completed = fence.GetCompletedValue(),
+                    seconds = began.elapsed().as_secs(),
+                    "still waiting for the host GPU"
+                );
+            }
+        }
+    }
 }
 
 /// Hardware details and D3D12 capabilities queried directly from a created
@@ -944,6 +1010,23 @@ mod tests {
         assert_eq!(value(1), 5);
     }
 
+    /// A list of another host than the process's waits on that host's fence,
+    /// not on the process's.
+    #[test]
+    fn a_list_waits_on_the_fence_of_its_own_host() {
+        let Some(warp) = Host::new_warp() else { return };
+        let Ok(list) = warp.new_list() else { return };
+        // A value the process's host (a hardware device, if there is one)
+        // never reaches: waiting for it there would not return.
+        let value = 1 << 40;
+        // SAFETY: our queue and fence.
+        unsafe { warp.queue.Signal(&warp.fence, value).unwrap() };
+        list.last_fence.store(value, Ordering::Release);
+        list.close();
+        list.reset();
+        drop(list);
+    }
+
     /// With asynchronous submission on, a title submission may return before
     /// its results are put back; they are there once it is waited for.
     #[test]
@@ -1068,6 +1151,9 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Host fence value signalled by the last submission that ran this list.
     last_fence: std::sync::atomic::AtomicU64,
+    /// The fence of the host that made the list, which `last_fence` counts
+    /// on. The process's host is not the only one (tests make their own).
+    fence: ID3D12Fence,
     /// Dispatches and buffer copies recorded since the reset: what may have
     /// written indirect arguments (`crate::indirect` clamps hoisted before).
     writes: std::sync::atomic::AtomicU64,
@@ -1110,14 +1196,35 @@ const STAMPS: u32 = 16384;
 
 impl Drop for HostList {
     fn drop(&mut self) {
-        let fence = self.last_fence.load(Ordering::Acquire);
-        if fence != 0
-            && let Some(h) = host()
-        {
-            h.wait_fence(fence);
-        }
+        self.wait_for_last_submission();
         crate::memstat::sub(&crate::memstat::LISTS, 1);
         self.release_kept();
+    }
+}
+
+impl HostList {
+    /// Waits until the last submission that ran the list is done, on the
+    /// host that ran it: the process's host through its own wait (which also
+    /// finishes unwaited submissions), any other on its fence directly.
+    fn wait_for_last_submission(&self) {
+        use windows::core::Interface;
+        let value = self.last_fence.load(Ordering::Acquire);
+        if value == 0 {
+            return;
+        }
+        if let Some(Some(host)) = HOST.get()
+            && host.fence.as_raw() == self.fence.as_raw()
+        {
+            host.wait_fence(value);
+            return;
+        }
+        // SAFETY: a private event, closed here.
+        unsafe {
+            if let Ok(event) = CreateEventW(None, false, false, None) {
+                wait_for_value(&self.fence, event, value);
+                let _ = windows::Win32::Foundation::CloseHandle(event);
+            }
+        }
     }
 }
 
@@ -1502,6 +1609,7 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 last_fence: std::sync::atomic::AtomicU64::new(0),
+                fence: self.fence.clone(),
                 meter: std::sync::atomic::AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -1567,16 +1675,7 @@ impl Host {
             return;
         }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the fence and event are ours; guarded by `submitted`.
-        unsafe {
-            if self.fence.GetCompletedValue() < target {
-                if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
-                    tracing::warn!(error = %e, "host fence wait failed");
-                } else {
-                    WaitForSingleObject(self.event, INFINITE);
-                }
-            }
-        }
+        wait_for_value(&self.fence, self.event, target);
         self.reap_completed();
     }
 
@@ -1606,17 +1705,12 @@ impl Host {
         if target == 0 {
             return;
         }
-        // SAFETY: the fence and event are ours; caller holds `submitted`.
-        unsafe {
-            if self.fence.GetCompletedValue() < target {
-                let waited = std::time::Instant::now();
-                if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
-                    tracing::warn!(error = %e, "host async drain failed");
-                } else {
-                    WaitForSingleObject(self.event, INFINITE);
-                }
-                submission_us(1, waited.elapsed().as_micros() as u64);
-            }
+        // SAFETY: a plain fence query.
+        if unsafe { self.fence.GetCompletedValue() } < target {
+            let waited = std::time::Instant::now();
+            // The fence and event are ours; the caller holds `submitted`.
+            wait_for_value(&self.fence, self.event, target);
+            submission_us(1, waited.elapsed().as_micros() as u64);
         }
         self.reap_completed();
     }
@@ -1825,18 +1919,10 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host async submission not signalled"),
                 }
             }
-            // SAFETY: the fence and event are ours.
-            unsafe {
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, fence_val)
-                    .and_then(|()| self.fence.SetEventOnCompletion(fence_val, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+            // SAFETY: the fence is ours.
+            match unsafe { self.queue.Signal(&self.fence, fence_val) } {
+                Ok(()) => wait_for_value(&self.fence, self.event, fence_val),
+                Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
             }
             #[cfg(feature = "diagnostics")]
             if each {
@@ -2467,12 +2553,7 @@ impl HostList {
 
     /// Only after the list's last submission finished.
     pub(crate) fn reset(&self) {
-        let fence = self.last_fence.load(Ordering::Acquire);
-        if fence != 0
-            && let Some(h) = host()
-        {
-            h.wait_fence(fence);
-        }
+        self.wait_for_last_submission();
         self.release_kept();
         *self.deferred() = Deferred::default();
         self.work.store(0, Ordering::Relaxed);
