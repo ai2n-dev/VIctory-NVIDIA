@@ -835,10 +835,15 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        // Reject truncated subobjects before reading their fields.
+        if size > desc.size - at {
+            return E_INVALIDARG;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: the complete shader subobject lies in the stream;
+            // its bytecode field need not be aligned.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.

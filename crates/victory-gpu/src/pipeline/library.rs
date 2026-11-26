@@ -382,13 +382,78 @@ pub(crate) fn pipeline(
     // Compiled outside the lock: compiles take up to seconds.
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
-    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        l.added += 1;
+    if stores_later() {
+        store_or_defer(
+            library,
+            &DEFERRED,
+            Deferred(wide, pso.clone()),
+            |l, Deferred(wide, pso)| store_pipeline(l, &wide, &pso),
+        );
+    } else {
+        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        store_pipeline(&mut l, &wide, &pso);
     }
     Ok(pso)
+}
+
+fn store_pipeline(l: &mut Library, wide: &HSTRING, pso: &ID3D12PipelineState) {
+    // SAFETY: a live pipeline; all library calls remain serialized.
+    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), pso) }.is_ok() {
+        l.added += 1;
+    }
+}
+
+// Adapted from DoubleGhosty/cool_fox 4a028f31 (GPL-3.0), retaining this
+// branch's single library mutex. Only cache stores may be deferred.
+fn stores_later() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_STORE_LATER").is_some_and(|v| v == "1"))
+}
+
+struct Deferred(HSTRING, ID3D12PipelineState);
+// SAFETY: D3D12 objects are free-threaded; the queue owns its reference.
+unsafe impl Send for Deferred {}
+static DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
+const DEFERRED_LIMIT: usize = 256;
+
+fn store_or_defer<L, T>(
+    library: &Mutex<L>,
+    queue: &Mutex<Vec<T>>,
+    item: T,
+    store: impl FnOnce(&mut L, T),
+) {
+    let mut l = match library.try_lock() {
+        Ok(l) => l,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+            // A full queue skips only cache publication, never the live PSO.
+            if q.len() < DEFERRED_LIMIT {
+                q.push(item);
+            }
+            return;
+        }
+    };
+    store(&mut l, item);
+}
+
+fn drain_deferred<T>(queue: &Mutex<Vec<T>>, mut store: impl FnMut(T)) {
+    let items = std::mem::take(&mut *queue.lock().unwrap_or_else(|e| e.into_inner()));
+    for item in items {
+        store(item);
+    }
+}
+
+fn save_every() -> std::time::Duration {
+    static EVERY: OnceLock<std::time::Duration> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let seconds = std::env::var("VICTORY_LIBRARY_SAVE_S")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(20)
+            .max(5);
+        std::time::Duration::from_secs(seconds)
+    })
 }
 
 /// Periodic saves must not park other pipeline workers behind disk I/O.
@@ -409,17 +474,21 @@ pub(crate) fn save(now: bool) {
     // Held over serialization and writes, so overlapping saves cannot
     // replace files under each other.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let Some(dir) = DIR.get() else { return };
     let Some(mut last) = save_guard(&LAST, now) else { return };
-    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+    if !now && last.is_some_and(|t| t.elapsed() < save_every()) {
         return;
     }
     *last = Some(std::time::Instant::now());
 
     if let Some(library) = library() {
         let snapshot = {
-            let l = library.lock().unwrap_or_else(|e| e.into_inner());
+            let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+            if stores_later() {
+                drain_deferred(&DEFERRED, |Deferred(wide, pso)| {
+                    store_pipeline(&mut l, &wide, &pso);
+                });
+            }
             serialize_if_dirty(l.added, || {
                 // SAFETY: a buffer of the size the library asks for.
                 let bytes = unsafe {
@@ -568,6 +637,22 @@ mod tests {
         assert_eq!(serialize_if_dirty::<Vec<u8>>(0, || panic!("clean library")), None);
         assert_eq!(serialize_if_dirty(3, || Some(vec![1u8, 2])), Some((vec![1, 2], 3)));
         assert_eq!(serialize_if_dirty::<Vec<u8>>(3, || None), None);
+    }
+
+    #[test]
+    fn deferred_cache_stores_are_bounded_and_drained() {
+        let library = Mutex::new(Vec::new());
+        let queue = Mutex::new(Vec::new());
+        store_or_defer(&library, &queue, 0usize, |l, item| l.push(item));
+        let mut held = library.lock().unwrap();
+        for n in 1..=DEFERRED_LIMIT + 1 {
+            store_or_defer(&library, &queue, n, |l, item| l.push(item));
+        }
+        assert_eq!(held.as_slice(), &[0]);
+        assert_eq!(queue.lock().unwrap().len(), DEFERRED_LIMIT);
+        drain_deferred(&queue, |item| held.push(item));
+        assert_eq!(*held, (0..=DEFERRED_LIMIT).collect::<Vec<_>>());
+        assert!(queue.lock().unwrap().is_empty());
     }
 
     #[test]
