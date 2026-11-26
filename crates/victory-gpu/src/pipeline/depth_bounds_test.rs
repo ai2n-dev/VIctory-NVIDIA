@@ -70,6 +70,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             stride_table: false,
         },
         used: Vec::new(),
+        tables: crate::draw::TablePlan::new(&[]),
     }));
     shader
 }
