@@ -75,9 +75,21 @@ impl Pending {
     }
 
     fn make(&self) {
+        self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
         // Not `get_or_init`: a worker lost in it would leave it locked.
-        let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-        let _ = self.made.set(made);
+        // Rust unwinding must complete the entry and let the worker retire it.
+        // Native driver faults are still handled by the separate lost-worker path.
+        if self.made.get().is_none() {
+            let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build))
+                .unwrap_or_else(|_| {
+                    tracing::warn!(key = %self.key, "host pipeline build panicked");
+                    None
+                });
+            let _ = self.made.set(made);
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -372,6 +384,17 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pipeline_build_panic_completes_the_entry() {
+        let bad = Pending::new(Vec::new(), None);
+        let next = Pending::new(Vec::new(), None);
+        bad.make_with(|| panic!("synthetic pipeline build panic"));
+        assert!(matches!(bad.made.get(), Some(None)));
+        next.make_with(|| None);
+        assert!(matches!(next.made.get(), Some(None)));
+        bad.make_with(|| panic!("completed pipeline must not be rebuilt"));
+    }
 
     #[test]
     fn bounded_wait_reserves_both_budgets_and_refunds_only_unused_time() {

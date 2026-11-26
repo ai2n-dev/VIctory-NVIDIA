@@ -58,11 +58,7 @@ impl Cache {
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
-        let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let (tmp, mut file) = create_staging(|| tempfile_in(dir))?;
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
@@ -72,6 +68,20 @@ impl Cache {
         published?;
         Ok(path)
     }
+}
+
+/// Skip a stale staging name after PID reuse, without truncating another
+/// writer's file. Bound retries so a corrupt cache cannot spin indefinitely.
+fn create_staging(mut next: impl FnMut() -> PathBuf) -> std::io::Result<(PathBuf, std::fs::File)> {
+    for _ in 0..64 {
+        let path = next();
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "staging name retry limit"))
 }
 
 fn tempfile_in(dir: &Path) -> PathBuf {
@@ -117,6 +127,22 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn stale_staging_file_is_skipped_without_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old");
+        let fresh = dir.path().join("fresh");
+        std::fs::write(&old, b"partial").unwrap();
+        let mut names = [old.clone(), fresh.clone()].into_iter();
+        let (path, mut file) = create_staging(|| names.next().unwrap()).unwrap();
+        assert_eq!(path, fresh);
+        file.write_all(b"new").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&old).unwrap(), b"partial");
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"new");
+        assert_eq!(create_staging(|| old.clone()).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
     }
 
     #[test]
