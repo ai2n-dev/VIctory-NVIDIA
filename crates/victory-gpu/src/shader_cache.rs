@@ -23,16 +23,35 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
-    match Cache::open(dir) {
-        Ok(cache) => {
-            let _ = CACHE.set(cache);
-        }
-        Err(e) => tracing::warn!(error = %e, "no shader cache"),
+    if let Err(e) = open_shader_cache(dir) {
+        tracing::warn!(error = %e, "no shader cache");
     }
 }
 
+/// Open the shader cache, independently of the pipeline/image caches.
+/// A shared directory is safe only through the normal content/ABI keys.
+pub fn open_shader_cache(dir: PathBuf) -> anyhow::Result<()> {
+    let dir = std::env::var_os("VICTORY_SHADER_CACHE_DIR")
+        .filter(|p| !p.is_empty())
+        .map_or(dir, PathBuf::from);
+    let cache = Cache::open(&dir)?;
+    CACHE.set(cache).map_err(|_| anyhow::anyhow!("shader cache already opened"))?;
+    tracing::info!(path = %dir.display(), "shader cache opened");
+    Ok(())
+}
+
+/// Populate exactly the same cache entry used by runtime translation.
+/// This function performs CPU translation only; callers must set the host
+/// wave sizes and descriptor clamp to the intended runtime values first.
+pub fn precompile(container: &[u8], target: Target) -> Result<(), String> {
+    if CACHE.get().is_none() {
+        return Err("shader cache has not been opened".into());
+    }
+    host_shader(container, target).map(|_| ())
+}
+
 /// Shaders found in the cache and translated since the start.
-pub(crate) fn counts() -> (u64, u64) {
+pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 

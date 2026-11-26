@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod cache_shaders;
 mod census;
 mod inspect;
 mod run;
@@ -97,6 +98,21 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Populate the runtime shader cache from explicit, authorized shader files.
+    /// CPU-only: no D3D12 device, pipeline creation or title execution.
+    CacheShaders {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Match the runtime host wave sizes, e.g. 32-32 or 32-64.
+        #[arg(long, value_parser = parse_lanes)]
+        host_lanes: (u32, u32),
+        /// Match the actual runtime descriptor clamp, not the heap size.
+        #[arg(long)]
+        heap_clamp: u32,
+        /// CPU workers, 1 through 8.
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -167,6 +183,8 @@ fn main() -> Result<()> {
             jobs,
             host_lanes,
         } => translate::run(paths, validate, pipelines, &only, list, jobs, host_lanes),
+        Command::CacheShaders { paths, host_lanes, heap_clamp, jobs } =>
+            cache_shaders::run(paths, host_lanes, heap_clamp, jobs),
         Command::Run {
             exe,
             unimplemented,
