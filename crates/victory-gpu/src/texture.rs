@@ -73,6 +73,13 @@ struct Last {
     next: u64,
 }
 
+/// A reported runtime write must invalidate a watched staging buffer even
+/// if the current journal snapshot has no newer page. The report is consumed
+/// under the staging lock, so a concurrent later write stays pending.
+fn watched_refresh_due(asked: u64, rewritten: bool, pages: &[(usize, u64)]) -> bool {
+    rewritten || asked == 0 || pages.iter().any(|&(_, stamp)| stamp > asked)
+}
+
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -330,9 +337,12 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
+        let mode = crate::resource::textures();
+        let explicit = self.rewritten.swap(false, Ordering::AcqRel);
+        let rewritten = explicit || mode == crate::resource::Textures::Always;
         if !self.not_watched.load(Ordering::Relaxed) {
             if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-                if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                if !watched_refresh_due(last.asked, rewritten, &written) {
                     return (0, false);
                 }
                 last.asked = now;
@@ -349,9 +359,6 @@ impl Staging {
         // static textures skip both page probing and BLAKE3 hashing in O(1),
         // while `title_memory_written` still flips `rewritten` immediately.
         let frame = crate::queue::presented() + 1;
-        let mode = crate::resource::textures();
-        let rewritten = self.rewritten.swap(false, Ordering::AcqRel)
-            || mode == crate::resource::Textures::Always;
         if rewritten {
             last.still = 0;
         }
@@ -362,6 +369,11 @@ impl Staging {
             return (0, false);
         }
         if !any_committed(self.memory, size) {
+            // A write notification that arrived before the pages became
+            // accessible must not be lost to the static-texture backoff.
+            if explicit {
+                self.rewritten.store(true, Ordering::Release);
+            }
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -799,6 +811,15 @@ mod tests {
     use super::*;
     use crate::host::Host;
     use crate::resource::HostTexture;
+
+    #[test]
+    fn runtime_write_invalidates_even_without_new_watch_pages() {
+        assert!(watched_refresh_due(0, false, &[]));
+        assert!(!watched_refresh_due(8, false, &[(1, 8), (2, 7)]));
+        assert!(watched_refresh_due(8, false, &[(1, 9)]));
+        assert!(watched_refresh_due(8, true, &[]));
+        assert!(watched_refresh_due(8, true, &[(1, 7)]));
+    }
 
     #[test]
     fn texture_staging_pressure_respects_configured_budget() {

@@ -4372,7 +4372,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             0,
         ];
 
-        assert!(crate::resource::texture_at(addr_a, &desc, 0).is_some());
+        let held = crate::resource::texture_at(addr_a, &desc, 0).expect("placed texture A");
         assert!(crate::resource::texture_at(addr_b, &desc, 0).is_some());
         assert!(crate::resource::has_placed_texture(addr_a, &desc));
         assert!(crate::resource::has_placed_texture(addr_b, &desc));
@@ -4390,6 +4390,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             "non-overlapping placed texture must remain cached"
         );
         assert!(crate::resource::placed_epoch() > epoch_before);
+        // Eviction releases the registry's reference, not the caller's.
+        assert!(crate::resource::host_resource(held.get()).is_some());
+        drop(held);
 
         // Clean up `addr_b` too.
         crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
