@@ -59,10 +59,18 @@ struct Fixed {
     blend: Option<Option<[f32; 4]>>,
     stencil: Option<u32>,
     views: Option<(Vec<crate::descriptor::RtvRecord>, Option<crate::descriptor::RtvRecord>)>,
+    /// CPU descriptor handles used only while recording OMSetRenderTargets.
+    rtv_scratch: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
 }
 
 // SAFETY: the views only name title resources.
 unsafe impl Send for Fixed {}
+
+/// Replace a CPU-side state snapshot without discarding its allocation.
+fn replace_snapshot<T: Copy>(snapshot: &mut Vec<T>, values: &[T]) {
+    snapshot.clear();
+    snapshot.extend_from_slice(values);
+}
 
 /// Where the clamps of a run of indirect draws go: the list `clamps`, open,
 /// that runs before the host list at `into`, as long as that one has
@@ -519,12 +527,12 @@ impl State {
     }
 
     pub(crate) fn set_viewports(&mut self, list: &HostList, items: &[D3D12_VIEWPORT]) {
-        self.fixed.viewports = items.to_vec();
+        replace_snapshot(&mut self.fixed.viewports, items);
         viewports(list, items);
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
-        self.fixed.scissors = rects.to_vec();
+        replace_snapshot(&mut self.fixed.scissors, rects);
         scissors(list, rects);
     }
 
@@ -540,7 +548,14 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        let mut targets = Vec::new();
+        // A host, once created, remains available. Reuse the previous
+        // descriptor snapshot rather than allocating it at every bind.
+        if crate::host::host().is_none() {
+            return;
+        }
+        let mut targets = self.fixed.views.take().map_or_else(Vec::new, |(views, _)| views);
+        targets.clear();
+        targets.reserve(handles.len());
         for &h in handles {
             match crate::descriptor::rtv_record(h) {
                 Some(record) => targets.push(record),
@@ -563,7 +578,9 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let rtvs = &mut self.fixed.rtv_scratch;
+        rtvs.clear();
+        rtvs.reserve(targets.len());
         for record in &targets {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
@@ -1700,13 +1717,15 @@ impl State {
             return None;
         }
         let mut views = Vec::new();
+        let mut elements = Vec::new();
         for slot in 0..32u32 {
-            let elements: Vec<(u32, u32)> = p
-                .inputs
-                .iter()
-                .filter(|e| e.slot == slot && !e.per_instance)
-                .map(|e| (e.offset, e.format))
-                .collect();
+            elements.clear();
+            elements.extend(
+                p.inputs
+                    .iter()
+                    .filter(|e| e.slot == slot && !e.per_instance)
+                    .map(|e| (e.offset, e.format)),
+            );
             if elements.is_empty() {
                 continue;
             }
@@ -2254,6 +2273,19 @@ fn stencil_ref(list: &HostList, reference: u32) {
 
 #[cfg(test)]
 mod group_limit_tests {
+    #[test]
+    fn state_snapshots_reuse_storage_without_retaining_old_elements() {
+        let mut snapshot = Vec::with_capacity(8);
+        let address = snapshot.as_ptr();
+        super::replace_snapshot(&mut snapshot, &[1u32, 2, 3]);
+        assert_eq!(snapshot, [1, 2, 3]);
+        super::replace_snapshot(&mut snapshot, &[9]);
+        assert_eq!(snapshot, [9]);
+        super::replace_snapshot(&mut snapshot, &[]);
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.as_ptr(), address);
+    }
+
     #[test]
     fn dispatches_past_the_host_limit_do_not_fit() {
         assert!(super::dispatch_fits(65_535, 65_535, 65_535));
