@@ -456,6 +456,13 @@ pub(crate) struct CardEngine {
 // D3D12 interfaces are free-threaded.
 unsafe impl Send for CardEngine {}
 
+impl Drop for CardEngine {
+    fn drop(&mut self) {
+        crate::cardmeter::release(&self.before_list);
+        crate::cardmeter::release(&self.after_list);
+    }
+}
+
 impl CardEngine {
     pub(crate) fn new(host: &Host) -> windows::core::Result<Self> {
         let direct = std::env::var_os("VICTORY_CARD_DIRECT_FLAGS").is_some_and(|v| v == "1");
