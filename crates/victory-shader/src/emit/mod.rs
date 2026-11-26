@@ -84,6 +84,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod fuzz_tests;
+#[cfg(all(test, windows))]
+mod helper_lane_tests;
 #[cfg(test)]
 mod memory_tests;
 #[cfg(all(test, windows))]
@@ -2423,7 +2425,7 @@ mod barycentric_tests {
         3 << 25 | dst << 17 | b << 9 | (256 + a)
     }
 
-    fn element(name: &str, kind: u8, row: u32) -> SigElement {
+    pub(super) fn element(name: &str, kind: u8, row: u32) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
@@ -2441,9 +2443,17 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
+    }
+
+    pub(super) fn pixel_with_inputs(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        pixel_sig(words, input_addr, &[element("TEXCOORD", 0, 0)], &[target])
+        pixel_sig(words, input_addr, inputs, &[target])
     }
 
     /// The same with the console signatures `inputs` and `outputs`.
@@ -2546,6 +2556,37 @@ mod barycentric_tests {
         indices.sort();
         assert_eq!(indices, [0, 1], "{inputs:?}");
         validate(&shader);
+    }
+
+    #[test]
+    fn pixel_quad_swizzles_validate_and_dpp8_cannot_cross_quads() {
+        let [e0, e1] = exp_mrt0(3);
+        let swizzle = |instruction: [u32; 2]| {
+            let words = [
+                0xc808_0000,
+                0xc809_0001, // interpolate attr0.x into v2
+                instruction[0],
+                instruction[1],
+                e0,
+                e1,
+                0xbf81_0000,
+            ];
+            pixel(&words, PERSP_CENTER)
+        };
+        for permutation in [0x00, 0x55, 0xaa, 0xff, 0xb1, 0x4e, 0x1b, 0xe4, 0x27] {
+            // ds_swizzle_b32 v3,v2 and v_mov_b32 v3,v2 quad_perm.
+            validate(&swizzle([0xd8d4_8000 | permutation, 0x0300_0002]).unwrap());
+            validate(&swizzle([0x7e06_02fa, 0xff00_0002 | permutation << 8]).unwrap());
+        }
+        // DPP8: different permutations in the two quads of an octet.
+        let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
+        let sel = selections
+            .into_iter()
+            .enumerate()
+            .fold(0, |s, (i, n)| s | n << (3 * i));
+        let mov_dpp8 = |sel: u32| [0x7e06_02e9, (sel << 8) | 2];
+        validate(&swizzle(mov_dpp8(sel)).unwrap());
+        assert!(swizzle(mov_dpp8(sel ^ 4)).is_err(), "lane 0 now reads lane 7");
     }
 
     /// I and J only fed to `v_interp_*` stay host interpolation: no
