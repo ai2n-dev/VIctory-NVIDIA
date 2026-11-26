@@ -24,6 +24,13 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+/// Whether accesses through code-built buffer descriptors enforce the
+/// console descriptor's bounds (`VICTORY_BUILT_BOUNDS`, on unless `0`).
+fn built_bounds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUILT_BOUNDS").is_none_or(|v| v != "0"))
+}
+
 /// What a heap handle made in a block is looked up by: the block, the load
 /// that produced the descriptor, its first word, whether it is a sampler and
 /// the properties of the view.
@@ -8126,6 +8133,47 @@ impl<'a> Lower<'a> {
             &[h, coords[0], coords[1], coords[2], old, new])
     }
 
+    /// Bounds predicate for a descriptor built in shader code (`Source::Built`),
+    /// checked against descriptor-relative `index`/`off` before any root-buffer
+    /// base offset is added. Host root descriptors lack hardware bounds, so OOB
+    /// accesses would otherwise corrupt adjacent memory or fault.
+    fn built_buffer_ok(
+        &mut self,
+        src: &Source,
+        index: Option<V>,
+        off: V,
+        access_bytes: u32,
+    ) -> Option<V> {
+        let Source::Built {
+            bits,
+            words: [num, w3],
+            ..
+        } = *src
+        else {
+            return None;
+        };
+        if !built_bounds() {
+            return None;
+        }
+        let c = self.cur;
+        let stride = (bits >> 16) & 0x3FFF;
+        let oob = (w3 >> 28) & 3;
+        if oob == 2 {
+            return (num == 0).then(|| self.s.m.bool(false));
+        }
+        if stride == 0 || oob == 3 {
+            return Some(if num < access_bytes {
+                self.s.m.bool(false)
+            } else {
+                let last = self.s.m.i32(num - access_bytes);
+                self.s.m.cmp(c, pred::IULE, off, last)
+            });
+        }
+        let i = index.unwrap_or_else(|| self.s.m.i32(0));
+        let n = self.s.m.i32(num);
+        Some(self.s.m.cmp(c, pred::IULT, i, n))
+    }
+
     /// A CAS must run on a real lane and at an in-range address: outside
     /// those cases DXIL can return an unspecified old value.
     fn buffer_bounds(&mut self, h: V, index: Option<V>, off: V, stride: u32, size: u32) -> V {
@@ -8148,15 +8196,21 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::And, fits, no_wrap)
     }
 
-    fn buffer_store_guard(&mut self, bounds: V, guard: Option<V>) -> V {
+    fn buffer_store_guard(&mut self, bounds: Option<V>, guard: Option<V>) -> Option<V> {
         let c = self.cur;
-        let g = guard.map_or(bounds, |g| self.s.m.bin(c, Bin::And, g, bounds));
+        let g = match (guard, bounds) {
+            (Some(g), Some(b)) => Some(self.s.m.bin(c, Bin::And, g, b)),
+            (Some(g), None) => Some(g),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
         if !self.s.pixel {
             return g;
         }
+        let g = g?;
         let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
         let no = self.s.m.bool(false);
-        self.s.m.select(c, helper, no, g)
+        Some(self.s.m.select(c, helper, no, g))
     }
 
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -8265,6 +8319,16 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
         let stride = used.map_or(0, |u| u.stride);
+        let access_bytes = sub_load
+            .map(|(w, _, _)| w / 8)
+            .or_else(|| sub_store.map(|w| w / 8))
+            .unwrap_or_else(|| if wide { 8 } else { 4 * count });
+        let built_ok = self.built_buffer_ok(src, index, off, access_bytes);
+        let guard = match (guard, built_ok) {
+            (Some(g), Some(ok)) => Some(self.s.m.bin(c, Bin::And, g, ok)),
+            (None, ok) => ok,
+            (g, None) => g,
+        };
         if self.by_address(src)
             && let Fields::Buffer { rsrc, .. } = &inst.fields
         {
@@ -8363,8 +8427,11 @@ impl<'a> Lower<'a> {
             let coords = |byte| index.map_or([byte, iu], |i| [i, byte]);
             if let Some((width, signed, half)) = sub_load {
                 // Root SRVs have no size in DXIL.
-                let bounds = (!matches!(src, Source::Built { .. } | Source::Address))
-                    .then(|| self.buffer_bounds(h, index, off, stride, width / 8));
+                let bounds = if matches!(src, Source::Built { .. } | Source::Address) {
+                    built_ok
+                } else {
+                    Some(self.buffer_bounds(h, index, off, stride, width / 8))
+                };
                 let at = self.begin_guarded(bounds);
                 let x = self.read_subword(off, width, signed, |l, at| Ok(l.raw_dword(h, coords(at))))?;
                 let zero = self.s.m.i32(0);
@@ -8376,9 +8443,10 @@ impl<'a> Lower<'a> {
                     let sixteen = self.s.m.i32(16);
                     x = self.s.m.bin(c, Bin::LShr, x, sixteen);
                 }
-                let bounds = self.buffer_bounds(h, index, off, stride, width / 8);
+                let bounds = (!matches!(src, Source::Built { .. } | Source::Address))
+                    .then(|| self.buffer_bounds(h, index, off, stride, width / 8));
                 let active = self.buffer_store_guard(bounds, guard);
-                let at = self.begin_guarded(Some(active));
+                let at = self.begin_guarded(active);
                 self.write_subword(off, width, x, |l, byte, mask, bits| {
                     let [a, b] = coords(byte);
                     let zero = l.s.m.i32(0);
@@ -8429,8 +8497,9 @@ impl<'a> Lower<'a> {
                 self.s.flags |= flags::INT64 | flags::ATOMIC_HEAP64;
             }
             let active = if wide || matches!(op, "sub" | "inc" | "dec" | "csub") {
-                let bounds = self.buffer_bounds(h, index, off, stride, 4 * u32::from(words));
-                Some(self.buffer_store_guard(bounds, guard))
+                let bounds = (!matches!(src, Source::Built { .. } | Source::Address))
+                    .then(|| self.buffer_bounds(h, index, off, stride, 4 * u32::from(words)));
+                self.buffer_store_guard(bounds, guard)
             } else {
                 guard
             };
@@ -8542,16 +8611,25 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            let at = self.begin_guarded(built_ok);
             let mut xs = self.format_load(h, off, f, count)?;
             if d16 {
                 xs = self.d16_channels(f, xs)?;
+            }
+            if at.is_some() {
+                let zero = self.s.m.i32(0);
+                let pairs: Vec<(V, V)> = xs.into_iter().map(|x| (x, zero)).collect();
+                xs = self.end_guarded(at, &pairs);
             }
             for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
         }
-        let r = if typed {
+        let Some(Operand::Vector { reg, .. }) = *data else {
+            return Err("a buffer result");
+        };
+        let r_handle = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
             }
@@ -8560,59 +8638,50 @@ impl<'a> Lower<'a> {
             }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
+            (true, h, index, iu)
         } else {
-            let mask = self.s.m.i8((1u8 << count) - 1);
-            let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride >= 4 && stride.is_multiple_of(4) {
                         let h = self.handle(site, src, false, (12 | u, stride))?;
-                        self.s.op(
-                            c,
-                            "rawBufferLoad.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            139,
-                            &[h, index, off, mask, align],
-                        )
+                        (false, h, index, off)
                     } else {
                         let byte = self.runtime_stride_offset(src, index, off)?;
                         let h = self.handle(site, src, false, (11 | u, 0))?;
-                        self.s.op(
-                            c,
-                            "rawBufferLoad.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            139,
-                            &[h, byte, iu, mask, align],
-                        )
+                        (false, h, byte, iu)
                     }
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
+                    (false, h, off, iu)
                 }
             }
         };
-        let Some(Operand::Vector { reg, .. }) = *data else {
-            return Err("a buffer result");
+        let at = self.begin_guarded(built_ok);
+        let lc = self.cur;
+        let r = if r_handle.0 {
+            self.s.op(
+                lc,
+                "bufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                68,
+                &[r_handle.1, r_handle.2, r_handle.3],
+            )
+        } else {
+            let mask = self.s.m.i8((1u8 << count) - 1);
+            let align = self.s.m.i32(4);
+            self.s.op(
+                lc,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[r_handle.1, r_handle.2, r_handle.3, mask, align],
+            )
         };
+        let mut loaded = Vec::new();
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0).
             let k16 = self.s.m.i32(16);
@@ -8620,25 +8689,34 @@ impl<'a> Lower<'a> {
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
+                    let f = self.s.m.extract(lc, r, ch);
                     let h = self
                         .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                        .op(lc, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
                     x = Some(match x {
                         Some(hi) => {
-                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                            self.s.m.bin(c, Bin::Or, h, hi)
+                            let hi = self.s.m.bin(lc, Bin::Shl, hi, k16);
+                            self.s.m.bin(lc, Bin::Or, h, hi)
                         }
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                loaded.push(x.expect("a channel"));
             }
-            return Ok(());
+        } else {
+            for k in 0..count {
+                let x = self.s.m.extract(lc, r, k);
+                loaded.push(self.as_int(x));
+            }
         }
-        for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+        let loaded = if at.is_some() {
+            let zero = self.s.m.i32(0);
+            let pairs: Vec<(V, V)> = loaded.into_iter().map(|v| (v, zero)).collect();
+            self.end_guarded(at, &pairs)
+        } else {
+            loaded
+        };
+        for (k, x) in loaded.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -10585,6 +10663,57 @@ mod tests {
             why(indexed_root_load(0x0010_0000, 0x1181_4FAC)),
             "a buffer indexed by lane"
         );
+    }
+
+    #[test]
+    fn built_buffer_bounds_lower_and_validate_with_dxil_validator() {
+        let validate = |s6_word: u32, hi: u32, w3: u32| {
+            let words = [
+                0x8805_FF01,
+                hi,          // s_or_b32 s5, s1, hi
+                0xBE84_0300, // s_mov_b32 s4, s0
+                s6_word,     // s_mov_b32 s6, num_records
+                0xBE87_03FF,
+                w3,          // s_mov_b32 s7, w3
+                0xE030_2000,
+                0x8001_0100, // buffer_load_dword v1, v0, s[4:7], 0 idxen
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ];
+            let root = RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 3,
+            };
+            let used = UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 3,
+            };
+            let lowered = lower_with(&words, vec![root], vec![used]).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut validator) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                let mut dxil = lowered.dxil;
+                validator.validate(&mut dxil).unwrap();
+            }
+        };
+        // Structured bounds (stride=16, num_records=4, oob=1)
+        validate(0xBE86_0384, 16 << 16, 0x1101_4FAC);
+        // Raw bounds (stride=0, num_records=16, oob=3)
+        validate(0xBE86_0390, 0, 0x3101_4FAC);
+        // Zero records under oob=2 (all accesses must fail bounds and zero-fill)
+        validate(0xBE86_0380, 0, 0x2101_4FAC);
     }
 
     #[test]
