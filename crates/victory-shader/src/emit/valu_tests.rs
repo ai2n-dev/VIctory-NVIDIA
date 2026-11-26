@@ -1461,6 +1461,11 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
         (xy, 29, 0x4000_3C00, 0x4000_3C00),
         // 16_16_UINT: the 16-bit integers as they were stored.
         (xy, 27, 0xBEEF_1234, 0xBEEF_1234),
+        // 16_16_SINT: preserve the negative integer bit patterns.
+        (xy, 28, 0x8000_FFFF, 0x8000_FFFF),
+        // 16_UINT and 16_SINT: the unused high half stays zero.
+        (x, 11, 0xDEAD_FFFF, 0x0000_FFFF),
+        (x, 12, 0xDEAD_8000, 0x0000_8000),
         // 16_16_UNORM: 0.0 and 1.0, as f16.
         (xy, 23, 0xFFFF_0000, 0x3C00_0000),
         // 16_FLOAT, one channel: the high half is 0.
