@@ -391,6 +391,18 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// Periodic saves must not park other pipeline workers behind disk I/O.
+fn save_guard<T>(lock: &Mutex<T>, now: bool) -> Option<std::sync::MutexGuard<'_, T>> {
+    if now {
+        return Some(lock.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
@@ -399,7 +411,7 @@ pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut last) = save_guard(&LAST, now) else { return };
     if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
         return;
     }
@@ -527,6 +539,20 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_periodic_save_does_not_wait_for_another_save() {
+        let lock = Mutex::new(0);
+        let held = lock.lock().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| assert!(save_guard(&lock, false).is_none()))
+                .join()
+                .unwrap();
+        });
+        drop(held);
+        assert!(save_guard(&lock, false).is_some());
+        assert!(save_guard(&lock, true).is_some());
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
