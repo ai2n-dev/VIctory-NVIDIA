@@ -234,6 +234,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) tables: crate::draw::TablePlan,
     /// Whether the shader indexes `ResourceDescriptorHeap[]` directly.
     pub(crate) resource_heap: bool,
     /// Whether the shader may write memory (buffer, image, or global stores
@@ -339,9 +340,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             (p.used, rh)
         })
         .unwrap_or_default();
+    let tables = crate::draw::TablePlan::new(&used);
     Ok(Translated {
         host,
         used,
+        tables,
         resource_heap: dxil_heap || native_heap,
         writes_memory,
     })
@@ -443,6 +446,7 @@ pub(crate) fn translate_linked(
                 Translated {
                     host: ms_host,
                     used: ms_orig.used.clone(),
+                    tables: ms_orig.tables.clone(),
                     resource_heap: ms_orig.resource_heap,
                     writes_memory: ms_orig.writes_memory,
                 },
@@ -455,6 +459,7 @@ pub(crate) fn translate_linked(
                         Translated {
                             host,
                             used: ps_orig.used.clone(),
+                            tables: ps_orig.tables.clone(),
                             resource_heap: ps_orig.resource_heap,
                             writes_memory: ps_orig.writes_memory,
                         },

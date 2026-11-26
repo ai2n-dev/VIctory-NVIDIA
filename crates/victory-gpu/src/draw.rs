@@ -331,19 +331,6 @@ impl Slots {
         (self.0[usize::from(slot / 64)] >> (slot % 64)) & 1 != 0
     }
 
-    fn iter(&self) -> impl Iterator<Item = u8> {
-        let words = self.0;
-        (0..4u8).flat_map(move |w| {
-            let mut bits = words[usize::from(w)];
-            std::iter::from_fn(move || {
-                (bits != 0).then(|| {
-                    let bit = bits.trailing_zeros() as u8;
-                    bits &= bits - 1;
-                    w * 64 + bit
-                })
-            })
-        })
-    }
 }
 
 /// A table made afresh: what it was made from (the `n` records at `at` in
@@ -392,6 +379,55 @@ fn index_table_entries(offsets: impl Iterator<Item = u32>, indices: &mut Vec<(u3
     indices.extend(offsets.enumerate().map(|(i, offset)| (offset, i)));
     indices.sort_unstable();
     indices.dedup_by_key(|entry| entry.0);
+}
+
+/// Immutable metadata for the descriptor tables of a translated shader.
+/// Indices refer to Translated::used, not to mutable guest descriptors.
+/// Inspired by codec_d/cool_fox e05d4633 (GPL-3.0-or-later).
+#[derive(Clone)]
+pub(crate) struct TablePlan {
+    direct: Vec<usize>,
+    groups: Vec<TableGroup>,
+}
+
+#[derive(Clone)]
+struct TableGroup {
+    slot: u8,
+    entries: Vec<usize>,
+    named: Vec<(u32, usize)>,
+    count: u32,
+    snapshot: bool,
+    has_cbv: bool,
+}
+
+impl TablePlan {
+    pub(crate) fn new(used: &[UsedResource]) -> Self {
+        let mut direct = Vec::new();
+        let mut groups = std::collections::BTreeMap::<u8, TableGroup>::new();
+        for (i, u) in used.iter().enumerate().filter(|(_, u)| u.root == RootType::Table) {
+            direct.push(i);
+            let group = groups.entry(u.slot).or_insert_with(|| TableGroup {
+                slot: u.slot,
+                entries: Vec::new(),
+                named: Vec::new(),
+                count: 1,
+                snapshot: false,
+                has_cbv: false,
+            });
+            group.entries.push(i);
+            group.count = group.count.max(u.table_offset_dwords / 8 + 1);
+            group.snapshot |= matches!(u.kind, ResourceType::Cbv | ResourceType::Srv);
+            group.has_cbv |= u.kind == ResourceType::Cbv;
+        }
+        let groups = groups.into_values().map(|mut group| {
+            index_table_entries(
+                group.entries.iter().map(|&i| used[i].table_offset_dwords / 8),
+                &mut group.named,
+            );
+            group
+        }).collect();
+        Self { direct, groups }
+    }
 }
 
 /// The words of entry `k` of `table`.
@@ -1079,7 +1115,7 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            if !self.tables(list, &t.used, compute) {
+            if !self.tables(list, &t.used, &t.tables, compute) {
                 return no("a table not made");
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -1472,25 +1508,23 @@ impl State {
     /// within a list. Returns the fresh tables' new byte offsets by root
     /// parameter in `self.made`, or `false` when the draw must be dropped (a
     /// constant table found no dynamic slots).
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> bool {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
+    fn tables(&mut self, list: &HostList, used: &[UsedResource], plan: &TablePlan, compute: bool) -> bool {
         // Taken out so `self` stays free to borrow; a draw dropped below
         // leaves it empty, and it grows again.
         let mut made = std::mem::take(&mut self.made);
         made.clear();
         let mut fresh = Slots::default();
-        for u in used
-            .iter()
-            .filter(tables)
-            .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
-        {
-            fresh.insert(u.slot);
+        for group in &plan.groups {
+            if group.snapshot {
+                fresh.insert(group.slot);
+            }
         }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
         // are made afresh too: the title's slots there have no host slot of
         // their own.
-        for u in used.iter().filter(tables) {
+        for &i in &plan.direct {
+            let u = &used[i];
             if fresh.contains(u.slot) {
                 continue;
             }
@@ -1508,37 +1542,34 @@ impl State {
                 fresh.insert(u.slot);
             }
         }
-        for u in used.iter().filter(tables) {
+        for &i in &plan.direct {
+            let u = &used[i];
             if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        // Reuse scratch across the root tables of this draw.
-        let mut entries: Vec<&UsedResource> = Vec::new();
-        let mut indices = Vec::new();
-        for slot in fresh.iter() {
+        for group in &plan.groups {
+            let slot = group.slot;
+            if !fresh.contains(slot) {
+                continue;
+            }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            entries.clear();
-            entries.extend(used.iter().filter(tables).filter(|u| u.slot == slot));
+            let entries = || group.entries.iter().map(|&i| &used[i]);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
+            let n = group.count;
             let last = table + u64::from(n - 1) * 32;
             // Shaders read such a table to many lengths, and a copy for each
             // ran out of slots: the longest seen serves all.
             let n = if n >= LARGE { longest(heap, table, n) } else { n };
             if heap.index(last).is_none() {
-                for &u in &entries {
+                for u in entries() {
                     self.table_entry(list, u, compute);
                 }
                 continue;
@@ -1562,7 +1593,7 @@ impl State {
             if n >= LARGE
                 && let Some(first) = same
             {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
                         Some(view) => readable(list, u, &view),
@@ -1583,7 +1614,7 @@ impl State {
                         .all(|(k, r)| *r == record(table, k as u32))
             });
             if let Some(&Fresh { first, .. }) = same {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     match crate::descriptor::view(handle) {
                         Some(view) => readable(list, u, &view),
@@ -1597,14 +1628,14 @@ impl State {
                 // A table holding constants made from the title's slots
                 // would view them misaligned: the draw is dropped. Other
                 // tables fall back to the title's slots.
-                if entries.iter().any(|u| u.kind == ResourceType::Cbv) {
+                if group.has_cbv {
                     once!(n, "a constant table did not fit in command-list slots; draw dropped");
                     made.clear();
                     self.made = made;
                     return false;
                 }
                 once!(n, "descriptor table did not fit in command-list slots");
-                for &u in &entries {
+                for u in entries() {
                     self.table_entry(list, u, compute);
                 }
                 continue;
@@ -1620,12 +1651,11 @@ impl State {
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays). Walk the sorted
             // first-use index instead of searching the entire list per slot.
-            index_table_entries(entries.iter().map(|u| u.table_offset_dwords / 8), &mut indices);
-            let mut named = indices.iter().peekable();
+            let mut named = group.named.iter().peekable();
             for k in 0..n {
                 let index = first + k;
                 let used = if named.peek().is_some_and(|(offset, _)| *offset == k) {
-                    named.next().map(|&(_, i)| entries[i])
+                    named.next().map(|&(_, i)| &used[group.entries[i]])
                 } else {
                     None
                 };
@@ -2444,6 +2474,31 @@ fn stencil_ref(list: &HostList, reference: u32) {
 
 #[cfg(test)]
 mod group_limit_tests {
+    #[test]
+    fn table_plan_preserves_interleaved_declaration_order() {
+        use super::*;
+        let entry = |slot, offset, kind, root| UsedResource {
+            slot, table_offset_dwords: offset, kind, root, dwords: 4,
+        };
+        let used = [
+            entry(7, 24, ResourceType::Uav, RootType::Table),
+            entry(2, 0, ResourceType::Cbv, RootType::Table),
+            entry(7, 24, ResourceType::Srv, RootType::Table),
+            entry(2, 80, ResourceType::Uav, RootType::Table),
+            entry(9, 0, ResourceType::Srv, RootType::ResourceHeap),
+        ];
+        let plan = TablePlan::new(&used);
+        assert_eq!(plan.direct, [0, 1, 2, 3]);
+        assert_eq!(plan.groups.len(), 2);
+        let a = &plan.groups[0];
+        assert_eq!((a.slot, a.count, a.snapshot, a.has_cbv), (2, 11, true, true));
+        assert_eq!(a.entries, [1, 3]);
+        let b = &plan.groups[1];
+        assert_eq!((b.slot, b.count, b.snapshot, b.has_cbv), (7, 4, true, false));
+        assert_eq!(b.entries, [0, 2]);
+        assert_eq!(b.named, [(3, 0)]);
+    }
+
     #[test]
     fn indexed_table_lookup_preserves_first_match_and_sparse_offsets() {
         let offsets = [8, 0, 8, 100, 2, 0, 100];
