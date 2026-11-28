@@ -1713,7 +1713,7 @@ pub(crate) struct HostList {
     /// resource first.
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    prelude: OnceLock<Prelude>,
     /// What the title's list held for this recording, if the title reset or
     /// released it while a submission of it was still to run.
     kept: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
@@ -1771,6 +1771,14 @@ struct ClampChunks {
     at: u64,
     barrier: bool,
     bound: bool,
+}
+
+type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Opt-in until the same-host lifetime and hardware tests pass.
+fn lazy_prelude() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_some_and(|v| v == "1"))
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -2161,6 +2169,19 @@ impl Host {
         })
     }
 
+    /// A closed prelude belonging to this device, ready for recording.
+    fn new_prelude(&self) -> windows::core::Result<Prelude> {
+        // SAFETY: plain object creation on this host.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None,
+            )?;
+            list.Close()?;
+            Ok((allocator, list))
+        }
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
@@ -2174,16 +2195,11 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
+            let prelude = if lazy_prelude() {
+                OnceLock::new()
+            } else {
+                OnceLock::from(self.new_prelude()?)
+            };
             crate::memstat::add(&crate::memstat::LISTS, 1);
             Ok(HostList {
                 allocator,
@@ -2192,7 +2208,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
-                prelude: (prelude_allocator, prelude),
+                prelude,
                 kept: Mutex::default(),
                 work: Default::default(),
                 writes: Default::default(),
@@ -2495,7 +2511,7 @@ impl Host {
         for list in runs {
             let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
+            if let Some(prelude) = list.prelude(self, &uploads) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -3403,6 +3419,7 @@ impl HostList {
     /// the textures' real states become those the list ends with.
     fn prelude(
         &self,
+        host: &Host,
         uploads: &[(
             std::sync::Arc<crate::texture::Staging>,
             std::sync::Arc<crate::resource::HostTexture>,
@@ -3459,7 +3476,9 @@ impl HostList {
         };
         validate_barriers(&pre_barriers);
         validate_barriers(&post_barriers);
-        let (allocator, list) = &self.prelude;
+        let (allocator, list) = self.prelude.get_or_init(|| {
+            host.new_prelude().unwrap_or_else(|e| fail(format_args!("cannot create host prelude: {e}")))
+        });
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures and staging buffers are live.
         let recorded = unsafe {
