@@ -129,6 +129,26 @@ pub(crate) fn merge_byte_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.truncate(out + 1);
 }
 
+/// Extends a snapshot in its existing allocation, preserving the bytes
+/// already captured before any title writes. Returns false without changing
+/// it if the allocation is too small; the caller then uses the snapshot pool.
+fn extend_snapshot_in_place(bytes: &mut Vec<u8>, prefix: &[u8], suffix: &[u8]) -> bool {
+    let old = bytes.len();
+    let total = old + prefix.len() + suffix.len();
+    if total > bytes.capacity() {
+        return false;
+    }
+    if prefix.is_empty() {
+        bytes.extend_from_slice(suffix);
+    } else {
+        bytes.resize(old + prefix.len(), 0);
+        bytes.copy_within(0..old, prefix.len());
+        bytes[..prefix.len()].copy_from_slice(prefix);
+        bytes.extend_from_slice(suffix);
+    }
+    true
+}
+
 /// Completes declarations covered by one merged range of this submission.
 fn complete_copy_back(pending: &mut Vec<(usize, usize)>, start: usize, end: usize) {
     pending.retain(|&(from, to)| !(start <= from && to <= end));
@@ -778,6 +798,15 @@ impl Shadow {
             return;
         }
         // Parts newly covered from the copy, the rest as it was taken.
+        // A pooled allocation often has spare capacity. Extend it directly
+        // instead of allocating/copying the entire existing snapshot again.
+        if let Some((at, bytes)) = before.as_mut() {
+            let old_end = *at + bytes.len();
+            if extend_snapshot_in_place(bytes, host(start, *at), host(old_end, end)) {
+                *at = start;
+                return;
+            }
+        }
         let mut grown = pooled(end - start);
         match before.take() {
             Some((at, bytes)) => {
@@ -3005,6 +3034,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn snapshot_growth_reuses_capacity_and_preserves_original_bytes() {
+        for old_len in [0usize, 1, 31, 64, 4096] {
+            for prefix_len in [0usize, 1, 17, 4096] {
+                for suffix_len in [0usize, 1, 33, 4096] {
+                    let old = vec![0xa5; old_len];
+                    let prefix = vec![0x12; prefix_len];
+                    let suffix = vec![0x34; suffix_len];
+                    let mut bytes = Vec::with_capacity(old_len + prefix_len + suffix_len);
+                    bytes.extend_from_slice(&old);
+                    let ptr = bytes.as_ptr();
+                    assert!(extend_snapshot_in_place(&mut bytes, &prefix, &suffix));
+                    assert_eq!(bytes.as_ptr(), ptr);
+                    assert_eq!(bytes, [prefix.as_slice(), old.as_slice(), suffix.as_slice()].concat());
+                }
+            }
+        }
+        let mut bytes = vec![7u8; 8];
+        let old = bytes.clone();
+        let excess = vec![1u8; bytes.capacity() + 1];
+        assert!(!extend_snapshot_in_place(&mut bytes, &[], &excess));
+        assert_eq!(bytes, old);
     }
 
     #[test]
