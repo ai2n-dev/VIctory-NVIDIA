@@ -171,23 +171,34 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// KiB override for small device-local buffers, following Vice-Tay's
+/// measured 4070-class profile. Preserve the old MiB setting and default
+/// when no valid KiB override is supplied. The allocation and residency
+/// limits still apply; selecting 64 KiB never authorizes exceeding them.
+fn card_limits_from(min_kib: Option<&str>, min_mib: Option<&str>, max_mib: Option<&str>) -> (u64, u64) {
+    let number = |s: Option<&str>| s.and_then(|v| v.trim().parse::<u64>().ok());
+    let minimum = match number(min_kib) {
+        Some(kib) => kib.saturating_mul(1 << 10).max(PAGE as u64),
+        None => number(min_mib).unwrap_or(4).saturating_mul(1 << 20).max(1 << 20),
+    };
+    let maximum = number(max_mib).unwrap_or(2048).saturating_mul(1 << 20);
+    (minimum, maximum)
+}
+
 /// `(min_bytes, max_total_bytes)` for card buffers:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (default 4 MiB) and
-/// `VICTORY_CARD_BUFFERS_MB` (default 2048 MiB).
+/// `VICTORY_CARD_BUFFERS_MIN_KB` overrides `VICTORY_CARD_BUFFERS_MIN_MB`
+/// (default 4 MiB); `VICTORY_CARD_BUFFERS_MB` defaults to 2048 MiB.
 fn limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(default)
-                .saturating_mul(1 << 20)
-        };
-        (
-            mb("VICTORY_CARD_BUFFERS_MIN_MB", 4).max(1 << 20),
-            mb("VICTORY_CARD_BUFFERS_MB", 2048),
-        )
+        let limits = card_limits_from(
+            std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().as_deref(),
+            std::env::var("VICTORY_CARD_BUFFERS_MIN_MB").ok().as_deref(),
+            std::env::var("VICTORY_CARD_BUFFERS_MB").ok().as_deref(),
+        );
+        tracing::info!(min_kib = limits.0 / 1024, max_mib = limits.1 / (1 << 20),
+            "device-local card buffer limits");
+        limits
     })
 }
 
@@ -1212,6 +1223,19 @@ fn drop_barriers(barriers: impl IntoIterator<Item = D3D12_RESOURCE_BARRIER>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn card_buffer_kib_override_preserves_legacy_defaults_and_budget() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(card_limits_from(None, None, None), (4 * MIB, 2048 * MIB));
+        assert_eq!(card_limits_from(Some("64"), None, Some("1536")), (64 << 10, 1536 * MIB));
+        assert_eq!(card_limits_from(Some(" 128 "), Some("8"), Some("0")), (128 << 10, 0));
+        assert_eq!(card_limits_from(Some("invalid"), Some("2"), None), (2 * MIB, 2048 * MIB));
+        assert_eq!(card_limits_from(Some("0"), None, None).0, PAGE as u64);
+        assert_eq!(card_limits_from(None, Some("0"), None).0, MIB);
+        let huge = u64::MAX.to_string();
+        assert_eq!(card_limits_from(Some(&huge), None, Some(&huge)), (u64::MAX, u64::MAX));
+    }
 
     #[test]
     fn gpu_upload_budget_leaves_room_for_unallocated_card_buffers() {
