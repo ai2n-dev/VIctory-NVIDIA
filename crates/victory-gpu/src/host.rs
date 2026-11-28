@@ -231,6 +231,8 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Idle preludes belong exclusively to this device.
+    prelude_pool: std::sync::Arc<PreludePool>,
     /// Async submissions not yet retired, oldest first.
     in_flight: Mutex<std::collections::VecDeque<InFlight>>,
     /// The newest fence value of `fence` whose submission is finished: its
@@ -774,6 +776,7 @@ impl Host {
                 presenter: Mutex::new(None),
                 card: OnceLock::new(),
                 card_dirty: Default::default(),
+                prelude_pool: Default::default(),
                 #[cfg(test)]
                 warp_serial: None,
             })
@@ -1290,6 +1293,24 @@ mod tests {
     /// A list of another host than the process's waits on that host's fence,
     /// not on the process's.
     #[test]
+    fn prelude_pool_reuses_idle_pairs_without_crossing_pool_ownership() {
+        use windows::core::Interface;
+        let Some(host) = Host::new_warp() else { return };
+        let first = host.new_prelude().expect("same-host prelude");
+        let first_id = first.0.as_raw() as usize;
+        let second = host.new_prelude().expect("another prelude");
+        assert_ne!(first_id, second.0.as_raw() as usize);
+        assert!(host.prelude_pool.take().is_none());
+        let other_pool = PreludePool::default();
+        host.prelude_pool.give(first);
+        assert!(other_pool.take().is_none());
+        assert_eq!(host.prelude_pool.take().unwrap().0.as_raw() as usize, first_id);
+        host.prelude_pool.give(second);
+        assert!(host.prelude_pool.take().is_some());
+        assert!(host.prelude_pool.take().is_none());
+    }
+
+    #[test]
     fn a_list_waits_on_the_fence_of_its_own_host() {
         let Some(warp) = Host::new_warp() else { return };
         let Ok(list) = warp.new_list() else { return };
@@ -1713,7 +1734,8 @@ pub(crate) struct HostList {
     /// resource first.
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
-    prelude: OnceLock<Prelude>,
+    prelude: Mutex<Option<Prelude>>,
+    prelude_pool: Option<std::sync::Arc<PreludePool>>,
     /// What the title's list held for this recording, if the title reset or
     /// released it while a submission of it was still to run.
     kept: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
@@ -1774,6 +1796,35 @@ struct ClampChunks {
 }
 
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+const PRELUDE_IDLE_LIMIT: usize = 128;
+
+struct IdlePrelude(Prelude);
+
+// SAFETY: native command objects are free-threaded. A pooled pair is idle
+// and has no owner recording it; its device is fixed by the Host's pool.
+unsafe impl Send for IdlePrelude {}
+
+#[derive(Default)]
+struct PreludePool(Mutex<Vec<IdlePrelude>>);
+
+impl PreludePool {
+    fn take(&self) -> Option<Prelude> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).pop().map(|idle| idle.0)
+    }
+
+    fn give(&self, prelude: Prelude) {
+        let mut idle = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.len() < PRELUDE_IDLE_LIMIT {
+            idle.push(IdlePrelude(prelude));
+        }
+    }
+}
+
+fn pool_preludes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    lazy_prelude() && *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_some_and(|v| v == "1"))
+}
 
 /// Opt-in until the same-host lifetime and hardware tests pass.
 fn lazy_prelude() -> bool {
@@ -2196,9 +2247,9 @@ impl Host {
                 None,
             )?;
             let prelude = if lazy_prelude() {
-                OnceLock::new()
+                Mutex::new(None)
             } else {
-                OnceLock::from(self.new_prelude()?)
+                Mutex::new(Some(self.new_prelude()?))
             };
             crate::memstat::add(&crate::memstat::LISTS, 1);
             Ok(HostList {
@@ -2209,6 +2260,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude,
+                prelude_pool: pool_preludes().then(|| self.prelude_pool.clone()),
                 kept: Mutex::default(),
                 work: Default::default(),
                 writes: Default::default(),
@@ -3323,6 +3375,14 @@ impl HostList {
     /// Only after the list's last submission finished.
     pub(crate) fn reset(&self) {
         self.wait_for_last_submission();
+        // Only reset retires this recording. A completed closed list may
+        // still be executed again, so completion alone cannot recycle it.
+        if let Some(pool) = &self.prelude_pool {
+            let idle = self.prelude.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(idle) = idle {
+                pool.give(idle);
+            }
+        }
         self.release_kept();
         *self.deferred() = Deferred::default();
         self.work.store(0, Ordering::Relaxed);
@@ -3476,9 +3536,13 @@ impl HostList {
         };
         validate_barriers(&pre_barriers);
         validate_barriers(&post_barriers);
-        let (allocator, list) = self.prelude.get_or_init(|| {
-            host.new_prelude().unwrap_or_else(|e| fail(format_args!("cannot create host prelude: {e}")))
+        let mut prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        let (allocator, list) = prelude.get_or_insert_with(|| {
+            self.prelude_pool.as_ref().and_then(|pool| pool.take()).unwrap_or_else(|| {
+                host.new_prelude().unwrap_or_else(|e| fail(format_args!("cannot create host prelude: {e}")))
+            })
         });
+        let (allocator, list) = (&*allocator, &*list);
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures and staging buffers are live.
         let recorded = unsafe {
