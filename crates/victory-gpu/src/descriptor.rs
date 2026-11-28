@@ -566,11 +566,62 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
-/// A resource description's padding (after the dimension and the flags):
-/// whatever was on the title's stack.
-fn clear_padding(resource: &mut [u32; 14]) {
-    resource[1] = 0;
-    resource[13] = 0;
+/// Read the initialized resource fields without reading stack padding.
+/// The dimension is word 0; alignment through flags occupy words 2..=12.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    let mut fields = [0; 14];
+    // SAFETY: the caller supplies the placed resource description, possibly
+    // unaligned. The reads exclude its two padding words.
+    unsafe {
+        fields[0] = src.read_unaligned();
+        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
+    }
+    Some(fields)
+}
+
+/// Number of meaningful words in the PC union for a known view dimension.
+/// The six console-specific words after the PC description stay intact.
+fn placed_view_union(unordered: bool, dimension: u32) -> Option<(usize, usize)> {
+    if dimension == 0 {
+        return None;
+    }
+    if unordered {
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        USED.get(dimension as usize).map(|&n| (2, n))
+    } else {
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        USED.get(dimension as usize).map(|&n| (4, n))
+    }
+}
+
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    // SAFETY: the caller supplies a view description with the format and
+    // dimension initialized.
+    let dimension = unsafe { src.add(1).read_unaligned() };
+    let Some((start, used)) = placed_view_union(unordered, dimension) else {
+        // Unknown console extensions keep their existing representation.
+        return words(desc);
+    };
+    let mut d = [0u32; 16];
+    let header = if unordered { 2 } else { 3 };
+    // SAFETY: the declared dimension determines the initialized union
+    // fields. Do not read the unused tail or SRV alignment word.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.cast::<u8>(), d.as_mut_ptr().cast::<u8>(), header * 4);
+        std::ptr::copy_nonoverlapping(
+            src.add(start).cast::<u8>(), d.as_mut_ptr().add(start).cast::<u8>(), used * 4,
+        );
+        d[10..].copy_from_slice(&src.add(10).cast::<[u32; 6]>().read_unaligned());
+    }
+    Some(d)
 }
 
 /// Device methods 0x230 and 0x238: shader resource and unordered access
@@ -582,17 +633,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(mut resource), Some(mut desc)) = (words::<14>(resource), words::<16>(desc)) {
-        clear_padding(&mut resource);
-        // After the component mapping, and what the dimension does not use.
-        desc[3] = 0;
-        match desc[1] {
-            1 => desc[9] = 0,
-            4 => desc[8..10].fill(0),
-            8 | 9 => desc[7..10].fill(0),
-            10 => desc[9] = 0,
-            _ => {}
-        }
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -603,8 +644,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(mut resource), Some(desc)) = (words::<14>(resource), words::<16>(desc)) {
-        clear_padding(&mut resource);
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -798,6 +838,53 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn placed_resource_padding_does_not_change_key() {
+        let mut a = [7u32; 14];
+        let mut b = a;
+        a[1] = 100;
+        b[1] = 200;
+        a[13] = 300;
+        b[13] = 400;
+        let key = placed_resource_words(&a).unwrap();
+        assert_eq!(key, placed_resource_words(&b).unwrap());
+        assert_eq!(key[1], 0);
+        assert_eq!(key[13], 0);
+        assert_eq!(&key[2..13], &a[2..13]);
+        assert!(placed_resource_words(std::ptr::null()).is_none());
+    }
+
+    #[test]
+    fn placed_view_keys_ignore_only_known_unused_fields() {
+        for (unordered, sizes) in [
+            (false, &[0usize, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2][..]),
+            (true, &[0usize, 7, 1, 3, 2, 4, 0, 2, 3][..]),
+        ] {
+            for (dimension, &used) in sizes.iter().enumerate().skip(1) {
+                let start = if unordered { 2 } else { 4 };
+                let mut a = [7u32; 16];
+                a[1] = dimension as u32;
+                let mut b = a;
+                b[start + used..10].fill(99);
+                if !unordered {
+                    b[3] = 123;
+                }
+                let key = placed_view_words(&a, unordered).unwrap();
+                assert_eq!(key, placed_view_words(&b, unordered).unwrap());
+                assert_eq!(&key[start..start + used], &a[start..start + used]);
+                assert_eq!(&key[10..], &a[10..]);
+                b[10] += 1;
+                assert_ne!(key, placed_view_words(&b, unordered).unwrap());
+            }
+            for dimension in [0, 100, u32::MAX] {
+                let mut a = [9u32; 16];
+                a[1] = dimension;
+                assert_eq!(placed_view_words(&a, unordered), Some(a));
+            }
+        }
+    }
+
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
