@@ -1699,21 +1699,19 @@ impl State {
                                     None => crate::port_cbv::copied(true),
                                 }
                             }
-                            let Some((buffer, gpu, to)) = list.scratch_buffer(u64::from(size)) else {
+                            let Some((buffer, gpu)) = list.fill_table_scratch(address as *const u8, size) else {
                                 host.make_null_kind(index, ResourceType::Cbv, 4);
                                 continue;
                             };
-                            list.defer_fill(to, address as *const u8, size as usize);
                             if !host.constant_raw_at(index, &buffer, gpu, size) {
                                 host.make_null_kind(index, ResourceType::Cbv, 4);
                             }
                             continue;
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some((_, gpu)) = list.fill_table_scratch(address as *const u8, size) else {
                             host.make_null_kind(index, ResourceType::Cbv, 4);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {

@@ -2124,6 +2124,8 @@ struct Deferred {
     /// (source, bytes): its host address, which a second fill would find
     /// holding the same bytes.
     filled: std::collections::HashMap<(usize, usize), u64>,
+    /// Optional table CBV snapshots: the owning buffer and GPU address.
+    filled_tables: std::collections::HashMap<(usize, usize), (ID3D12Resource, u64)>,
     /// View heaps the list's draws index directly (`ResourceDescriptorHeap[]`),
     /// and whether any of their shaders may write memory: their slots are
     /// brought up to date once per submission, after every other step.
@@ -3689,6 +3691,7 @@ impl HostList {
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
         deferred.filled.clear();
+        deferred.filled_tables.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -3712,6 +3715,29 @@ impl HostList {
         self.defer_fill(to, src, len as usize);
         self.deferred().filled.insert(key, gpu);
         Some(gpu)
+    }
+
+    /// The same submit-time snapshot for descriptor-table CBVs, whose raw
+    /// form also needs the owning buffer. Reuse only identical ranges in
+    /// one recording, and clear the cache on every guest-memory write
+    /// that invalidates the existing root-constant snapshot cache.
+    pub(crate) fn fill_table_scratch(
+        &self, src: *const u8, len: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        static REUSE: OnceLock<bool> = OnceLock::new();
+        let reuse = *REUSE.get_or_init(|| std::env::var_os("VICTORY_REUSE_CBV_FILLS").is_some_and(|v| v == "1"));
+        let key = (src as usize, len as usize);
+        if reuse
+            && let Some(known) = self.deferred().filled_tables.get(&key).cloned()
+        {
+            return Some(known);
+        }
+        let (buffer, gpu, to) = self.scratch_buffer(u64::from(len))?;
+        self.defer_fill(to, src, len as usize);
+        if reuse {
+            self.deferred().filled_tables.insert(key, (buffer.clone(), gpu));
+        }
+        Some((buffer, gpu))
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -4127,6 +4153,7 @@ impl HostList {
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
         deferred.filled.clear();
+        deferred.filled_tables.clear();
     }
 
     /// Queues submission-time materialization and refresh of the bindless
