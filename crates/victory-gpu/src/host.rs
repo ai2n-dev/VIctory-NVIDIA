@@ -38,6 +38,101 @@ const RTV_RING: u32 = 1024;
 
 /// An asynchronous submission still running on the GPU: its staging textures
 /// and bindless plans stay alive until `fence` completes.
+/// Declared guest-memory writes of a single submission. This is a
+/// diagnostic dependency model, not permission to omit a fence: GPU
+/// aliasing, direct mappings and shared scratch lifetimes still need proof.
+#[cfg(any(test, feature = "diagnostics"))]
+#[derive(Default)]
+struct FlightWriteRanges {
+    ranges: Vec<(usize, usize)>,
+    unknown: bool,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+#[derive(Debug, PartialEq, Eq)]
+enum FillHazard {
+    DeclaredOverlap(usize),
+    Unknown,
+    NoDeclaredOverlap,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl FlightWriteRanges {
+    fn add(&mut self, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        match start.checked_add(len) {
+            Some(end) => self.ranges.push((start, end)),
+            None => self.unknown = true,
+        }
+    }
+
+    fn seal(&mut self) {
+        crate::shadow::merge_byte_ranges(&mut self.ranges);
+    }
+
+    fn classify(&self, start: usize, len: usize) -> FillHazard {
+        let Some(end) = start.checked_add(len) else {
+            return FillHazard::Unknown;
+        };
+        if len == 0 {
+            return FillHazard::NoDeclaredOverlap;
+        }
+        let first = self.ranges.partition_point(|&(_, to)| to <= start);
+        let largest = self.ranges[first..]
+            .iter()
+            .take_while(|&&(from, _)| from < end)
+            .map(|&(from, to)| to - from)
+            .max();
+        match largest {
+            Some(bytes) => FillHazard::DeclaredOverlap(bytes),
+            None if self.unknown => FillHazard::Unknown,
+            None => FillHazard::NoDeclaredOverlap,
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn trace_flight_hazards() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLIGHT_HAZARDS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+mod flight_write_range_tests {
+    use super::{FillHazard, FlightWriteRanges};
+
+    #[test]
+    fn fill_hazards_use_half_open_ranges_and_preserve_gaps() {
+        let mut flight = FlightWriteRanges::default();
+        flight.add(200, 100);
+        flight.add(100, 100);
+        flight.add(500, 20);
+        flight.add(300, 0);
+        flight.seal();
+        assert_eq!(flight.classify(99, 1), FillHazard::NoDeclaredOverlap);
+        assert_eq!(flight.classify(99, 2), FillHazard::DeclaredOverlap(200));
+        assert_eq!(flight.classify(299, 1), FillHazard::DeclaredOverlap(200));
+        assert_eq!(flight.classify(300, 200), FillHazard::NoDeclaredOverlap);
+        assert_eq!(flight.classify(300, 201), FillHazard::DeclaredOverlap(20));
+        assert_eq!(flight.classify(150, 0), FillHazard::NoDeclaredOverlap);
+    }
+
+    #[test]
+    fn tiny_fill_reports_large_declared_dependency_without_overflow() {
+        let mut flight = FlightWriteRanges::default();
+        let start = 0x11600000;
+        let size = 0xae00000;
+        flight.add(start, size);
+        flight.add(usize::MAX - 1, 4);
+        flight.seal();
+        assert_eq!(flight.classify(start + 64, 32), FillHazard::DeclaredOverlap(size));
+        assert_eq!(flight.classify(start + size, 32), FillHazard::Unknown);
+        assert_eq!(flight.classify(usize::MAX - 1, 4), FillHazard::Unknown);
+    }
+}
+
 struct InFlight {
     fence: u64,
     submission: u64,
@@ -49,6 +144,8 @@ struct InFlight {
     /// What is done once it has run ([`Host::finish_submission`]): its
     /// lists, kept alive for that, and the ranges its shaders wrote.
     finish: Option<Finish>,
+    #[cfg(feature = "diagnostics")]
+    hazards: Option<FlightWriteRanges>,
 }
 
 /// See [`InFlight::finish`].
@@ -2291,6 +2388,53 @@ impl Host {
         PREWARM_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
+    /// Compare incoming upload fills with the previous submission's
+    /// declared guest writes. Report only; never weaken synchronization.
+    #[cfg(feature = "diagnostics")]
+    fn log_fill_hazards(&self, runs: &[&HostList]) {
+        if !trace_flight_hazards() {
+            return;
+        }
+        let mut fills = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                if let Step::Fill(_, src, len) = step {
+                    fills.push((*src, *len));
+                }
+            }
+        }
+        if fills.is_empty() {
+            return;
+        }
+        let mut counts = [0usize; 3];
+        let mut largest = 0usize;
+        {
+            let flights = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            for (src, len) in fills {
+                let mut unknown = false;
+                let mut overlap = 0;
+                for flight in flights.iter() {
+                    match flight.hazards.as_ref().map_or(FillHazard::Unknown, |h| h.classify(src, len)) {
+                        FillHazard::DeclaredOverlap(bytes) => overlap = overlap.max(bytes),
+                        FillHazard::Unknown => unknown = true,
+                        FillHazard::NoDeclaredOverlap => {}
+                    }
+                }
+                if overlap != 0 {
+                    counts[0] += 1;
+                    largest = largest.max(overlap);
+                } else if unknown {
+                    counts[1] += 1;
+                } else {
+                    counts[2] += 1;
+                }
+            }
+        }
+        tracing::debug!(overlapping = counts[0], unknown = counts[1],
+            no_declared_overlap = counts[2], largest_declared_bytes = largest,
+            "incoming fill dependencies on in-flight submissions (diagnostic only)");
+    }
+
     fn execute_inner(&self, runs: &[&HostList], keep: Option<&[std::sync::Arc<HostList>]>) {
         #[cfg(feature = "diagnostics")]
         let _inside = crate::profile::here();
@@ -2309,6 +2453,8 @@ impl Host {
             let pending = self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
                 .back().is_some_and(|flight| flight.fence > completed);
             if pending {
+                #[cfg(feature = "diagnostics")]
+                self.log_fill_hazards(runs);
                 self.prewarm(runs);
             }
         }
@@ -2534,6 +2680,33 @@ impl Host {
         if async_signalled {
             debug_assert!(card_after_ran || card_plan.as_ref().is_none_or(|p| !p.has_writes()));
             submission_us(0, (prepared - started).as_micros() as u64);
+            #[cfg(feature = "diagnostics")]
+            let hazards = trace_flight_hazards().then(|| {
+                let mut hazards = FlightWriteRanges::default();
+                for (_, address, len) in cpu_back.iter().chain(&card_writes) {
+                    hazards.add(*address, *len);
+                }
+                for list in runs {
+                    let deferred = list.deferred();
+                    for &(address, _, len) in &deferred.writes {
+                        hazards.add(address, len);
+                    }
+                    for rb in &deferred.readbacks {
+                        if rb.lines != 0 {
+                            if let Some(len) = (rb.lines - 1).checked_mul(rb.dst_pitch)
+                                .and_then(|n| n.checked_add(rb.row_bytes))
+                            {
+                                hazards.add(rb.dst, len);
+                            } else {
+                                hazards.unknown = true;
+                            }
+                        }
+                    }
+                    hazards.unknown |= !deferred.texture_backs.is_empty();
+                }
+                hazards.seal();
+                hazards
+            });
             self.in_flight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2542,6 +2715,8 @@ impl Host {
                     submission: this_submission,
                     _early_copies: early.copies,
                     _plans: batch.plans,
+                    #[cfg(feature = "diagnostics")]
+                    hazards,
                     finish: Some(Finish {
                         lists: keep.map(<[_]>::to_vec).unwrap_or_default(),
                         back: cpu_back,
