@@ -1,0 +1,23 @@
+name: Import pinned upstream snapshot
+on:
+  push:
+    branches: [dev/trustno1-foxhound]
+    paths: [.github/workflows/import-trustno1.yml]
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - name: Fetch exact upstream commit and publish new ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/trustno1-coder/VIctory-NVIDIA.git main
+          git cat-file -e 8fc22547c81a0ae6e2e9d0669f776854016fb8a1^{commit}
+          git push origin 8fc22547c81a0ae6e2e9d0669f776854016fb8a1:refs/heads/upstream/trustno1-pure
+          test "$(git ls-remote origin refs/heads/upstream/trustno1-pure | cut -f1)" = "8fc22547c81a0ae6e2e9d0669f776854016fb8a1"
