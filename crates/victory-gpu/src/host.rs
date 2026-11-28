@@ -1234,6 +1234,32 @@ mod tests {
         assert!(finished >= last, "finished {finished}, list's last fence {last}");
     }
 
+    /// A hardware fence wait must leave the submission mutex available.
+    /// Use an isolated software device and CPU-signalled fence, not a long
+    /// GPU workload. The timeout on the channel makes failure bounded.
+    #[test]
+    fn fence_wait_does_not_hold_submission_mutex() {
+        let Some(host) = Host::new_warp() else { return };
+        let host = &host;
+        let target = 1u64;
+        let (entered, ready) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(move || {
+                entered.send(()).unwrap();
+                host.wait_fence(target);
+            });
+            ready.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            // Give the waiter a chance to reach the hardware wait. The
+            // signal below is unconditional even if the assertion would fail.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let available = host.submitted.try_lock().is_ok();
+            // SAFETY: isolated test fence; CPU signalling does not submit GPU work.
+            unsafe { host.fence.Signal(target).unwrap() };
+            waiter.join().unwrap();
+            assert!(available, "hardware fence wait held submitted");
+        });
+    }
+
     #[test]
     fn an_unwaited_card_submission_lands_before_title_completion() {
         let Some(host) = Host::new_warp() else { return };
@@ -2146,9 +2172,36 @@ impl Host {
         if target == 0 || finishing_here() || self.finished_fence.load(Ordering::Acquire) >= target {
             return;
         }
+        // The target was already published by a submission. Waiting for
+        // the hardware must not hold the submission mutex: a recording
+        // thread can enter execute_inner and prewarm its next batch.
+        // Each waiter owns its event; the submission event remains reserved
+        // for the serial drain and for synchronous work under submitted.
+        // SAFETY: plain query on the live host fence.
+        if unsafe { self.fence.GetCompletedValue() } < target {
+            // SAFETY: CreateEventW returns a newly owned handle on success.
+            let event = unsafe {
+                match CreateEventW(None, false, false, None) {
+                    Ok(event) => Some(OwnedHandle::from_raw_handle(event.0)),
+                    Err(error) => {
+                        tracing::warn!(%error, target, "cannot create independent fence event: polling");
+                        None
+                    }
+                }
+            };
+            wait_for_value(
+                &self.fence,
+                event.as_ref().map(|event| HANDLE(event.as_raw_handle())),
+                target,
+            );
+        }
+        // Completion includes copy-back and guest-visible writes, not just
+        // the hardware fence. Only one thread may land them; recheck after
+        // acquiring the mutex because another caller may already have done it.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        wait_for_value(&self.fence, Some(HANDLE(self.event.as_raw_handle())), target);
-        self.reap_completed(&mut submitted);
+        if self.finished_fence.load(Ordering::Acquire) < target {
+            self.reap_completed(&mut submitted);
+        }
     }
 
     /// Waits for all in-flight asynchronous submissions to complete.
@@ -2249,7 +2302,15 @@ impl Host {
         // ran in parallel with the title's CPU command-list recording, and
         // runs on while this submission's buffer copies are refreshed.
         if keep.is_some() && self.has_in_flight() {
-            self.prewarm(runs);
+            // Do not refresh twice when the preceding GPU work has already
+            // completed: landing it first leaves only the normal prepare.
+            // SAFETY: a plain query on the live fence.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            let pending = self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
+                .back().is_some_and(|flight| flight.fence > completed);
+            if pending {
+                self.prewarm(runs);
+            }
         }
         self.drain_in_flight_locked(&mut submitted);
         if !runs.is_empty() {
