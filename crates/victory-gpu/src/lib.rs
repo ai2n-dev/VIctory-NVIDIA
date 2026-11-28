@@ -15,6 +15,12 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+// Optional allocator for the compatibility runtime, following Vice-Tay.
+// The guest's native Windows heap API is unchanged.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

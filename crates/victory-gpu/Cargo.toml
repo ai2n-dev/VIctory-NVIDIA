@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+mimalloc = { workspace = true, optional = true }
 victory-core.workspace = true
 blake3.workspace = true
 miniz_oxide.workspace = true
@@ -23,6 +24,7 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+mimalloc = ["dep:mimalloc"]
 
 [lints]
 workspace = true
