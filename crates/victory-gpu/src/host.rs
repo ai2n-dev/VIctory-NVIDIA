@@ -3960,6 +3960,92 @@ impl HostList {
     }
 }
 
+/// First-seen ordered refresh ranges, indexed by live Arc identity once
+/// a batch is large enough that repeated linear scans become expensive.
+/// Keeping the Arc in each entry prevents address reuse until the flush.
+struct RefreshRanges<T> {
+    entries: Vec<(std::sync::Arc<T>, usize, usize)>,
+    indices: std::collections::HashMap<usize, usize>,
+}
+
+impl<T> Default for RefreshRanges<T> {
+    fn default() -> Self {
+        Self { entries: Vec::new(), indices: std::collections::HashMap::new() }
+    }
+}
+
+impl<T> RefreshRanges<T> {
+    fn add(&mut self, resource: &std::sync::Arc<T>, from: usize, to: usize) {
+        const INDEX_AT: usize = 16;
+        let key = std::sync::Arc::as_ptr(resource) as usize;
+        let index = if self.entries.len() < INDEX_AT {
+            self.entries.iter().position(|(r, ..)| std::sync::Arc::ptr_eq(r, resource))
+        } else {
+            if self.indices.is_empty() {
+                self.indices.extend(self.entries.iter().enumerate().map(|(i, (r, ..))| {
+                    (std::sync::Arc::as_ptr(r) as usize, i)
+                }));
+            }
+            self.indices.get(&key).copied()
+        };
+        if let Some(index) = index {
+            let (_, start, end) = &mut self.entries[index];
+            *start = (*start).min(from);
+            *end = (*end).max(to);
+        } else {
+            if self.entries.len() >= INDEX_AT {
+                self.indices.insert(key, self.entries.len());
+            }
+            self.entries.push((resource.clone(), from, to));
+        }
+    }
+
+    fn take(&mut self) -> Vec<(std::sync::Arc<T>, usize, usize)> {
+        self.indices.clear();
+        std::mem::take(&mut self.entries)
+    }
+}
+
+#[cfg(test)]
+mod refresh_ranges_tests {
+    use super::RefreshRanges;
+    use std::sync::Arc;
+
+    #[test]
+    fn indexed_refreshes_match_first_seen_linear_oracle_across_flushes() {
+        // Identical values must not cause separate allocations to alias.
+        let resources: Vec<_> = (0..257).map(|_| Arc::new(0u32)).collect();
+        let mut batch = RefreshRanges::default();
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        for count in [1, 15, 16, 17, 64, 257, 16, 3] {
+            let mut expected: Vec<(Arc<u32>, usize, usize)> = Vec::new();
+            for step in 0..(count * 8) {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let index = if step < count { step } else { (seed >> 32) as usize % count };
+                let resource = &resources[index];
+                let from = (seed & 0xffff) as usize;
+                let to = from + 1 + ((seed >> 16) & 0xff) as usize;
+                if let Some((_, start, end)) =
+                    expected.iter_mut().find(|(r, ..)| Arc::ptr_eq(r, resource))
+                {
+                    *start = (*start).min(from);
+                    *end = (*end).max(to);
+                } else {
+                    expected.push((resource.clone(), from, to));
+                }
+                batch.add(resource, from, to);
+            }
+            let actual = batch.take();
+            assert_eq!(actual.len(), expected.len());
+            for ((a, from, to), (b, start, end)) in actual.iter().zip(&expected) {
+                assert!(Arc::ptr_eq(a, b));
+                assert_eq!((*from, *to), (*start, *end));
+            }
+            assert!(batch.take().is_empty());
+        }
+    }
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -3970,7 +4056,7 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: RefreshRanges<crate::shadow::Shadow>,
     /// The same of sparse copies.
     pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
@@ -3999,14 +4085,7 @@ impl Batch {
             self.pieces.push((shadow.clone(), address, end));
             return;
         }
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
-        }
+        self.refreshes.add(shadow, address, end);
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -4051,7 +4130,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        let refreshes = std::mem::take(&mut self.refreshes);
+        let refreshes = self.refreshes.take();
         let parallel = port_guard_plan();
         if parallel && refreshes.len() >= 2 {
             let started = std::time::Instant::now();
